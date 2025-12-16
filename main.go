@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -14,7 +15,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"unicode"
 )
 
 func pickRoute(a *ast.File) *ast.FuncDecl {
@@ -155,13 +155,13 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 								if t, ok := isIdent(d.Names[0]); ok && strings.HasPrefix(t.Name, "RBODY") {
 									suffix := t.Name[5:]
 									if suffix == "" {
-										v.responseTypes[200] = typeRef(d.Type, v.pkg)
+										v.responseTypes[200] = typeRef(v.fset, t.Name, d.Type, v.pkg)
 									} else {
 										code, err := strconv.Atoi(suffix)
 										if err != nil {
 											log.Fatalf("failed to parse integer status code in variable name '%v': %s", t.Name, err)
 										}
-										v.responseTypes[code] = typeRef(d.Type, v.pkg)
+										v.responseTypes[code] = typeRef(v.fset, t.Name, d.Type, v.pkg)
 									}
 								}
 							}
@@ -218,10 +218,18 @@ func (v paramsVisitor) isBodyCall(call *ast.CallExpr) (string, bool) {
 							if vs, ok := isValueSpec(x.Obj.Decl); ok {
 								n := nameOf(vs.Type, v.pkg)
 								return n, true
+							} else {
+								log.Fatalf("unsupported call to Request.body(): UnaryExpr argument is not an Ident but a %v", e)
 							}
 						}
+					default:
+						log.Fatalf("unsupported call to Request.body(): is not a UnaryExpr but a %v", e)
 					}
+				} else {
+					log.Fatalf("call to body() but not on a Request: %v", f)
 				}
+			} else {
+				log.Fatalf("call to body() but is not a field: %v", x.Obj)
 			}
 		}
 	}
@@ -249,8 +257,6 @@ func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]Type, bool) {
 							return r.responseTypes, true
 						}
 					}
-					// fmt.Printf("### RESPOND: ")
-					// ast.Print(v.fset, a)
 				}
 			}
 		}
@@ -326,10 +332,11 @@ func parseComment(text string) string {
 }
 
 func impls(fset *token.FileSet, a *ast.File, source string) ([]Impl, []Type) {
-	//fmt.Printf("[📃] \x1b[34;4;1m%s\x1b[0m\n", source)
+	if verbose {
+		fmt.Printf("[📃] \x1b[34;4;1m%s\x1b[0m\n", source)
+	}
 	ims := []Impl{}
 	types := []Type{}
-	//enums := map[string]map[string]string{}
 	pkg := ""
 
 	if p, ok := isIdent(a.Name); ok {
@@ -343,7 +350,9 @@ func impls(fset *token.FileSet, a *ast.File, source string) ([]Impl, []Type) {
 		case *ast.FuncDecl:
 			if isGroupwareRouteFunc(d) {
 				fun := nameOf(d.Name, pkg)
-				//fmt.Printf("\x1b[4;1;34m%s\x1b[0m\n", fun)
+				if verbose {
+					fmt.Printf("\x1b[4;1;34m%s\x1b[0m\n", fun)
+				}
 				comments := []string{}
 				resp := map[int]Resp{}
 				/*
@@ -382,46 +391,43 @@ func impls(fset *token.FileSet, a *ast.File, source string) ([]Impl, []Type) {
 					UriParams:   keysOf(v.uriParams),
 					BodyParams:  keysOf(v.bodyParams),
 				})
-				//fmt.Printf("\n")
+				if verbose {
+					fmt.Printf("\n")
+				}
 			}
 		case *ast.GenDecl:
 			for _, spec := range d.Specs {
 				switch v := spec.(type) {
 				case *ast.TypeSpec:
 					tname := v.Name.Name
+					//if unicode.IsLower(rune(tname[0])) {
+					//	continue
+					//}
 
 					switch t := v.Type.(type) {
 					case *ast.StructType:
 						if strings.HasPrefix(tname, "Swagger") {
 							continue
 						}
-						if unicode.IsLower(rune(tname[0])) {
-							continue
-						}
-						//fmt.Printf("  - [🚧] \x1b[35;1m%s\x1b[0m\n", v.Name)
 						fields := []Field{}
 						if t.Fields != nil && t.Fields.List != nil {
 							for _, f := range t.Fields.List {
 								if f != nil && f.Tag != nil {
-									//spew.Dump(f)
+									fieldName := typeName(f.Names)
 									fields = append(fields, Field{
 										Pkg:  pkg,
-										Name: typeName(f.Names),
-										Type: typeRef(f.Type, pkg),
+										Name: fieldName,
+										Type: typeRef(fset, fieldName, f.Type, pkg),
 										Tag:  tagOf(f),
 									})
 								}
 							}
 						}
-						ty := newCustomType(pkg, tname)
-						ty.fields = fields
-						types = append(types, ty)
+						types = append(types, newCustomType(pkg, tname, fields))
 					case *ast.InterfaceType:
-						// noop
+						types = append(types, newInterfaceType(pkg, tname))
 					default:
-						tr := newAliasType(pkg, tname, typeRef(v.Type, pkg))
-						//fmt.Printf("typespec: %s.%s=%v -> %#v\n", pkg, tname, v.Type, tr)
-						types = append(types, tr)
+						types = append(types, newAliasType(pkg, tname, typeRef(fset, tname, v.Type, pkg)))
 					}
 				}
 			}
@@ -504,9 +510,16 @@ func printType(t Type, m map[string]Type, e map[string]map[string]bool, l int, p
 	}
 }
 
+var verbose bool = false
+
 func main() {
-	if len(os.Args) == 2 {
-		err := os.Chdir(os.Args[1])
+	chdir := ""
+	flag.StringVar(&chdir, "C", "", "Change into the specified directory before parsing source files")
+	flag.BoolVar(&verbose, "v", false, "Output verbose information while parsing source files")
+	flag.Parse()
+
+	if chdir != "" {
+		err := os.Chdir(chdir)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -588,9 +601,6 @@ func main() {
 	typeMap := map[string]Type{}
 	for _, t := range types {
 		typeMap[t.Key()] = t
-		//fmt.Printf("[TypeMap] %s : %v\n", t.Key(), t)
-		//ast.Print(fset, v)
-		// fmt.Printf("t: %s\n", t.FQName)
 	}
 	enums := map[string]map[string]bool{}
 	for k := range typeMap {
@@ -599,22 +609,21 @@ func main() {
 				if _, ok := enums[k]; !ok {
 					enums[k] = map[string]bool{}
 				}
-				//fmt.Printf("::: %v <> %v\n", k, s)
 				enums[k][s] = true
 			}
 		}
 	}
 
-	/*
+	if verbose {
 		fmt.Printf("\x1b[4mTypes:\x1b[0m\n")
 		for _, t := range types {
-			fmt.Printf("  \x1b[33m%s\x1b[0m\n", t.Name)
-			for _, f := range t.Fields {
-				fmt.Printf("    \x1b[34m%s\x1b[0m %s\n", f.Name, f.Type)
+			fmt.Printf("  \x1b[33m%s\x1b[0m\n", t.Key())
+			for _, f := range t.Fields() {
+				fmt.Printf("    · \x1b[34m%s\x1b[0m %s\n", f.Name, f.Type)
 			}
 		}
 		fmt.Println()
-	*/
+	}
 
 	imMap := map[string]Impl{}
 	for _, im := range ims {
@@ -629,7 +638,6 @@ func main() {
 			for _, c := range im.Comments {
 				fmt.Printf("        \x1b[30;1m# %s\x1b[0m\n", c)
 			}
-
 			for _, p := range im.UriParams {
 				fmt.Printf("        \x1b[35m· /\x1b[0m\x1b[1;35m%s\x1b[0m\n", uriParams[p])
 			}
