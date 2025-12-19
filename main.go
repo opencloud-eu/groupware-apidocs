@@ -4,18 +4,41 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
-	"go/parser"
 	"go/token"
+	"go/types"
 	"log"
 	"maps"
-	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+
+	"golang.org/x/tools/go/packages"
 )
+
+var packagesOfInterest = []string{
+	"groupware",
+	"jmap",
+	"jscontact",
+	"jscalendar",
+}
+
+const (
+	GroupwarePackageID  = "github.com/opencloud-eu/opencloud/services/groupware/pkg/groupware"
+	JmapPackageID       = "github.com/opencloud-eu/opencloud/pkg/jmap"
+	JSCalendarPackageID = "github.com/opencloud-eu/opencloud/pkg/jscalendar"
+	JSContactPacakgeID  = "github.com/opencloud-eu/opencloud/pkg/jscontact"
+)
+
+var PackageIDs = []string{
+	GroupwarePackageID,
+	JmapPackageID,
+	JSCalendarPackageID,
+	JSContactPacakgeID,
+}
 
 func pickRoute(a *ast.File) *ast.FuncDecl {
 	for _, decl := range a.Decls {
@@ -41,19 +64,13 @@ type Resp struct {
 
 type Impl struct {
 	Source      string
-	Fun         string
+	Fun         *ast.FuncDecl
+	Name        string
 	Comments    []string
 	Resp        map[int]Resp
 	QueryParams []string
 	UriParams   []string
 	BodyParams  []string
-}
-
-type Field struct {
-	Pkg  string
-	Name string
-	Type Type
-	Tag  string
 }
 
 var verbs = []string{
@@ -116,85 +133,161 @@ func params(decls []ast.Decl) (map[string]string, map[string]string) {
 	return uriParams, queryParams
 }
 
-// api:response:200: *jscontact.ContactCard
-// var apiResponseRegex = regexp.MustCompile(`^//\s*api:response:(\d+):\s*(\S+)$`)
-
-func isGroupwareRouteFunc(d *ast.FuncDecl) bool {
-	return isMemberOf(d, "Groupware") && hasNumParams(d, 2) && isParamType(d.Type.Params.List[0], "http", "ResponseWriter") && isParamPtrType(d.Type.Params.List[1], "http", "Request")
+type responseFunc struct {
+	hasBody    bool
+	bodyArgPos int
+	statusCode int
 }
 
 type returnVisitor struct {
 	fset          *token.FileSet
-	pkg           string
+	typeMap       map[string]Type
+	pkg           *packages.Package
 	responseTypes map[int]Type
+	responseFuncs map[string]responseFunc
 }
 
-func newReturnVisitor(fset *token.FileSet, pkg string) returnVisitor {
+func newReturnVisitor(fset *token.FileSet, pkg *packages.Package, typeMap map[string]Type, responseFuncs map[string]responseFunc) returnVisitor {
 	return returnVisitor{
 		fset:          fset,
 		pkg:           pkg,
+		typeMap:       typeMap,
 		responseTypes: map[int]Type{},
+		responseFuncs: responseFuncs,
 	}
+}
+
+func keyOf(n *types.Named) string {
+	key := n.Obj().Name()
+	if n.Obj().Pkg() != nil {
+		key = n.Obj().Pkg().Name() + "." + key
+	}
+	return key
+}
+
+func (v returnVisitor) isResponseFunc(r *ast.ReturnStmt) (ast.Expr, int, bool) {
+	if r == nil {
+		return nil, 0, false
+	}
+	if c, ok := isCallExpr(r.Results[0]); ok {
+		if i, ok := isIdent(c.Fun); ok {
+			for f, spec := range v.responseFuncs {
+				if i.Name == f {
+					if spec.hasBody {
+						return c.Args[spec.bodyArgPos], spec.statusCode, true
+					} else {
+						return nil, spec.statusCode, true
+					}
+				}
+			}
+		}
+	}
+	return nil, 0, false
 }
 
 func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 	if n == nil { // = nothing left to visit
 		return nil
 	}
-	switch r := n.(type) {
-	case *ast.ReturnStmt:
-		if len(r.Results) == 1 {
-			if c, ok := isCallExpr(r.Results[0]); ok {
-				if i, ok := isIdent(c.Fun); ok && i.Name == "etagResponse" && len(c.Args) >= 2 {
-					if j, ok := isIdent(c.Args[1]); ok && j.Obj != nil {
-						switch d := j.Obj.Decl.(type) {
-						case *ast.AssignStmt:
-							// ignore
-						case *ast.ValueSpec:
-							if len(d.Names) == 1 {
-								if t, ok := isIdent(d.Names[0]); ok && strings.HasPrefix(t.Name, "RBODY") {
-									suffix := t.Name[5:]
-									if suffix == "" {
-										v.responseTypes[200] = typeRef(v.fset, t.Name, d.Type, v.pkg)
-									} else {
-										code, err := strconv.Atoi(suffix)
-										if err != nil {
-											log.Fatalf("failed to parse integer status code in variable name '%v': %s", t.Name, err)
-										}
-										v.responseTypes[code] = typeRef(v.fset, t.Name, d.Type, v.pkg)
-									}
+	r, ok := n.(*ast.ReturnStmt)
+	if !ok {
+		return v
+	}
+	if a, code, ok := v.isResponseFunc(r); ok {
+		if a != nil {
+			switch x := a.(type) {
+			case *ast.SelectorExpr:
+				key := x.X.(*ast.Ident).Name + "." + x.Sel.Name
+				if m, ok := v.typeMap[key]; ok {
+					v.responseTypes[code] = m
+				} else {
+					keys := slices.Collect(maps.Keys(v.typeMap))
+					fmt.Printf("typemap has the following types:\n")
+					for _, k := range keys {
+						fmt.Printf("  - %s\n", k)
+					}
+					panic(fmt.Sprintf("failed to find the type '%s' in the typeMap", key))
+				}
+			case *ast.Ident:
+				if x.Obj == nil {
+					panic(fmt.Sprintf("response body argument is an ident that has a nil Obj: %v", x))
+				}
+				switch d := x.Obj.Decl.(type) {
+				case *ast.AssignStmt:
+					// ignore
+				case *ast.ValueSpec:
+					if len(d.Names) == 1 {
+						if t, ok := isIdent(d.Names[0]); ok && strings.HasPrefix(t.Name, "RBODY") {
+							suffix := t.Name[5:]
+							if suffix != "" {
+								var err error
+								code, err = strconv.Atoi(suffix)
+								if err != nil {
+									panic(fmt.Sprintf("failed to parse integer status code in variable name '%v': %s\n", t.Name, err))
 								}
 							}
-						default:
-							ast.Print(v.fset, d)
-							panic(fmt.Sprintf("unsupported return decl: %T %v", d, d))
+
+							key := ""
+							{
+								z := v.pkg.TypesInfo.Uses[x]
+								switch n := z.Type().(type) {
+								case *types.Named:
+									key = keyOf(n)
+								case *types.Slice:
+									if nn, ok := n.Elem().(*types.Named); ok {
+										key = keyOf(nn)
+									} else {
+										panic(fmt.Sprintf("unsupported slice elem: %T: %#v", n.Elem(), n.Elem()))
+									}
+								default:
+									panic(fmt.Sprintf("unsupported z: %T: %#v", z.Type(), z.Type()))
+								}
+							}
+							if m, ok := v.typeMap[key]; ok {
+								v.responseTypes[code] = m
+							} else {
+								panic(fmt.Sprintf("(x) not found: %v", key))
+							}
+						} else {
+							panic("it's not RBODY")
 						}
+					} else {
+						panic("d.Names len is not == 1")
 					}
+				default:
+					ast.Print(v.fset, d)
+					panic(fmt.Sprintf("unsupported return decl: %T %v", d, d))
 				}
 			}
+		} else {
+			// if a is nil, it means that there is no body
+			v.responseTypes[code] = nil
 		}
 	}
-
 	return v
 }
 
 type paramsVisitor struct {
 	fset          *token.FileSet
-	pkg           string
+	pkg           *packages.Package
+	typeMap       map[string]Type
 	queryParams   map[string]bool
 	uriParams     map[string]bool
 	bodyParams    map[string]bool
 	responseTypes map[int]Type
+	responseFuncs map[string]responseFunc
 }
 
-func newParamsVisitor(fset *token.FileSet, pkg string) paramsVisitor {
+func newParamsVisitor(fset *token.FileSet, pkg *packages.Package, typeMap map[string]Type, responseFuncs map[string]responseFunc) paramsVisitor {
 	return paramsVisitor{
 		fset:          fset,
 		pkg:           pkg,
+		typeMap:       typeMap,
 		queryParams:   map[string]bool{},
 		uriParams:     map[string]bool{},
 		bodyParams:    map[string]bool{},
 		responseTypes: map[int]Type{},
+		responseFuncs: responseFuncs,
 	}
 }
 
@@ -216,7 +309,7 @@ func (v paramsVisitor) isBodyCall(call *ast.CallExpr) (string, bool) {
 					case *ast.UnaryExpr:
 						if x, ok := isIdent(e.X); ok && e.Op == token.AND && x.Obj != nil {
 							if vs, ok := isValueSpec(x.Obj.Decl); ok {
-								n := nameOf(vs.Type, v.pkg)
+								n := nameOf(vs.Type, v.pkg.Name)
 								return n, true
 							} else {
 								log.Fatalf("unsupported call to Request.body(): UnaryExpr argument is not an Ident but a %v", e)
@@ -251,7 +344,7 @@ func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]Type, bool) {
 				if t, ok := isIdent(f.Type); ok && t.Name == "Groupware" {
 					a := call.Args[2]
 					if c, ok := isClosure(a); ok {
-						r := newReturnVisitor(v.fset, v.pkg)
+						r := newReturnVisitor(v.fset, v.pkg, v.typeMap, v.responseFuncs)
 						ast.Walk(r, c)
 						if len(r.responseTypes) > 0 {
 							return r.responseTypes, true
@@ -331,186 +424,102 @@ func parseComment(text string) string {
 	}
 }
 
-func impls(fset *token.FileSet, a *ast.File, source string) ([]Impl, []Type) {
-	if verbose {
-		fmt.Printf("[📃] \x1b[34;4;1m%s\x1b[0m\n", source)
-	}
-	ims := []Impl{}
-	types := []Type{}
-	pkg := ""
+type Model struct {
+	Routes           []Endpoint
+	UriParams        map[string]string
+	QueryParams      map[string]string
+	Impls            []Impl
+	Types            []Type
+	Enums            map[string][]string
+	DefaultResponses map[int]Type
+}
 
-	if p, ok := isIdent(a.Name); ok {
-		pkg = p.Name
-	} else {
-		log.Fatalf("no package name found")
-	}
-
-	for _, decl := range a.Decls {
-		switch d := decl.(type) {
-		case *ast.FuncDecl:
-			if isGroupwareRouteFunc(d) {
-				fun := nameOf(d.Name, pkg)
-				if verbose {
-					fmt.Printf("\x1b[4;1;34m%s\x1b[0m\n", fun)
-				}
-				comments := []string{}
-				resp := map[int]Resp{}
-				/*
-					if d.Doc != nil && d.Doc.List != nil {
-						for _, doc := range d.Doc.List {
-							comment := strings.TrimSpace(doc.Text)
-							if match := apiResponseRegex.FindAllStringSubmatch(comment, -1); len(match) > 0 {
-								statusCode, _ := strconv.Atoi(match[0][1]) // TODO err
-								ret := TypeRef{Name: match[0][2]}
-								resp[statusCode] = Resp{Type: ret}
-							}
-							comments = append(comments, doc.Text)
-						}
-					}
-				*/
-				if d.Doc != nil && d.Doc.List != nil {
-					for _, doc := range d.Doc.List {
-						comments = append(comments, parseComment(doc.Text))
-					}
-				}
-
-				v := newParamsVisitor(fset, pkg)
-				if d.Body != nil {
-					//ast.Print(fset, d.Body)
-					ast.Walk(v, d.Body)
-				}
-				for code, typename := range v.responseTypes {
-					resp[code] = Resp{Type: typename}
-				}
-				ims = append(ims, Impl{
-					Source:      source,
-					Fun:         fun,
-					Comments:    comments,
-					Resp:        resp,
-					QueryParams: keysOf(v.queryParams),
-					UriParams:   keysOf(v.uriParams),
-					BodyParams:  keysOf(v.bodyParams),
-				})
-				if verbose {
-					fmt.Printf("\n")
-				}
-			}
-		case *ast.GenDecl:
-			for _, spec := range d.Specs {
-				switch v := spec.(type) {
-				case *ast.TypeSpec:
-					tname := v.Name.Name
-					//if unicode.IsLower(rune(tname[0])) {
-					//	continue
-					//}
-
-					switch t := v.Type.(type) {
-					case *ast.StructType:
-						if strings.HasPrefix(tname, "Swagger") {
-							continue
-						}
-						fields := []Field{}
-						if t.Fields != nil && t.Fields.List != nil {
-							for _, f := range t.Fields.List {
-								if f != nil && f.Tag != nil {
-									fieldName := typeName(f.Names)
-									fields = append(fields, Field{
-										Pkg:  pkg,
-										Name: fieldName,
-										Type: typeRef(fset, fieldName, f.Type, pkg),
-										Tag:  tagOf(f),
-									})
-								}
-							}
-						}
-						types = append(types, newCustomType(pkg, tname, fields))
-					case *ast.InterfaceType:
-						types = append(types, newInterfaceType(pkg, tname))
-					default:
-						types = append(types, newAliasType(pkg, tname, typeRef(fset, tname, v.Type, pkg)))
-					}
-				}
-			}
+func (m Model) resolveType(k string) (Type, bool) {
+	for _, t := range m.Types {
+		if t.Key() == k {
+			return t, true
 		}
 	}
-	return ims, types
+	return nil, false
 }
 
-func hi(path string) string {
-	parts := strings.Split(path, "/")
-	result := make([]string, len(parts))
-	for i, part := range parts {
-		if strings.HasPrefix(part, "{") && strings.HasSuffix(part, "}") {
-			result[i] = "\x1b[35;1m" + part + "\x1b[0m"
-		} else {
-			result[i] = part
-		}
-	}
-	return strings.Join(result, "/")
-}
-
-func parse(filename string) (*token.FileSet, *ast.File, error) {
-	fset := token.NewFileSet()
-	src, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, nil, err
-	}
-	a, err := parser.ParseFile(fset, filename, src, parser.ParseComments+parser.AllErrors)
-	if err != nil {
-		return nil, nil, err
-	}
-	return fset, a, nil
-}
-
-var tagRegex = regexp.MustCompile(`json:"(.+?)(?:,(omitempty|omitzero))?"`)
-
-func fieldName(field Field) string {
-	if field.Tag == "" {
-		return field.Pkg + "." + field.Name
-	}
-	if m := tagRegex.FindAllStringSubmatch(field.Tag, 2); m != nil {
-		return m[0][1]
-	} else {
-		log.Fatalf("failed to parse tag '%v'", field.Tag)
-		return ""
-	}
-}
-
-func fieldType(field Field) string {
-	return field.Type.String()
-}
-
-func printType(t Type, m map[string]Type, e map[string]map[string]bool, l int, p string) {
-	clr := fmt.Sprintf("\x1b[%dm", 31+l)
-	pp := p + strings.Repeat("  ", l)
-
-	if len(t.Fields()) > 0 {
-		fmt.Printf("%s %s{\x1b[0m\n", t.String(), clr)
-		for _, f := range t.Fields() {
-			fmt.Printf("%s %s-\x1b[0m ", pp, clr)
-			if !strings.Contains(f.Type.String(), ".") {
-				fmt.Printf("\x1b[4m%s\x1b[0m %s\n", fieldName(f), fieldType(f))
-			} else {
-				fmt.Printf("\x1b[4m%s\x1b[0m ", fieldName(f))
-				printType(f.Type, m, e, l+1, p)
-			}
-		}
-		fmt.Printf("%s %s}\x1b[0m\n", pp, clr)
-	} else {
-		switch v := t.(type) {
-		case AliasType:
-			fmt.Printf("%s (%s)", t.Key(), v.typeRef.String())
-			if n, ok := e[t.Key()]; ok {
-				fmt.Printf(" [%s]", strings.Join(slices.Collect(maps.Keys(n)), ","))
-			}
-			fmt.Printf("\n")
-		default:
-			fmt.Printf("%s\n", t.String())
-		}
-	}
+type Sink interface {
+	Output(model Model)
 }
 
 var verbose bool = false
+
+func recv(s *types.Signature, pkg string, name string) bool {
+	if s == nil {
+		return false
+	}
+	r := s.Recv()
+	if r == nil {
+		return false
+	}
+	t := r.Type()
+	if t == nil {
+		return false
+	}
+	p, ok := t.(*types.Pointer)
+	if ok {
+		t = p.Elem()
+	}
+	n, ok := t.(*types.Named)
+	if !ok {
+		return false
+	}
+	return n.Obj().Name() == name && n.Obj().Pkg() != nil && n.Obj().Pkg().Name() == pkg
+}
+
+func p(v *types.Var, pkg string, name string) bool {
+	t := v.Type()
+	if p, ok := t.(*types.Pointer); ok {
+		t = p.Elem()
+	}
+	switch n := t.(type) {
+	case *types.Named:
+		return n.Obj() != nil && n.Obj().Name() == name && n.Obj().Pkg() != nil && n.Obj().Pkg().Path() == pkg
+	}
+	return false
+}
+
+func isRouteFun(f *types.Func) bool {
+	if !f.Exported() {
+		return false
+	}
+	s := f.Signature()
+	if s.Results() != nil && s.Results().Len() != 0 { // must have no results
+		return false
+	}
+	if !recv(s, "groupware", "Groupware") { // must be a pointer method of groupware.Groupware
+		return false
+	}
+	if s.Params() == nil || s.Params().Len() != 2 { // must have 2 parameters
+		return false
+	}
+	matches := p(s.Params().At(0), "net/http", "ResponseWriter") && p(s.Params().At(1), "net/http", "Request")
+	return matches
+}
+
+func findFun(n string, p *packages.Package, fun *types.Func) (*ast.FuncDecl, string, bool) {
+	for i, f := range p.CompiledGoFiles {
+		s := p.Syntax[i] // TODO doesn't necessarily fit, can have nils that are compacted away
+		for _, d := range s.Decls {
+			switch x := d.(type) {
+			case *ast.FuncDecl:
+				fname := s.Name.Name + "." + x.Name.Name
+				if n == fname {
+					return x, f, true
+				}
+				if fun.Pos() <= x.Pos() && x.End() >= fun.Pos() {
+					return x, f, true
+				}
+			}
+		}
+	}
+	return nil, "", false
+}
 
 func main() {
 	chdir := ""
@@ -518,152 +527,194 @@ func main() {
 	flag.BoolVar(&verbose, "v", false, "Output verbose information while parsing source files")
 	flag.Parse()
 
+	var err error
+	basepath := ""
 	if chdir != "" {
-		err := os.Chdir(chdir)
+		basepath, err = filepath.Abs(chdir)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalf("failed to make an absolute path out of '%s': %v", chdir, err)
+		}
+	} else {
+		basepath, err = os.Getwd()
+		if err != nil {
+			log.Fatalf("failed to get current working directory: %v", err)
+		}
+		basepath, err = filepath.Abs(basepath)
+		if err != nil {
+			log.Fatalf("failed to make an absolute path out of the current working directory '%s': %v", chdir, err)
 		}
 	}
 
+	routeFuncs := map[string]*types.Func{}
+	typeMap := map[string]Type{}
+	constsMap := map[string]bool{}
 	var routes []Endpoint
 	var uriParams map[string]string
 	var queryParams map[string]string
-	{
-		_, a, err := parse("services/groupware/pkg/groupware/groupware_route.go")
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		pkg := ""
-		if i, ok := isIdent(a.Name); ok {
-			pkg = i.Name
-		} else {
-			log.Fatalf("failed to determine package name of groupware_route.go")
-		}
-
-		route := pickRoute(a)
-		if route == nil {
-			log.Fatal("failed to find Route() method")
-		}
-
-		routes = endpoints("/", route.Body.List, pkg)
-		uriParams, queryParams = params(a.Decls)
-	}
-
-	// load everything else and match the functions
 	ims := []Impl{}
-	types := []Type{}
 	{
-		sources, err := os.ReadDir("services/groupware/pkg/groupware")
+		cfg := &packages.Config{
+			Mode:  packages.LoadSyntax,
+			Dir:   chdir,
+			Tests: false,
+		}
+		pkgs, err := packages.Load(cfg,
+			"./services/groupware/pkg/groupware",
+			"./pkg/jmap",
+			"./pkg/jscontact",
+			"./pkg/jscalendar",
+		)
 		if err != nil {
 			log.Fatal(err)
 		}
-		for _, source := range sources {
-			filename := source.Name()
-			if !(strings.HasPrefix(filename, "groupware_") && strings.HasSuffix(filename, "go")) {
+		if packages.PrintErrors(pkgs) > 0 {
+			panic("package errors")
+		}
+
+		// TODO extract the response funcs from the source code: look for functions in the groupware package that return a Response object, and look for the "body" parameter
+		responseFuncs := map[string]responseFunc{
+			"etagResponse":              {true, 1, http.StatusOK},
+			"response":                  {true, 1, http.StatusOK},
+			"noContentResponse":         {false, -1, http.StatusNoContent},
+			"noContentResponseWithEtag": {false, -1, http.StatusNoContent},
+			"notFoundResponse":          {false, -1, http.StatusNotFound},
+			"etagNotFoundResponse":      {false, -1, http.StatusNotFound},
+			"notImplementedResponse":    {false, -1, http.StatusNotImplemented},
+		}
+
+		for _, p := range pkgs {
+			if !slices.Contains(PackageIDs, p.ID) {
 				continue
 			}
 
-			fset, b, err := parse(filepath.Join("services/groupware/pkg/groupware", filename))
-			if err != nil {
-				log.Fatal(err)
+			for _, name := range p.Types.Scope().Names() {
+				obj := p.Types.Scope().Lookup(name)
+				switch t := obj.Type().(type) {
+				case *types.Signature:
+					// skip methods
+				case *types.Named:
+					r := typeOf(t, typeMap)
+					if r != nil {
+						typeMap[r.Key()] = r
+					}
+				case *types.Basic:
+					switch t.Kind() {
+					case types.UntypedString, types.String:
+						constsMap[name] = true
+					case types.UntypedInt, types.Int, types.UntypedBool, types.Bool:
+						// ignore
+					default:
+						panic(fmt.Sprintf("> %s is Basic but not string: %s\n", name, t.Name()))
+					}
+				case *types.Slice:
+					//fmt.Printf("globvar(slice): %s: %s\n", name, t.String())
+				case *types.Map:
+					//fmt.Printf("globvar(map): %s: %s\n", name, t.String())
+				case *types.Pointer:
+					//fmt.Printf("globvar(ptr): %s: %s\n", name, t.String())
+				default:
+					panic(fmt.Sprintf("> %s is not Named but %T\n", name, t))
+				}
 			}
-
-			sourceIms, sourceTypes := impls(fset, b, filename)
-			ims = append(ims, sourceIms...)
-			types = append(types, sourceTypes...)
 		}
-	}
 
-	{
-		for _, d := range []string{"pkg/jmap", "pkg/jscontact", "pkg/jscalendar"} {
-			sources, err := os.ReadDir(d)
-			if err != nil {
-				log.Fatal(err)
+		for _, p := range pkgs {
+			if p.ID != GroupwarePackageID {
+				continue
 			}
-			for _, source := range sources {
-				filename := source.Name()
-				if !strings.HasSuffix(filename, "_model.go") {
+			for _, d := range p.TypesInfo.Defs {
+				if d == nil {
 					continue
 				}
-				fset, b, err := parse(filepath.Join(d, filename))
+				if f, ok := d.(*types.Func); ok && isRouteFun(f) {
+					routeFuncs[p.Name+"."+f.Name()] = f
+				}
+			}
+
+			var syntax *ast.File = nil
+			for i, f := range p.CompiledGoFiles {
+				rf, err := filepath.Rel(basepath, f)
 				if err != nil {
-					log.Fatal(err)
+					panic(err)
 				}
-				_, sourceTypes := impls(fset, b, filename)
-				//ims = append(ims, sourceIms...)
-				types = append(types, sourceTypes...)
-			}
-		}
-
-	}
-
-	typeMap := map[string]Type{}
-	for _, t := range types {
-		typeMap[t.Key()] = t
-	}
-	enums := map[string]map[string]bool{}
-	for k := range typeMap {
-		for s := range typeMap {
-			if s != k && strings.HasPrefix(s, k) {
-				if _, ok := enums[k]; !ok {
-					enums[k] = map[string]bool{}
-				}
-				enums[k][s] = true
-			}
-		}
-	}
-
-	if verbose {
-		fmt.Printf("\x1b[4mTypes:\x1b[0m\n")
-		for _, t := range types {
-			fmt.Printf("  \x1b[33m%s\x1b[0m\n", t.Key())
-			for _, f := range t.Fields() {
-				fmt.Printf("    · \x1b[34m%s\x1b[0m %s\n", f.Name, f.Type)
-			}
-		}
-		fmt.Println()
-	}
-
-	imMap := map[string]Impl{}
-	for _, im := range ims {
-		imMap[im.Fun] = im
-	}
-
-	fmt.Printf("\x1b[4mRoutes:\x1b[0m\n")
-	for _, r := range routes {
-		fmt.Printf("\x1b[33m%7.7s\x1b[0m %s \x1b[36m[%s]\x1b[0m", r.Verb, hi(r.Path), r.Fun)
-		if im, ok := imMap[r.Fun]; ok {
-			fmt.Printf(" \x1b[34m%s\x1b[0m\n", im.Source)
-			for _, c := range im.Comments {
-				fmt.Printf("        \x1b[30;1m# %s\x1b[0m\n", c)
-			}
-			for _, p := range im.UriParams {
-				fmt.Printf("        \x1b[35m· /\x1b[0m\x1b[1;35m%s\x1b[0m\n", uriParams[p])
-			}
-			for _, p := range im.QueryParams {
-				fmt.Printf("        \x1b[34m· ?\x1b[0m\x1b[1;34m%s\x1b[0;34m=\x1b[0m\n", queryParams[p])
-			}
-			for _, p := range im.BodyParams {
-				fmt.Printf("        \x1b[36m· {\x1b[0m")
-				if t, ok := typeMap[p]; ok {
-					pfx := "          "
-					printType(t, typeMap, enums, 0, pfx)
+				if rf == "services/groupware/pkg/groupware/groupware_route.go" {
+					syntax = p.Syntax[i]
 				}
 			}
-
-			for statusCode, resp := range im.Resp {
-				clr := "41;33;1"
-				if statusCode < 300 {
-					clr = "42;37;1"
+			if syntax != nil {
+				route := pickRoute(syntax)
+				if route == nil {
+					log.Fatal("failed to find Route() method")
 				}
-				pfx := "        " + strings.Repeat(" ", int(math.Log10(float64(statusCode)))+1) + "  "
-				fmt.Printf("        \x1b[%sm%d\x1b[0m ", clr, statusCode)
-				printType(resp.Type, typeMap, enums, 0, pfx)
+
+				routes = endpoints("/", route.Body.List, p.Name)
+				uriParams, queryParams = params(syntax.Decls)
+
+				for n, f := range routeFuncs {
+					if fun, source, ok := findFun(n, p, f); ok {
+						comments := []string{}
+						if fun.Doc != nil && len(fun.Doc.List) > 0 {
+							for _, doc := range fun.Doc.List {
+								comments = append(comments, parseComment(doc.Text))
+							}
+						}
+
+						resp := map[int]Resp{}
+						pv := newParamsVisitor(p.Fset, p, typeMap, responseFuncs)
+						if fun.Body != nil {
+							ast.Walk(pv, fun.Body)
+							for code, typename := range pv.responseTypes {
+								resp[code] = Resp{Type: typename}
+							}
+						}
+						source, err := filepath.Rel(basepath, source)
+						if err != nil {
+							panic(err)
+						}
+
+						ims = append(ims, Impl{
+							Name:        n,
+							Fun:         fun,
+							Source:      source,
+							Comments:    comments,
+							Resp:        resp,
+							QueryParams: keysOf(pv.queryParams),
+							UriParams:   keysOf(pv.uriParams),
+							BodyParams:  keysOf(pv.bodyParams),
+						})
+					} else {
+						panic(fmt.Sprintf("failed to find syntax for route function %s\n", n))
+					}
+				}
+			} else {
+				panic("failed to find syntax for groupware_route.go")
 			}
-		} else {
-			fmt.Printf(" ❌ not found\n")
 		}
-		fmt.Println()
 	}
+
+	enums := map[string][]string{} // TODO
+
+	defaultResponses := map[int]Type{}
+	{
+		if t, ok := typeMap["groupware.ErrorResponse"]; ok {
+			for _, statusCode := range []int{400, 404, 500} {
+				defaultResponses[statusCode] = t
+			}
+		}
+	}
+
+	types := slices.Collect(maps.Values(typeMap))
+
+	model := Model{
+		Routes:           routes,
+		UriParams:        uriParams,
+		QueryParams:      queryParams,
+		Impls:            ims,
+		Types:            types,
+		Enums:            enums,
+		DefaultResponses: defaultResponses,
+	}
+
+	o := AnsiSink{}
+	o.Output(model)
 }

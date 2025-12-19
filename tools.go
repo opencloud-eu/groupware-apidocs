@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
-	"slices"
 	"strings"
 )
 
@@ -18,38 +17,6 @@ func ident(expr ast.Expr, name string) bool {
 	return false
 }
 
-var builtins = []string{
-	"bool",
-	"string",
-	"int",
-	"uint",
-	"time.Time",
-	"[]string",
-	"[]bool",
-	"[]int",
-	"[]uint",
-	"[]time.Time",
-}
-
-func isBuiltinType(t string) bool {
-	return slices.Contains(builtins, t)
-}
-
-func isBuiltinSelectorType(pkg string, name string) bool {
-	return slices.Contains(builtins, pkg+"."+name)
-}
-
-func tagOf(field *ast.Field) string {
-	if field == nil || field.Tag == nil {
-		return ""
-	}
-	if field.Tag.Kind == token.STRING {
-		return field.Tag.Value
-	} else {
-		return ""
-	}
-}
-
 func isParamType(field *ast.Field, pkg string, name string) bool {
 	if field == nil || field.Type == nil {
 		return false
@@ -58,24 +25,6 @@ func isParamType(field *ast.Field, pkg string, name string) bool {
 	case *ast.SelectorExpr:
 		if w.Sel != nil && w.Sel.Name == name && ident(w.X, pkg) {
 			return true
-		}
-	}
-	return false
-}
-
-func isParamPtrType(field *ast.Field, pkg string, name string) bool {
-	if field == nil || field.Type == nil {
-		return false
-	}
-	switch w := field.Type.(type) {
-	case *ast.StarExpr:
-		if w.X != nil {
-			switch z := w.X.(type) {
-			case *ast.SelectorExpr:
-				if z.Sel != nil && z.Sel.Name == name && ident(z.X, pkg) {
-					return true
-				}
-			}
 		}
 	}
 	return false
@@ -137,16 +86,6 @@ func keysOf[K comparable, V any](m map[K]V) []K {
 		i++
 	}
 	return r
-}
-
-func typeName(names []*ast.Ident) string {
-	parts := []string{}
-	for _, n := range names {
-		if n.Name != "" {
-			parts = append(parts, n.Name)
-		}
-	}
-	return strings.Join(parts, "")
 }
 
 func isCallExpr(expr ast.Expr) (*ast.CallExpr, bool) {

@@ -2,60 +2,39 @@ package main
 
 import (
 	"fmt"
-	"go/ast"
-	"go/token"
-	"log"
+	"go/types"
+	"regexp"
+	"slices"
 )
 
-func typeRef(fset *token.FileSet, name string, expr ast.Expr, pkg string) Type {
-	switch t := expr.(type) {
-	case *ast.StructType:
-		fields := []Field{}
-		if t.Fields != nil && t.Fields.List != nil {
-			for _, f := range t.Fields.List {
-				if f != nil && f.Tag != nil {
-					fieldName := typeName(f.Names)
-					fields = append(fields, Field{
-						Pkg:  pkg,
-						Name: fieldName,
-						Type: typeRef(fset, fieldName, f.Type, pkg),
-						Tag:  tagOf(f),
-					})
-				}
-			}
-		}
-		return newCustomType(pkg, name, fields)
-	case *ast.Ident:
-		if isBuiltinType(t.Name) {
-			return newBuiltinType("", t.Name)
-		} else {
-			return newCustomType(pkg, t.Name, []Field{})
-		}
-	case *ast.StarExpr:
-		return typeRef(fset, name, t.X, pkg)
-	case *ast.SelectorExpr:
-		if x, ok := isIdent(t.X); ok {
-			if isBuiltinSelectorType(x.Name, t.Sel.Name) {
-				return newBuiltinType(x.Name, t.Sel.Name)
-			} else {
-				return newCustomType(x.Name, t.Sel.Name, []Field{})
-			}
-		} else {
-			panic(fmt.Sprintf("typeName(): unsupported SelectorExpr type: %T %v", expr, expr))
-		}
-	case *ast.MapType:
-		return newMapType(typeRef(fset, "key", t.Key, pkg), typeRef(fset, "value", t.Value, pkg))
-	case *ast.ArrayType:
-		return newArrayType(typeRef(fset, name, t.Elt, pkg))
-	default:
-		ast.Print(fset, expr)
-		log.Fatalf("typeRef: unsupported type %T", expr)
-		return nil
+type Field struct {
+	Name string
+	Attr string
+	Type Type
+	Tag  string
+}
+
+var tagRegex = regexp.MustCompile(`json:"(.+?)(?:,(omitempty|omitzero))?"`)
+
+func newField(name string, t Type, tag string) (Field, bool) {
+	attr := ""
+	if m := tagRegex.FindAllStringSubmatch(tag, 2); m != nil {
+		attr = m[0][1]
 	}
+	if attr == "-" {
+		return Field{}, false
+	}
+	return Field{
+		Name: name,
+		Attr: attr,
+		Type: t,
+		Tag:  tag,
+	}, true
 }
 
 type Type interface {
 	Key() string
+	Name() string
 	IsArray() bool
 	IsMap() bool
 	Deref() (Type, bool)
@@ -76,6 +55,10 @@ type AliasType struct {
 
 func (t AliasType) Key() string {
 	return t.String()
+}
+
+func (t AliasType) Name() string {
+	return t.name
 }
 
 func (t AliasType) IsArray() bool {
@@ -115,6 +98,10 @@ type InterfaceType struct {
 
 func (t InterfaceType) Key() string {
 	return t.String()
+}
+
+func (t InterfaceType) Name() string {
+	return t.name
 }
 
 func (t InterfaceType) IsArray() bool {
@@ -160,6 +147,10 @@ func (t BuiltinType) Key() string {
 	}
 }
 
+func (t BuiltinType) Name() string {
+	return t.name
+}
+
 func (t BuiltinType) IsArray() bool {
 	return false
 }
@@ -202,6 +193,10 @@ func (t ArrayType) Key() string {
 	return t.elt.Key()
 }
 
+func (t ArrayType) Name() string {
+	return t.elt.Name()
+}
+
 func (t ArrayType) IsArray() bool {
 	return true
 }
@@ -227,50 +222,54 @@ func (t ArrayType) Fields() []Field {
 }
 
 func (t ArrayType) Element() (Type, bool) {
-	return t.elt, false
+	return t.elt, true
 }
 
 var _ Type = ArrayType{}
 
-func newCustomType(pkg string, name string, fields []Field) CustomType {
-	return CustomType{pkg: pkg, name: name, fields: fields}
+func newStructType(pkg string, name string, fields []Field) StructType {
+	return StructType{pkg: pkg, name: name, fields: fields}
 }
 
-type CustomType struct {
+type StructType struct {
 	pkg    string
 	name   string
 	fields []Field
 }
 
-func (t CustomType) Key() string {
+func (t StructType) Key() string {
 	return t.String()
 }
 
-func (t CustomType) IsArray() bool {
+func (t StructType) Name() string {
+	return t.name
+}
+
+func (t StructType) IsArray() bool {
 	return false
 }
 
-func (t CustomType) IsMap() bool {
+func (t StructType) IsMap() bool {
 	return false
 }
 
-func (t CustomType) String() string {
+func (t StructType) String() string {
 	return t.pkg + "." + t.name
 }
 
-func (t CustomType) Deref() (Type, bool) {
+func (t StructType) Deref() (Type, bool) {
 	return nil, false
 }
 
-func (t CustomType) Fields() []Field {
+func (t StructType) Fields() []Field {
 	return t.fields
 }
 
-func (t CustomType) Element() (Type, bool) {
+func (t StructType) Element() (Type, bool) {
 	return nil, false
 }
 
-var _ Type = CustomType{}
+var _ Type = StructType{}
 
 func newMapType(key Type, value Type) MapType {
 	return MapType{key: key, value: value}
@@ -283,6 +282,10 @@ type MapType struct {
 
 func (t MapType) Key() string {
 	return t.String()
+}
+
+func (t MapType) Name() string {
+	return t.value.Name()
 }
 
 func (t MapType) IsArray() bool {
@@ -322,3 +325,110 @@ func (t MapType) Element() (Type, bool) {
 }
 
 var _ Type = MapType{}
+
+func typeOf(t types.Type, mem map[string]Type) Type {
+	switch t := t.(type) {
+	case *types.Named:
+		name := t.Obj().Name()
+		pkg := ""
+		if t.Obj().Pkg() != nil {
+			pkg = t.Obj().Pkg().Name()
+			if isBuiltinSelectorType(pkg, name) { // for things like time.Time
+				return newBuiltinType(pkg, name)
+			}
+		} else {
+			if isBuiltinType(name) {
+				return newBuiltinType("", name)
+			}
+		}
+		switch u := t.Underlying().(type) {
+		case *types.Basic:
+			return newAliasType(pkg, name, newBuiltinType("", u.Name()))
+		case *types.Interface:
+			return newInterfaceType(pkg, name)
+		case *types.Map:
+			return newMapType(typeOf(u.Key(), mem), typeOf(u.Elem(), mem))
+		case *types.Array:
+			return newArrayType(typeOf(u.Elem(), mem))
+		case *types.Slice:
+			return newArrayType(typeOf(u.Elem(), mem))
+		case *types.Pointer:
+			return typeOf(u.Elem(), mem)
+		case *types.Struct:
+			id := fmt.Sprintf("%s.%s", pkg, name)
+			if ex, ok := mem[id]; ok {
+				return ex
+			}
+			fields := []Field{}
+			r := newStructType(pkg, name, fields)
+			mem[id] = r
+			for i := range u.NumFields() {
+				f := u.Field(i)
+				switch f.Type().Underlying().(type) {
+				case *types.Signature:
+					// skip methods
+				default:
+					typ := typeOf(f.Type(), mem)
+					tag := u.Tag(i)
+					if field, ok := newField(f.Name(), typ, tag); ok {
+						fields = append(fields, field)
+					}
+				}
+			}
+			r.fields = fields
+			return r
+		default:
+			panic(fmt.Sprintf("! underlying of named %s.%s is not struct but %T", pkg, name, u))
+		}
+	case *types.Basic:
+		return newBuiltinType("", t.Name())
+	case *types.Map:
+		return newMapType(typeOf(t.Key(), mem), typeOf(t.Elem(), mem))
+	case *types.Array:
+		return newArrayType(typeOf(t.Elem(), mem))
+	case *types.Slice:
+		return newArrayType(typeOf(t.Elem(), mem))
+	case *types.Pointer:
+		return typeOf(t.Elem(), mem)
+	case *types.Alias:
+		pkg := ""
+		if t.Obj().Pkg() != nil {
+			pkg = t.Obj().Pkg().Name()
+		}
+		return newAliasType(pkg, t.Obj().Name(), typeOf(t.Underlying(), mem))
+	case *types.Interface:
+		if t.String() == "any" {
+			return newBuiltinType("", "any")
+		} else {
+			panic(fmt.Sprintf("interface? %v\n", t))
+		}
+	case *types.TypeParam:
+		// ignore
+		return nil
+	case *types.Chan:
+		// ignore
+		return nil
+	case *types.Struct:
+		// ignore unnamed struct
+		return nil
+	default:
+		panic(fmt.Sprintf("unsupported: ?: %T: %#v", t, t))
+	}
+}
+
+var builtins = []string{
+	"any",
+	"bool",
+	"string",
+	"int",
+	"uint",
+	"error",
+}
+
+func isBuiltinType(t string) bool {
+	return slices.Contains(builtins, t)
+}
+
+func isBuiltinSelectorType(pkg string, _ string) bool {
+	return !slices.Contains(packagesOfInterest, pkg)
+}
