@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"maps"
 	"math"
 	"slices"
@@ -13,7 +14,7 @@ type AnsiSink struct {
 
 var _ Sink = AnsiSink{}
 
-func (s AnsiSink) Output(model Model) {
+func (s AnsiSink) Output(model Model, w io.Writer) error {
 	typeMap := map[string]Type{}
 	for _, t := range model.Types {
 		typeMap[t.Key()] = t
@@ -24,35 +25,40 @@ func (s AnsiSink) Output(model Model) {
 	}
 
 	if verbose {
-		fmt.Printf("\x1b[4mTypes:\x1b[0m\n")
+		fmt.Fprintf(w, "\x1b[4mTypes:\x1b[0m\n")
 		for _, t := range model.Types {
-			fmt.Printf("  \x1b[33m%s\x1b[0m\n", t.Key())
+			fmt.Fprintf(w, "  \x1b[33m%s\x1b[0m\n", t.Key())
 			for _, f := range t.Fields() {
-				fmt.Printf("    · \x1b[34m%s\x1b[0m %s\n", f.Name, f.Type)
+				fmt.Fprintf(w, "    · \x1b[34m%s\x1b[0m %s\n", f.Name, f.Type)
 			}
 		}
-		fmt.Println()
+		fmt.Fprintf(w, "\n")
 	}
 
-	fmt.Printf("\x1b[4mRoutes:\x1b[0m\n")
+	fmt.Fprintf(w, "\x1b[4mRoutes:\x1b[0m\n")
 	for _, r := range model.Routes {
-		fmt.Printf("\x1b[33m%7.7s\x1b[0m %s \x1b[36m[%s]\x1b[0m", r.Verb, s.hi(r.Path), r.Fun)
+		fmt.Fprintf(w, "\x1b[33m%7.7s\x1b[0m %s \x1b[36m[%s]\x1b[0m", r.Verb, s.hi(r.Path), r.Fun)
 		if im, ok := imMap[r.Fun]; ok {
-			fmt.Printf(" \x1b[34m%s\x1b[0m\n", im.Source)
+			fmt.Fprintf(w, " \x1b[34m%s\x1b[0m\n", im.Source)
 			for _, c := range im.Comments {
-				fmt.Printf("        \x1b[30;1m# %s\x1b[0m\n", c)
+				fmt.Fprintf(w, "        \x1b[30;1m# %s\x1b[0m\n", c)
 			}
-			for _, p := range im.UriParams {
-				fmt.Printf("        \x1b[35m· /\x1b[0m\x1b[1;35m%s\x1b[0m\n", model.UriParams[p])
+			for _, p := range im.PathParams {
+				fmt.Fprintf(w, "        \x1b[35m· /\x1b[0m\x1b[1;35m%s\x1b[0m\n", model.PathParams[p.Name].Name)
 			}
 			for _, p := range im.QueryParams {
-				fmt.Printf("        \x1b[34m· ?\x1b[0m\x1b[1;34m%s\x1b[0;34m=\x1b[0m\n", model.QueryParams[p])
+				fmt.Fprintf(w, "        \x1b[34m· ?\x1b[0m\x1b[1;34m%s\x1b[0;34m=\x1b[0m\n", model.QueryParams[p.Name].Name)
+			}
+			for _, p := range im.HeaderParams {
+				fmt.Fprintf(w, "        \x1b[34m· H\x1b[0m\x1b[1;34m%s\x1b[0;34m=\x1b[0m\n", model.HeaderParams[p.Name].Name)
 			}
 			for _, p := range im.BodyParams {
-				fmt.Printf("        \x1b[36m· {\x1b[0m")
+				fmt.Fprintf(w, "        \x1b[36m· {\x1b[0m")
 				if t, ok := typeMap[p]; ok {
 					pfx := "          "
-					s.printType(t, model, 0, pfx, []string{})
+					if err := s.printType(w, t, model, 0, pfx, []string{}); err != nil {
+						return err
+					}
 				}
 			}
 
@@ -72,19 +78,22 @@ func (s AnsiSink) Output(model Model) {
 					clr = "32;1"
 				}
 				pfx := "        " + strings.Repeat(" ", int(math.Log10(float64(statusCode)))+1) + "  "
-				fmt.Printf("        \x1b[%sm%d\x1b[0m ", clr, statusCode)
+				fmt.Fprintf(w, "        \x1b[%sm%d\x1b[0m ", clr, statusCode)
 				if resp.Type != nil {
-					s.printType(resp.Type, model, 0, pfx, []string{})
+					if err := s.printType(w, resp.Type, model, 0, pfx, []string{}); err != nil {
+						return err
+					}
 				} else {
-					fmt.Printf("-\n")
+					fmt.Fprintf(w, "-\n")
 				}
 			}
 
 		} else {
-			panic(fmt.Sprintf(" ❌ not found: %s\n", r.Fun))
+			return fmt.Errorf(" ❌ not found: %s\n", r.Fun)
 		}
-		fmt.Println()
+		fmt.Fprintf(w, "\n")
 	}
+	return nil
 }
 
 func (s AnsiSink) hi(path string) string {
@@ -108,11 +117,11 @@ func (s AnsiSink) fieldType(field Field) string {
 	return field.Type.String()
 }
 
-func (s AnsiSink) printType(t Type, model Model, l int, p string, path []string) {
+func (s AnsiSink) printType(w io.Writer, t Type, model Model, l int, p string, path []string) error {
 	clr := fmt.Sprintf("\x1b[%dm", 31+l)
 	pp := p + strings.Repeat("  ", l)
 	if l > 10 {
-		panic("level is >5")
+		return fmt.Errorf("level is >10: %d", l)
 	}
 	recurse := true
 	if slices.Contains(path, t.Key()) {
@@ -121,18 +130,20 @@ func (s AnsiSink) printType(t Type, model Model, l int, p string, path []string)
 
 	switch v := t.(type) {
 	case AliasType:
-		fmt.Printf("%s (%s)", t.Key(), v.typeRef.String())
+		fmt.Fprintf(w, "%s (%s)", t.Key(), v.typeRef.String())
 		if n, ok := model.Enums[t.Key()]; ok {
-			fmt.Printf(" [%s]", strings.Join(n, ","))
+			fmt.Fprintf(w, " [%s]", strings.Join(n, ","))
 		}
-		fmt.Printf("\n")
+		fmt.Fprintf(w, "\n")
 	case ArrayType:
 		if n, ok := v.Element(); ok {
-			fmt.Printf("%s%s\x1b[0m", clr, "[]")
+			fmt.Fprintf(w, "%s%s\x1b[0m", clr, "[]")
 			//path = append(path, t.Key())
-			s.printType(n, model, l+1, p, path)
+			if err := s.printType(w, n, model, l+1, p, path); err != nil {
+				return err
+			}
 		} else {
-			fmt.Printf("%s\n", t.String())
+			fmt.Fprintf(w, "%s\n", t.String())
 		}
 	case StructType:
 		if recurse {
@@ -142,22 +153,25 @@ func (s AnsiSink) printType(t Type, model Model, l int, p string, path []string)
 					fields = r.Fields()
 				}
 			}
-			fmt.Printf("%s %s{\x1b[0m\n", t.String(), clr)
+			fmt.Fprintf(w, "%s %s{\x1b[0m\n", t.String(), clr)
 			for _, f := range fields {
-				fmt.Printf("%s %s-\x1b[0m ", pp, clr)
+				fmt.Fprintf(w, "%s %s-\x1b[0m ", pp, clr)
 				if !strings.Contains(f.Type.String(), ".") {
-					fmt.Printf("\x1b[4m%s\x1b[0m %s\n", s.fieldName(f), s.fieldType(f))
+					fmt.Fprintf(w, "\x1b[4m%s\x1b[0m %s\n", s.fieldName(f), s.fieldType(f))
 				} else {
-					fmt.Printf("\x1b[4m%s\x1b[0m ", s.fieldName(f))
+					fmt.Fprintf(w, "\x1b[4m%s\x1b[0m ", s.fieldName(f))
 					path = append(path, t.Key())
-					s.printType(f.Type, model, l+1, p, path)
+					if err := s.printType(w, f.Type, model, l+1, p, path); err != nil {
+						return err
+					}
 				}
 			}
-			fmt.Printf("%s %s}\x1b[0m\n", pp, clr)
+			fmt.Fprintf(w, "%s %s}\x1b[0m\n", pp, clr)
 		} else {
-			fmt.Printf("%s %s↩️\x1b[0m\n", t.String(), clr)
+			fmt.Fprintf(w, "%s %s↩️\x1b[0m\n", t.String(), clr)
 		}
 	default:
-		fmt.Printf("%s\n", t.String())
+		fmt.Fprintf(w, "%s\n", t.String())
 	}
+	return nil
 }

@@ -1,11 +1,56 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"go/ast"
 	"go/token"
+	"log"
+	"maps"
+	"slices"
 	"strings"
+	"unicode/utf8"
+
+	"github.com/pb33f/libopenapi/orderedmap"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
+
+func isMemberFunc(call *ast.CallExpr, pkg string, name string) bool {
+	s, ok := isSelector(call.Fun)
+	if !ok {
+		return false
+	}
+	if m, ok := isIdent(s.Sel); !(ok && m.Name == name) {
+		return false
+	}
+	if x, ok := isIdent(s.X); ok {
+		switch d := x.Obj.Decl.(type) {
+		case *ast.Field:
+			if t, ok := isIdent(d.Type); ok {
+				return t.Name == pkg
+			}
+		default:
+			log.Panicf("isMemberFunc: unsupported x ident decl: %#v", d)
+		}
+		return false
+	}
+	return true
+}
+
+func isStaticFunc(call *ast.CallExpr, pkg string, name string) bool {
+	s, ok := isSelector(call.Fun)
+	if !ok {
+		return false
+	}
+	if m, ok := isIdent(s.Sel); !(ok && m.Name == name) {
+		return false
+	}
+	if p, ok := isIdent(s.X); !(ok && p.Name == pkg) {
+		return false
+	}
+	return true
+}
 
 func ident(expr ast.Expr, name string) bool {
 	if expr != nil {
@@ -56,36 +101,48 @@ func isMemberOf(f ast.Decl, name string) bool {
 	return false
 }
 
-func nameOf(expr ast.Expr, pkg string) string {
+func nameOf(expr ast.Expr, pkg string) (string, error) {
 	switch e := expr.(type) {
 	case *ast.Ident:
-		if pkg != "" {
-			return pkg + "." + e.Name
+		if isBuiltinType(e.Name) {
+			return e.Name, nil
+		} else if pkg != "" {
+			return pkg + "." + e.Name, nil
 		} else {
-			return e.Name
+			return e.Name, nil
 		}
 	case *ast.SelectorExpr:
 		if x, ok := isIdent(e.X); ok {
-			return x.Name + "." + e.Sel.Name
+			return x.Name + "." + e.Sel.Name, nil
 		} else {
-			panic(fmt.Sprintf("typeName(): unsupported SelectorExpr type: %T %v", expr, expr))
+			return "", fmt.Errorf("typeName(): unsupported SelectorExpr type: %T %v", expr, expr)
 		}
 	case *ast.ArrayType:
-		return fmt.Sprintf("[]%s", nameOf(e.Elt, pkg))
+		if deref, err := nameOf(e.Elt, pkg); err == nil {
+			return fmt.Sprintf("[]%s", deref), nil
+		} else {
+			return "", nil
+		}
 	case *ast.MapType:
-		return fmt.Sprintf("map[%s]%s", nameOf(e.Key, pkg), nameOf(e.Value, pkg))
+		keyDeref, err := nameOf(e.Key, pkg)
+		if err != nil {
+			return "", err
+		}
+		valueDeref, err := nameOf(e.Value, pkg)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("map[%s]%s", keyDeref, valueDeref), nil
 	}
-	panic(fmt.Sprintf("nameOf(): unsupported expression type: %T %v", expr, expr))
+	return "", fmt.Errorf("nameOf(): unsupported expression type: %T %v", expr, expr)
 }
 
 func keysOf[K comparable, V any](m map[K]V) []K {
-	r := make([]K, len(m))
-	i := 0
-	for k := range m {
-		r[i] = k
-		i++
-	}
-	return r
+	return slices.Collect(maps.Keys(m))
+}
+
+func valuesOf[K comparable, V any](m map[K]V) []V {
+	return slices.Collect(maps.Values(m))
 }
 
 func isCallExpr(expr ast.Expr) (*ast.CallExpr, bool) {
@@ -109,7 +166,7 @@ func stmtIsCallExpr(stmt ast.Stmt) *ast.CallExpr {
 	return nil
 }
 
-func methodNameOf(w *ast.CallExpr, recv string) string {
+func methodNameOf(w *ast.CallExpr, recv string) (string, error) {
 	if w.Fun != nil {
 		switch f := w.Fun.(type) {
 		case *ast.SelectorExpr:
@@ -118,7 +175,7 @@ func methodNameOf(w *ast.CallExpr, recv string) string {
 			}
 		}
 	}
-	return ""
+	return "", nil
 }
 
 func stringArgOf(call *ast.CallExpr, n int) string {
@@ -186,8 +243,14 @@ func join(parts ...string) string {
 	return str
 }
 
-func isConstDecl(decl ast.Decl) map[string]string {
-	result := map[string]string{}
+type Const struct {
+	Name     string
+	Value    string
+	Comments []string
+}
+
+func consts(decl ast.Decl) []Const {
+	results := []Const{}
 	switch v := decl.(type) {
 	case *ast.GenDecl:
 		for _, s := range v.Specs {
@@ -196,6 +259,8 @@ func isConstDecl(decl ast.Decl) map[string]string {
 				name := ""
 				if len(a.Names) == 1 {
 					name = a.Names[0].Name
+				} else {
+					log.Fatalf("const: more than 1 name: %v", a.Names)
 				}
 				value := ""
 				if len(a.Values) == 1 {
@@ -203,16 +268,36 @@ func isConstDecl(decl ast.Decl) map[string]string {
 					case *ast.BasicLit:
 						if b.Kind == token.STRING {
 							value = strings.Trim(b.Value, "\"")
+						} else {
+							log.Fatalf("const '%s': unsupported kind: %s", name, b.Kind)
 						}
+					}
+				} else {
+					log.Fatalf("const '%s': more than 1 value: %d", name, len(a.Values))
+				}
+				comments := []string{}
+				if a.Comment != nil {
+					for _, c := range a.Comment.List {
+						comments = append(comments, c.Text)
 					}
 				}
 				if name != "" {
-					result[name] = value
+					results = append(results, Const{Name: name, Value: value, Comments: comments})
 				}
 			}
 		}
 	}
-	return result
+	return results
+}
+
+func isString(expr ast.Expr) (string, bool) {
+	switch b := expr.(type) {
+	case *ast.BasicLit:
+		if b.Kind == token.STRING {
+			return strings.Trim(b.Value, "\""), true
+		}
+	}
+	return "", false
 }
 
 func isIdent(expr ast.Expr) (*ast.Ident, bool) {
@@ -239,4 +324,111 @@ func isSelector(expr ast.Expr) (*ast.SelectorExpr, bool) {
 		return s, true
 	}
 	return nil, false
+}
+
+func keysort[K cmp.Ordered, V any](m map[K]V) []K {
+	c := make([]K, len(m))
+	copy(c, slices.Collect(maps.Keys(m)))
+	slices.Sort(c)
+	return c
+}
+
+func title(str string) string {
+	if len(str) < 1 {
+		return str
+	}
+	f := str[0:1]
+	return cases.Title(language.English, cases.Compact).String(f) + str[1:]
+}
+
+func voweled(str string) bool {
+	if len(str) < 1 {
+		return false
+	}
+	c, _ := utf8.DecodeRuneInString(str)
+	switch c {
+	case 'a', 'i', 'e', 'o', 'u':
+		return true
+	}
+	return false
+}
+
+func singularize(str string) string {
+	if strings.HasSuffix(str, "ies") {
+		return str[0:len(str)-3] + "y"
+	}
+	if strings.HasSuffix(str, "es") {
+		return str[0 : len(str)-2]
+	}
+	if strings.HasSuffix(str, "s") {
+		return str[0 : len(str)-1]
+	}
+	return str
+}
+
+func boolPtr(b bool) *bool {
+	return &b
+}
+
+func zerofPtr() *float64 {
+	var f float64 = 0
+	return &f
+}
+
+func hasAnyPrefix(s string, options []string) bool {
+	for _, o := range options {
+		if strings.HasPrefix(s, o) {
+			return true
+		}
+	}
+	return false
+}
+
+func sappend[E any](s []E, elem E) []E {
+	c := make([]E, len(s)+1)
+	copy(c, s)
+	c[len(s)] = elem
+	return c
+}
+
+func index[K comparable, V any](s []V, indexer func(V) K) map[K]V {
+	m := map[K]V{}
+	for _, v := range s {
+		k := indexer(v)
+		m[k] = v
+	}
+	return m
+}
+
+func indexMany[K comparable, V any](s []V, indexer func(V) K) map[K][]V {
+	m := map[K][]V{}
+	for _, v := range s {
+		k := indexer(v)
+		a, ok := m[k]
+		if !ok {
+			a = []V{}
+		}
+		a = append(a, v)
+		m[k] = a
+	}
+	return m
+}
+
+func omap1[K comparable, V any](k K, v V) *orderedmap.Map[K, V] {
+	m := orderedmap.New[K, V]()
+	m.Set(k, v)
+	return m
+}
+
+func mapReduce[A any, B any, C any](s []A, mapper func(A) (B, bool, error), reducer func([]B) (C, error)) (C, error) {
+	mapped := []B{}
+	for _, a := range s {
+		if b, ok, err := mapper(a); err != nil {
+			var z C
+			return z, err
+		} else if ok {
+			mapped = append(mapped, b)
+		}
+	}
+	return reducer(mapped)
 }

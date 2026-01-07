@@ -35,6 +35,7 @@ func newField(name string, t Type, tag string) (Field, bool) {
 type Type interface {
 	Key() string
 	Name() string
+	IsBasic() bool
 	IsArray() bool
 	IsMap() bool
 	Deref() (Type, bool)
@@ -69,12 +70,20 @@ func (t AliasType) IsMap() bool {
 	return false
 }
 
+func (t AliasType) IsBasic() bool {
+	return false
+}
+
 func (t AliasType) Deref() (Type, bool) {
 	return t.typeRef, true
 }
 
 func (t AliasType) String() string {
-	return t.pkg + "." + t.name
+	if t.pkg != "" {
+		return t.pkg + "." + t.name
+	} else {
+		return t.name
+	}
 }
 
 func (t AliasType) Fields() []Field {
@@ -109,6 +118,10 @@ func (t InterfaceType) IsArray() bool {
 }
 
 func (t InterfaceType) IsMap() bool {
+	return false
+}
+
+func (t InterfaceType) IsBasic() bool {
 	return false
 }
 
@@ -159,6 +172,10 @@ func (t BuiltinType) IsMap() bool {
 	return false
 }
 
+func (t BuiltinType) IsBasic() bool {
+	return true
+}
+
 func (t BuiltinType) Deref() (Type, bool) {
 	return nil, false
 }
@@ -203,6 +220,10 @@ func (t ArrayType) IsArray() bool {
 
 func (t ArrayType) IsMap() bool {
 	return false
+}
+
+func (t ArrayType) IsBasic() bool {
+	return t.elt.IsBasic()
 }
 
 func (t ArrayType) Deref() (Type, bool) {
@@ -253,6 +274,10 @@ func (t StructType) IsMap() bool {
 	return false
 }
 
+func (t StructType) IsBasic() bool {
+	return false
+}
+
 func (t StructType) String() string {
 	return t.pkg + "." + t.name
 }
@@ -293,7 +318,11 @@ func (t MapType) IsArray() bool {
 }
 
 func (t MapType) IsMap() bool {
-	return false
+	return true
+}
+
+func (t MapType) IsBasic() bool {
+	return t.value.IsBasic()
 }
 
 func (t MapType) Deref() (Type, bool) {
