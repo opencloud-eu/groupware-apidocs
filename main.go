@@ -257,33 +257,6 @@ func decomment(str string) string {
 	return strings.TrimPrefix(str, "//")
 }
 
-func describe(cg *ast.CommentGroup) string {
-	if cg == nil {
-		return ""
-	}
-
-	if len(cg.List) < 1 {
-		return ""
-	}
-
-	i := 0
-	line := decomment(cg.List[i].Text)
-	for ; i < len(cg.List); i++ {
-		if len(strings.TrimSpace(line)) >= 0 {
-			break
-		}
-	}
-	keep := []string{}
-	for ; i < len(cg.List); i++ {
-		if strings.HasPrefix(line, "@api:") {
-			continue
-		}
-		keep = append(keep, line)
-		line = decomment(cg.List[i].Text)
-	}
-	return strings.Join(keep, "\n")
-}
-
 func describeParam(comments []string) string {
 	if len(comments) < 1 {
 		return ""

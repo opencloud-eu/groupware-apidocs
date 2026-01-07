@@ -1,11 +1,11 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -24,6 +24,7 @@ var (
 		Name:  "Pascal Bleser",
 		Email: "p.bleser@opencloud.eu",
 	}
+	mergeFile = ""
 )
 
 type OpenApiSink struct {
@@ -62,16 +63,9 @@ var (
 	integerSchema         = &base.Schema{Type: []string{"integer"}}
 	unsignedIntegerSchema = &base.Schema{Type: []string{"integer"}, Minimum: zerofPtr()}
 	booleanSchema         = &base.Schema{Type: []string{"boolean"}}
-	stringArraySchema     = &base.Schema{
-		Type:  []string{"array"},
-		Items: &base.DynamicValue[*base.SchemaProxy, bool]{N: 0, A: base.CreateSchemaProxy(stringSchema)},
-	}
-	timeSchema        = &base.Schema{Type: []string{"string"}, Format: "date-time"}
-	patchObjectSchema = &base.Schema{
-		Type:                 []string{"object"},
-		AdditionalProperties: &base.DynamicValue[*base.SchemaProxy, bool]{N: 0, A: base.CreateSchemaProxy(anySchema)},
-	}
-
+	stringArraySchema     = makeArraySchema(base.CreateSchemaProxy(stringSchema))
+	timeSchema            = &base.Schema{Type: []string{"string"}, Format: "date-time"}
+	patchObjectSchema     = makeArraySchema(base.CreateSchemaProxy(anySchema))
 	// numberSchema = &base.Schema{Type: []string{"number"}}
 	// dateSchema = &base.Schema{Type: []string{"string"}, Format: "date"}
 )
@@ -101,6 +95,28 @@ func (s OpenApiSink) parameterize(p Param, in string, requiredByDefault bool, mo
 }
 
 func (s OpenApiSink) Output(model Model, w io.Writer) error {
+	var _ *v3.Document = nil
+	{
+		if mergeFile != "" {
+			if _, err := os.ReadFile(mergeFile); err != nil {
+				return err
+			} else {
+				//oa.NewDocument(f)
+				/*
+					if d, err := oa.NewDocument(f); err != nil {
+						return err
+					} else {
+						template = d
+					}
+
+					if err := yaml.Unmarshal(f, &template); err != nil {
+						return err
+					}
+				*/
+			}
+		}
+	}
+
 	typeMap := index(model.Types, func(t Type) string { return t.Key() })
 	imMap := index(model.Impls, func(i Impl) string { return i.Name })
 	paths := indexMany(model.Routes, func(r Endpoint) string { return r.Path })
@@ -206,14 +222,31 @@ func (s OpenApiSink) Output(model Model, w io.Writer) error {
 			}
 			key := fmt.Sprintf("%s.%d", t.Key(), code)
 			contentMap := orderedmap.New[string, *v3.MediaType]()
-			if ref, err := s.refType(t, model); err != nil {
+			if schema, ext, err := s.schematize(fmt.Sprintf("default response '%s'", t.Name()), t, []string{t.Name()}, typeMap, schemaComponentTypes); err != nil {
 				return fmt.Errorf("failed to reference default response type %s: %v", t, err)
 			} else {
 				contentMap.Set("application/json", &v3.MediaType{
-					Schema: base.CreateSchemaProxyRef(SchemaComponentRefPrefix + ref),
+					Schema:     schema,
+					Extensions: ext,
 				})
-				schemaComponentTypes[ref] = t
 			}
+
+			/*
+				if schema, ref, err := s.refType(t, model); err != nil {
+					return fmt.Errorf("failed to reference default response type %s: %v", t, err)
+				} else {
+					contentMap.Set("application/json", &v3.MediaType{
+						Schema: schema,
+					})
+					if ref != "" {
+						if _, ok := typeMap[ref]; ok {
+							schemaComponentTypes[ref] = t
+						} else {
+							log.Panicf("failed to find type ref in typeMap: '%s'", ref)
+						}
+					}
+				}
+			*/
 			// TODO extract default response summary and description from @api
 			summary := ""
 			description := ""
@@ -307,10 +340,11 @@ func (s OpenApiSink) Output(model Model, w io.Writer) error {
 	components.SecuritySchemes = securitySchemes
 
 	doc := &v3.Document{
-		Version: "0.0.0",
+		Version: "3.0.4",
 		Info: &base.Info{
 			Title:   "OpenCloud Groupware API",
 			Contact: contact,
+			Version: "0.0.0",
 		},
 		Paths: &v3.Paths{
 			PathItems: pathItemMap,
@@ -327,6 +361,8 @@ func (s OpenApiSink) Output(model Model, w io.Writer) error {
 		doc.Security = security
 	}
 
+	// TODO merge in the template
+
 	if rendered, err := doc.Render(); err == nil {
 		if _, err := w.Write(rendered); err != nil {
 			return err
@@ -341,29 +377,21 @@ func (s OpenApiSink) schematize(ctx string, t Type, path []string, typeMap map[s
 	if t == nil {
 		return nil, nil, fmt.Errorf("schematize: t is nil (path=%s)", strings.Join(path, " > "))
 	}
-	isPatchObject := strings.Contains(t.Key(), "Patch") || strings.Contains(t.String(), "Patch")
-	var _ = isPatchObject
 	if elt, ok := t.Element(); ok {
 		if t.IsMap() {
 			if deref, ext, err := s.schematize(ctx, elt, sappend(path, t.Name()), typeMap, schemaComponentTypes); err != nil {
 				return nil, nil, err
 			} else {
-				schema := &highbase.Schema{
-					Type:                 []string{"object"},
-					AdditionalProperties: &base.DynamicValue[*base.SchemaProxy, bool]{N: 0, A: deref},
-					Extensions:           ext,
-				}
+				schema := makeObjectSchema(deref)
+				schema.Extensions = ext
 				return highbase.CreateSchemaProxy(schema), nil, nil
 			}
 		} else if t.IsArray() {
 			if deref, ext, err := s.schematize(ctx, elt, sappend(path, t.Name()), typeMap, schemaComponentTypes); err != nil {
 				return nil, nil, err
 			} else {
-				schema := &highbase.Schema{
-					Type:       []string{"array"},
-					Items:      &base.DynamicValue[*base.SchemaProxy, bool]{N: 0, A: deref},
-					Extensions: ext,
-				}
+				schema := makeArraySchema(deref)
+				schema.Extensions = ext
 				return highbase.CreateSchemaProxy(schema), nil, nil
 			}
 		} else {
@@ -491,21 +519,40 @@ func (s OpenApiSink) bodyparams(refs []string, im Impl, typeMap map[string]Type,
 	}, nil
 }
 
-func (s OpenApiSink) responses(im Impl, model Model, _ map[string]Type, schemaComponentTypes map[string]Type) (*v3.Responses, error) {
+func (s OpenApiSink) responses(im Impl, model Model, typeMap map[string]Type, schemaComponentTypes map[string]Type) (*v3.Responses, error) {
 	respMap := orderedmap.New[string, *v3.Response]()
 	for code, resp := range im.Resp {
 		contentMap := orderedmap.New[string, *v3.MediaType]()
 		if resp.Type != nil {
-			if ref, err := s.refType(resp.Type, model); err != nil {
-				return nil, fmt.Errorf("verb='%s' path='%s' fun='%s': failed to reference response type for %s: %v", im.Endpoint.Verb, im.Endpoint.Path, im.Endpoint.Fun, im.Name, err)
+			if schema, ext, err := s.schematize(
+				fmt.Sprintf("verb='%s' path='%s' fun='%s': response type '%s'", im.Endpoint.Verb, im.Endpoint.Path, im.Endpoint.Fun, resp.Type.Key()),
+				resp.Type, []string{resp.Type.Name()}, typeMap, schemaComponentTypes); err != nil {
+				return nil, fmt.Errorf("failed to reference response type %s: %v", resp.Type, err)
 			} else {
-				// use a reference for the response type
 				contentMap.Set("application/json", &v3.MediaType{
-					Schema:     base.CreateSchemaProxyRef(SchemaComponentRefPrefix + ref),
-					Extensions: ext1("x-oc-ref-source", fmt.Sprintf("response type %s", resp.Type)),
+					Schema:     schema,
+					Extensions: ext,
 				})
-				schemaComponentTypes[ref] = resp.Type
 			}
+
+			/*
+				if schema, ref, err := s.refType(resp.Type, model); err != nil {
+					return nil, fmt.Errorf("verb='%s' path='%s' fun='%s': failed to reference response type for %s: %v", im.Endpoint.Verb, im.Endpoint.Path, im.Endpoint.Fun, im.Name, err)
+				} else {
+					// use a reference for the response type
+					contentMap.Set("application/json", &v3.MediaType{
+						Schema:     schema,
+						Extensions: ext1("x-oc-ref-source", fmt.Sprintf("response type %s", resp.Type)),
+					})
+					if ref != "" {
+						if _, ok := typeMap[ref]; ok {
+							schemaComponentTypes[ref] = resp.Type
+						} else {
+							log.Panicf("failed to find type ref in typeMap: '%s'", ref)
+						}
+					}
+				}
+			*/
 		} else {
 			// when Type is nil, it means that there is no response object, used with 204 No Content,
 			// but we still have to add the Response object for that code below
@@ -576,12 +623,56 @@ func (s OpenApiSink) assign(op *v3.Operation, r Endpoint, pathItem *v3.PathItem)
 	return nil
 }
 
-func (s OpenApiSink) refType(t Type, _ Model) (string, error) {
-	if t == nil {
-		return "", errors.New("t is nil")
+func makeArraySchema(itemSchema *highbase.SchemaProxy) *highbase.Schema {
+	return &base.Schema{
+		Type:  []string{"array"},
+		Items: &base.DynamicValue[*base.SchemaProxy, bool]{N: 0, A: itemSchema},
 	}
-	return t.String(), nil
 }
+
+func makeObjectSchema(itemSchema *highbase.SchemaProxy) *highbase.Schema {
+	return &base.Schema{
+		Type:                 []string{"object"},
+		AdditionalProperties: &base.DynamicValue[*base.SchemaProxy, bool]{N: 0, A: itemSchema},
+	}
+}
+
+/*
+func (s OpenApiSink) _refType(t Type, _ Model) (*highbase.SchemaProxy, string, error) {
+	if t == nil {
+		return nil, "", errors.New("t is nil")
+	}
+
+	if elt, ok := t.Element(); ok {
+		if t.IsArray() {
+			// TODO what's the ref here? t.String() is []xyz, is that what we have in the typeMap?
+			ref := elt.Key()
+			if strings.HasPrefix("[]", ref) {
+				panic("[]")
+			}
+			return base.CreateSchemaProxy(makeArraySchema(base.CreateSchemaProxyRef(SchemaComponentRefPrefix + ref))), ref, nil
+		} else if t.IsMap() {
+			// TODO what's the ref here? t.String() is map[string]xyz, is that what we have in the typeMap?
+			ref := elt.Key()
+			if strings.HasPrefix("map[", ref) {
+				panic("map[]")
+			}
+			return base.CreateSchemaProxy(makeObjectSchema(base.CreateSchemaProxyRef(SchemaComponentRefPrefix + ref))), ref, nil
+		} else {
+			return nil, "", fmt.Errorf("%T has an Element() but is neither array nor map: %#v", t, t)
+		}
+	}
+
+	ref := t.Key()
+	if strings.HasPrefix("[]", ref) {
+		panic("[]")
+	}
+	if strings.HasPrefix("map[", ref) {
+		panic("map[]")
+	}
+	return base.CreateSchemaProxyRef(SchemaComponentRefPrefix + ref), ref, nil
+}
+*/
 
 func ext1(k string, v string) *orderedmap.Map[string, *yaml.Node] {
 	ext := orderedmap.New[string, *yaml.Node]()
