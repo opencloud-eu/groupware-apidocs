@@ -1,48 +1,12 @@
-package main
+package model
 
 import (
 	"fmt"
 	"go/types"
-	"regexp"
 	"slices"
+
+	"opencloud.eu/groupware-apidocs/internal/config"
 )
-
-type Field struct {
-	Name string
-	Attr string
-	Type Type
-	Tag  string
-}
-
-var tagRegex = regexp.MustCompile(`json:"(.+?)(?:,(omitempty|omitzero))?"`)
-
-func newField(name string, t Type, tag string) (Field, bool) {
-	attr := ""
-	if m := tagRegex.FindAllStringSubmatch(tag, 2); m != nil {
-		attr = m[0][1]
-	}
-	if attr == "-" {
-		return Field{}, false
-	}
-	return Field{
-		Name: name,
-		Attr: attr,
-		Type: t,
-		Tag:  tag,
-	}, true
-}
-
-type Type interface {
-	Key() string
-	Name() string
-	IsBasic() bool
-	IsArray() bool
-	IsMap() bool
-	Deref() (Type, bool)
-	String() string
-	Fields() []Field
-	Element() (Type, bool)
-}
 
 func newAliasType(pkg string, name string, typeRef Type) AliasType {
 	return AliasType{pkg: pkg, name: name, typeRef: typeRef}
@@ -355,18 +319,18 @@ func (t MapType) Element() (Type, bool) {
 
 var _ Type = MapType{}
 
-func typeOf(t types.Type, mem map[string]Type) Type {
+func TypeOf(t types.Type, mem map[string]Type) Type {
 	switch t := t.(type) {
 	case *types.Named:
 		name := t.Obj().Name()
 		pkg := ""
 		if t.Obj().Pkg() != nil {
 			pkg = t.Obj().Pkg().Name()
-			if isBuiltinSelectorType(pkg, name) { // for things like time.Time
+			if IsBuiltinSelectorType(pkg, name) { // for things like time.Time
 				return newBuiltinType(pkg, name)
 			}
 		} else {
-			if isBuiltinType(name) {
+			if IsBuiltinType(name) {
 				return newBuiltinType("", name)
 			}
 		}
@@ -376,13 +340,13 @@ func typeOf(t types.Type, mem map[string]Type) Type {
 		case *types.Interface:
 			return newInterfaceType(pkg, name)
 		case *types.Map:
-			return newMapType(typeOf(u.Key(), mem), typeOf(u.Elem(), mem))
+			return newMapType(TypeOf(u.Key(), mem), TypeOf(u.Elem(), mem))
 		case *types.Array:
-			return newArrayType(typeOf(u.Elem(), mem))
+			return newArrayType(TypeOf(u.Elem(), mem))
 		case *types.Slice:
-			return newArrayType(typeOf(u.Elem(), mem))
+			return newArrayType(TypeOf(u.Elem(), mem))
 		case *types.Pointer:
-			return typeOf(u.Elem(), mem)
+			return TypeOf(u.Elem(), mem)
 		case *types.Struct:
 			id := fmt.Sprintf("%s.%s", pkg, name)
 			if ex, ok := mem[id]; ok {
@@ -397,7 +361,7 @@ func typeOf(t types.Type, mem map[string]Type) Type {
 				case *types.Signature:
 					// skip methods
 				default:
-					typ := typeOf(f.Type(), mem)
+					typ := TypeOf(f.Type(), mem)
 					tag := u.Tag(i)
 					if field, ok := newField(f.Name(), typ, tag); ok {
 						fields = append(fields, field)
@@ -412,19 +376,19 @@ func typeOf(t types.Type, mem map[string]Type) Type {
 	case *types.Basic:
 		return newBuiltinType("", t.Name())
 	case *types.Map:
-		return newMapType(typeOf(t.Key(), mem), typeOf(t.Elem(), mem))
+		return newMapType(TypeOf(t.Key(), mem), TypeOf(t.Elem(), mem))
 	case *types.Array:
-		return newArrayType(typeOf(t.Elem(), mem))
+		return newArrayType(TypeOf(t.Elem(), mem))
 	case *types.Slice:
-		return newArrayType(typeOf(t.Elem(), mem))
+		return newArrayType(TypeOf(t.Elem(), mem))
 	case *types.Pointer:
-		return typeOf(t.Elem(), mem)
+		return TypeOf(t.Elem(), mem)
 	case *types.Alias:
 		pkg := ""
 		if t.Obj().Pkg() != nil {
 			pkg = t.Obj().Pkg().Name()
 		}
-		return newAliasType(pkg, t.Obj().Name(), typeOf(t.Underlying(), mem))
+		return newAliasType(pkg, t.Obj().Name(), TypeOf(t.Underlying(), mem))
 	case *types.Interface:
 		if t.String() == "any" {
 			return newBuiltinType("", "any")
@@ -454,10 +418,10 @@ var builtins = []string{
 	"error",
 }
 
-func isBuiltinType(t string) bool {
+func IsBuiltinType(t string) bool {
 	return slices.Contains(builtins, t)
 }
 
-func isBuiltinSelectorType(pkg string, _ string) bool {
-	return !slices.Contains(packagesOfInterest, pkg)
+func IsBuiltinSelectorType(pkg string, _ string) bool {
+	return !slices.Contains(config.PackagesOfInterest, pkg)
 }

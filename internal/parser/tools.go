@@ -1,4 +1,4 @@
-package main
+package parser
 
 import (
 	"cmp"
@@ -11,9 +11,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/pb33f/libopenapi/orderedmap"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
+	"opencloud.eu/groupware-apidocs/internal/model"
 )
 
 func isMemberFunc(call *ast.CallExpr, pkg string, name string) bool {
@@ -104,7 +104,7 @@ func isMemberOf(f ast.Decl, name string) bool {
 func nameOf(expr ast.Expr, pkg string) (string, error) {
 	switch e := expr.(type) {
 	case *ast.Ident:
-		if isBuiltinType(e.Name) {
+		if model.IsBuiltinType(e.Name) {
 			return e.Name, nil
 		} else if pkg != "" {
 			return pkg + "." + e.Name, nil
@@ -366,15 +366,6 @@ func singularize(str string) string {
 	return str
 }
 
-func boolPtr(b bool) *bool {
-	return &b
-}
-
-func zerofPtr() *float64 {
-	var f float64 = 0
-	return &f
-}
-
 func hasAnyPrefix(s string, options []string) bool {
 	for _, o := range options {
 		if strings.HasPrefix(s, o) {
@@ -382,53 +373,4 @@ func hasAnyPrefix(s string, options []string) bool {
 		}
 	}
 	return false
-}
-
-func sappend[E any](s []E, elem E) []E {
-	c := make([]E, len(s)+1)
-	copy(c, s)
-	c[len(s)] = elem
-	return c
-}
-
-func index[K comparable, V any](s []V, indexer func(V) K) map[K]V {
-	m := map[K]V{}
-	for _, v := range s {
-		k := indexer(v)
-		m[k] = v
-	}
-	return m
-}
-
-func indexMany[K comparable, V any](s []V, indexer func(V) K) map[K][]V {
-	m := map[K][]V{}
-	for _, v := range s {
-		k := indexer(v)
-		a, ok := m[k]
-		if !ok {
-			a = []V{}
-		}
-		a = append(a, v)
-		m[k] = a
-	}
-	return m
-}
-
-func omap1[K comparable, V any](k K, v V) *orderedmap.Map[K, V] {
-	m := orderedmap.New[K, V]()
-	m.Set(k, v)
-	return m
-}
-
-func mapReduce[A any, B any, C any](s []A, mapper func(A) (B, bool, error), reducer func([]B) (C, error)) (C, error) {
-	mapped := []B{}
-	for _, a := range s {
-		if b, ok, err := mapper(a); err != nil {
-			var z C
-			return z, err
-		} else if ok {
-			mapped = append(mapped, b)
-		}
-	}
-	return reducer(mapped)
 }
