@@ -188,6 +188,42 @@ func describeParam(comments []string) string {
 	return strings.Join(keep, "\n")
 }
 
+func skipEmptyLines(i int, lines []string) int {
+	for ; i < len(lines); i++ {
+		if !strings.HasPrefix(strings.TrimSpace(lines[i]), "swagger:") && len(strings.TrimSpace(lines[i])) > 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+func summarizeType(comments []string) (string, string) {
+	if len(comments) < 1 {
+		return "", ""
+	}
+
+	i := 0
+	i = skipEmptyLines(i, comments)
+	if i < 0 {
+		return "", ""
+	}
+
+	summary := comments[i]
+	description := ""
+	i++
+	if i < len(comments) {
+		i = skipEmptyLines(i, comments)
+		if i >= 0 && i < len(comments) {
+			description = strings.Join(comments[i:], "\n")
+		}
+	}
+
+	summary = title(summary)
+	description = title(description)
+
+	return summary, description
+}
+
 func summarizeEndpoint(verb string, path string, comments []string) (string, string) {
 	summary := ""
 	description := ""
@@ -296,7 +332,6 @@ func summarizeEndpoint(verb string, path string, comments []string) (string, str
 				summary = summary + " for a given account"
 			}
 		}
-		//summary += " (AUTO)"
 	}
 
 	summary = title(summary)
@@ -317,6 +352,7 @@ type returnVisitor struct {
 	pkg           *packages.Package
 	responseTypes map[int]model.Type
 	responseFuncs map[string]responseFunc
+	undocumented  map[string]token.Position
 }
 
 func newReturnVisitor(fset *token.FileSet, pkg *packages.Package, typeMap map[string]model.Type, responseFuncs map[string]responseFunc) returnVisitor {
@@ -326,6 +362,7 @@ func newReturnVisitor(fset *token.FileSet, pkg *packages.Package, typeMap map[st
 		typeMap:       typeMap,
 		responseTypes: map[int]model.Type{},
 		responseFuncs: responseFuncs,
+		undocumented:  map[string]token.Position{},
 	}
 }
 
@@ -349,50 +386,6 @@ func (v returnVisitor) isResponseFunc(r *ast.ReturnStmt) (ast.Expr, int, bool) {
 	return nil, 0, false
 }
 
-/*
-func (v returnVisitor) resolveType(t types.Type) (Type, error) {
-
-	key := ""
-	switch n := t.(type) {
-	case *types.Named:
-		key = keyOf(n)
-	case *types.Slice:
-		if nn, ok := n.Elem().(*types.Named); ok {
-			key = keyOf(nn)
-		} else {
-			return "", fmt.Errorf("unsupported slice elem: %T: %#v", n.Elem(), n.Elem())
-		}
-	case *types.Pointer:
-		switch e := n.Elem().(type) {
-		case *types.Named:
-			key = keyOf(e)
-		default:
-			log.Panicf("unsupported: pointer: %#v", n)
-		}
-		return "", nil
-	case *types.Basic:
-		return newBuiltinType("", n.Name())
-		key = n.Name(), nil
-	case *types.Map:
-		keyKey, err := v.resolveType(n.Key())
-		if err != nil {
-			return "", err
-		}
-		valueKey, err := v.resolveType(n.Elem())
-		if err != nil {
-			return "", err
-		}
-		return fmt.Sprintf("map[%s]%s", keyKey, valueKey), nil
-	default:
-		return "", fmt.Errorf("unsupported type: %T: %#v", t, t)
-	}
-
-		if m, ok := v.typeMap[key]; ok {
-
-
-}
-*/
-
 func (v returnVisitor) resolve(x *ast.Ident) (model.Type, error) {
 	z, ok := v.pkg.TypesInfo.Uses[x]
 	if !ok {
@@ -401,7 +394,34 @@ func (v returnVisitor) resolve(x *ast.Ident) (model.Type, error) {
 	if !ok {
 		return nil, fmt.Errorf("failed to find in TypesInfo.Uses or TypesInfo.Defs: %#v", x)
 	}
-	return model.TypeOf(z.Type(), v.typeMap), nil
+
+	t := z.Type()
+	name := ""
+	var pos token.Pos
+	summary := ""
+	description := ""
+	switch n := t.(type) {
+	case *types.Named:
+		summary, description = summarizeType(findComments(n.Obj().Pos(), token.TYPE, v.pkg))
+		{
+			p := n.Obj().Pkg()
+			if p != nil {
+				name = p.Name() + "." + n.Obj().Name()
+			} else {
+				name = p.Name() + "." + n.Obj().Name()
+			}
+		}
+		pos = n.Obj().Pos()
+	}
+	r, err := typeOf(t, summary, description, v.typeMap, v.pkg)
+	{
+		if r.Summary() == "" {
+			if name != "" {
+				v.undocumented[name] = v.pkg.Fset.Position(pos)
+			}
+		}
+	}
+	return r, err
 }
 
 func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
@@ -437,9 +457,6 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 				} else {
 					switch d := x.Obj.Decl.(type) {
 					case *ast.AssignStmt:
-						// TODO iterate through the LHS to pick the right variable by its name, and then find a way to get the type information from that variable using p.TypeInfo?
-						// TODO CONTINUE HERE
-
 						var a *ast.Ident = nil
 						for _, l := range d.Lhs {
 							if v, ok := isIdent(l); ok {
@@ -512,6 +529,7 @@ type paramsVisitor struct {
 	bodyParams    map[string]bool
 	responseTypes map[int]model.Type
 	responseFuncs map[string]responseFunc
+	undocumented  map[string]token.Position
 	errs          *[]error
 }
 
@@ -527,6 +545,7 @@ func newParamsVisitor(fset *token.FileSet, pkg *packages.Package, fun string, ty
 		bodyParams:    map[string]bool{},
 		responseTypes: map[int]model.Type{},
 		responseFuncs: responseFuncs,
+		undocumented:  map[string]token.Position{},
 		errs:          &[]error{},
 	}
 }
@@ -580,7 +599,7 @@ func isClosure(expr ast.Expr) (*ast.FuncLit, bool) {
 	return nil, false
 }
 
-func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Type, bool) {
+func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Type, map[string]token.Position, bool) {
 	if s, ok := isSelector(call.Fun); ok {
 		if x, ok := isIdent(s.X); ok && s.Sel.Name == "respond" && len(call.Args) == 3 && x.Obj != nil {
 			if f, ok := isField(x.Obj.Decl); ok {
@@ -590,7 +609,7 @@ func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Type, bo
 						rv := newReturnVisitor(v.fset, v.pkg, v.typeMap, v.responseFuncs)
 						ast.Walk(rv, c)
 						if len(rv.responseTypes) > 0 {
-							return rv.responseTypes, true
+							return rv.responseTypes, rv.undocumented, true
 						} else {
 							//buf := new(bytes.Buffer)
 							//ast.Fprint(buf, v.fset, c, nil) // TODO remove debugging
@@ -601,7 +620,7 @@ func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Type, bo
 			}
 		}
 	}
-	return nil, false
+	return nil, nil, false
 }
 
 func (v paramsVisitor) isAccountCall(call *ast.CallExpr) bool {
@@ -720,8 +739,9 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 			v.bodyParams[t] = true
 		} else if v.isAccountCall(d) {
 			v.pathParams[config.AccountIdUriParamName] = model.Param{Name: config.AccountIdUriParamName, Description: "", Required: true}
-		} else if r, ok := v.isRespondCall(d); ok {
+		} else if r, undocumented, ok := v.isRespondCall(d); ok {
 			maps.Copy(v.responseTypes, r)
+			maps.Copy(v.undocumented, undocumented)
 		} else if z, desc, ok := v.isNeedAccountCall(d); ok {
 			v.pathParams[z] = model.Param{Name: z, Description: desc, Required: true}
 		} else if z, desc, ok := v.isPathParamCall(d); ok {
@@ -823,6 +843,45 @@ func findFun(n string, p *packages.Package, _ *types.Func) (*ast.FuncDecl, strin
 	return nil, "", false
 }
 
+func findDecl(t token.Pos, p *packages.Package) ast.Decl {
+	pos := p.Fset.Position(t)
+	for _, s := range p.Syntax {
+		fp := p.Fset.Position(s.FileStart)
+		if fp.Filename != pos.Filename {
+			continue
+		}
+		for _, d := range s.Decls {
+			dp := p.Fset.Position(d.Pos())
+			if pos.Line == dp.Line {
+				return d
+			}
+		}
+	}
+	return nil
+}
+
+func findComments(pos token.Pos, tokenType token.Token, pkg *packages.Package) []string {
+	d := findDecl(pos, pkg)
+	if d == nil {
+		return []string{}
+	}
+	switch x := d.(type) {
+	case *ast.GenDecl:
+		if x.Tok == tokenType {
+			if x.Doc != nil {
+				return lines(x.Doc.List)
+			} else {
+				return []string{}
+			}
+		}
+	}
+	return []string{}
+}
+
+func lines(s []*ast.Comment) []string {
+	return collect(s, func(c *ast.Comment) string { return decomment(c.Text) })
+}
+
 func Parse(chdir string, basepath string) (model.Model, error) {
 	routeFuncs := map[string]*types.Func{}
 	typeMap := map[string]model.Type{}
@@ -832,6 +891,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 	queryParams := map[string]model.Param{}
 	headerParams := map[string]model.Param{}
 	ims := []model.Impl{}
+	undocumented := map[string]token.Position{}
 	{
 		cfg := &packages.Config{
 			Mode:  packages.LoadSyntax,
@@ -868,8 +928,12 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 				case *types.Signature:
 					// skip methods
 				case *types.Named:
-					r := model.TypeOf(t, typeMap)
-					if r != nil {
+					name := t.Obj().Name()
+					var _ = name
+					summary, description := summarizeType(findComments(t.Obj().Pos(), token.TYPE, p))
+					if r, err := typeOf(t, summary, description, typeMap, p); err != nil {
+						log.Panicf("failed to determine type of named %#v: %v", t, err)
+					} else if r != nil {
 						typeMap[r.Key()] = r
 					}
 				case *types.Basic:
@@ -888,7 +952,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 				case *types.Pointer:
 					//fmt.Printf("globvar(ptr): %s: %s\n", name, t.String())
 				default:
-					log.Panicf("> %s is not Named but %T", name, t)
+					log.Panicf("failed to analyze type %s: is not a Named but a %T", name, t)
 				}
 			}
 		}
@@ -908,11 +972,9 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 
 			var syntax *ast.File = nil
 			for i, f := range p.CompiledGoFiles {
-				rf, err := filepath.Rel(basepath, f)
-				if err != nil {
+				if rf, err := filepath.Rel(basepath, f); err != nil {
 					panic(err)
-				}
-				if rf == "services/groupware/pkg/groupware/groupware_route.go" {
+				} else if rf == "services/groupware/pkg/groupware/groupware_route.go" {
 					syntax = p.Syntax[i]
 				}
 			}
@@ -948,16 +1010,18 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 							}
 						}
 
+						v := newParamsVisitor(p.Fset, p, n, typeMap, responseFuncs)
 						resp := map[int]model.Resp{}
-						pv := newParamsVisitor(p.Fset, p, n, typeMap, responseFuncs)
+
 						if fun.Body != nil {
-							ast.Walk(pv, fun.Body)
-							if err := errors.Join(*pv.errs...); err != nil {
+							ast.Walk(v, fun.Body)
+							if err := errors.Join(*v.errs...); err != nil {
 								panic(err)
 							}
-							for code, typename := range pv.responseTypes {
+							for code, typename := range v.responseTypes {
 								resp[code] = model.Resp{Type: typename}
 							}
+							maps.Copy(undocumented, v.undocumented)
 						}
 						source, err := filepath.Rel(basepath, source)
 						if err != nil {
@@ -991,10 +1055,10 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 							Line:         line,
 							Comments:     comments,
 							Resp:         resp,
-							QueryParams:  valuesOf(pv.queryParams),
-							PathParams:   valuesOf(pv.pathParams),
-							HeaderParams: valuesOf(pv.headerParams),
-							BodyParams:   keysOf(pv.bodyParams),
+							QueryParams:  valuesOf(v.queryParams),
+							PathParams:   valuesOf(v.pathParams),
+							HeaderParams: valuesOf(v.headerParams),
+							BodyParams:   keysOf(v.bodyParams),
 							Tags:         tags,
 							Summary:      summary,
 							Description:  description,
@@ -1058,5 +1122,130 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 		DefaultResponses:       defaultResponses,
 		DefaultResponseHeaders: defaultResponseHeaders,
 		CommonRequestHeaders:   commonRequestHeaders,
+		Undocumented:           undocumented,
 	}, nil
+}
+
+func typeOf(t types.Type, summary string, description string, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
+	switch t := t.(type) {
+	case *types.Named:
+		name := t.Obj().Name()
+		pkg := ""
+		if t.Obj().Pkg() != nil {
+			pkg = t.Obj().Pkg().Name()
+			if model.IsBuiltinSelectorType(pkg, name) { // for things like time.Time
+				return model.NewBuiltinType(pkg, name), nil
+			}
+		} else {
+			if model.IsBuiltinType(name) {
+				return model.NewBuiltinType("", name), nil
+			}
+		}
+		switch u := t.Underlying().(type) {
+		case *types.Basic:
+			return model.NewAliasType(pkg, name, model.NewBuiltinType("", u.Name())), nil
+		case *types.Interface:
+			return model.NewInterfaceType(pkg, name), nil
+		case *types.Map:
+			return mapOf(u, mem, p)
+		case *types.Array:
+			return arrayOf(u.Elem(), summary, description, mem, p)
+		case *types.Slice:
+			return arrayOf(u.Elem(), summary, description, mem, p)
+		case *types.Pointer:
+			return typeOf(u.Elem(), summary, description, mem, p) // TODO pointer denotes that it's optional
+		case *types.Struct:
+			id := fmt.Sprintf("%s.%s", pkg, name)
+			if ex, ok := mem[id]; ok {
+				return ex, nil
+			}
+
+			fields := []model.Field{}
+			r := model.NewStructType(pkg, name, fields, summary, description)
+			mem[id] = r
+			for i := range u.NumFields() {
+				f := u.Field(i)
+				summary := strings.Join(findComments(f.Pos(), token.VAR, p), "\n")
+				switch f.Type().Underlying().(type) {
+				case *types.Signature:
+					// skip methods
+				default:
+					if typ, err := typeOf(f.Type(), summary, description, mem, p); err != nil {
+						return nil, err
+					} else {
+						tag := u.Tag(i)
+						if field, ok := model.NewField(f.Name(), typ, tag, summary); ok {
+							fields = append(fields, field)
+						}
+					}
+				}
+			}
+			r = model.NewStructType(pkg, name, fields, summary, description)
+			mem[id] = r
+			return r, nil
+		default:
+			return nil, fmt.Errorf("TypeOf: unsupported underlying type of named %s.%s is a %T: %#v", pkg, name, u, u)
+		}
+	case *types.Basic:
+		return model.NewBuiltinType("", t.Name()), nil
+	case *types.Map:
+		return mapOf(t, mem, p)
+	case *types.Array:
+		return arrayOf(t.Elem(), summary, description, mem, p)
+	case *types.Slice:
+		return arrayOf(t.Elem(), summary, description, mem, p)
+	case *types.Pointer:
+		return typeOf(t.Elem(), summary, description, mem, p)
+	case *types.Alias:
+		return aliasOf(t, mem, p)
+	case *types.Interface:
+		if t.String() == "any" {
+			return model.NewBuiltinType("", "any"), nil
+		} else {
+			return nil, fmt.Errorf("TypeOf: unsupported: using an interface type that isn't any: %T: %#v", t, t)
+		}
+	case *types.TypeParam:
+		// ignore
+		return nil, nil
+	case *types.Chan:
+		// ignore
+		return nil, nil
+	case *types.Struct:
+		// ignore unnamed struct
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("TypeOf: unsupported type: %T: %#v", t, t)
+	}
+}
+
+func arrayOf(t types.Type, summary string, description string, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
+	if e, err := typeOf(t, summary, description, mem, p); err != nil {
+		return nil, err
+	} else {
+		return model.NewArrayType(e), nil
+	}
+}
+
+func mapOf(t *types.Map, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
+	if k, err := typeOf(t.Key(), "", "", mem, p); err != nil {
+		return nil, err
+	} else {
+		if v, err := typeOf(t.Elem(), "", "", mem, p); err != nil {
+			return nil, err
+		} else {
+			return model.NewMapType(k, v), nil
+		}
+	}
+}
+
+func aliasOf(t *types.Alias, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
+	if e, err := typeOf(t.Underlying(), "", "", mem, p); err != nil {
+		return nil, err
+	} else {
+		pkg := ""
+		if t.Obj().Pkg() != nil {
+			pkg = t.Obj().Pkg().Name()
+		}
+		return model.NewAliasType(pkg, t.Obj().Name(), e), nil
+	}
 }

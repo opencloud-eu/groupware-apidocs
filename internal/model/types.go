@@ -1,14 +1,12 @@
 package model
 
 import (
-	"fmt"
-	"go/types"
 	"slices"
 
 	"opencloud.eu/groupware-apidocs/internal/config"
 )
 
-func newAliasType(pkg string, name string, typeRef Type) AliasType {
+func NewAliasType(pkg string, name string, typeRef Type) AliasType {
 	return AliasType{pkg: pkg, name: name, typeRef: typeRef}
 }
 
@@ -58,9 +56,17 @@ func (t AliasType) Element() (Type, bool) {
 	return nil, false
 }
 
+func (t AliasType) Summary() string {
+	return ""
+}
+
+func (t AliasType) Description() string {
+	return ""
+}
+
 var _ Type = AliasType{}
 
-func newInterfaceType(pkg string, name string) InterfaceType {
+func NewInterfaceType(pkg string, name string) InterfaceType {
 	return InterfaceType{pkg: pkg, name: name}
 }
 
@@ -105,9 +111,17 @@ func (t InterfaceType) Element() (Type, bool) {
 	return nil, false
 }
 
+func (t InterfaceType) Summary() string {
+	return ""
+}
+
+func (t InterfaceType) Description() string {
+	return ""
+}
+
 var _ Type = InterfaceType{}
 
-func newBuiltinType(pkg string, name string) BuiltinType {
+func NewBuiltinType(pkg string, name string) BuiltinType {
 	return BuiltinType{pkg: pkg, name: name}
 }
 
@@ -160,9 +174,17 @@ func (t BuiltinType) Element() (Type, bool) {
 	return nil, false
 }
 
+func (t BuiltinType) Summary() string {
+	return ""
+}
+
+func (t BuiltinType) Description() string {
+	return ""
+}
+
 var _ Type = BuiltinType{}
 
-func newArrayType(elt Type) ArrayType {
+func NewArrayType(elt Type) ArrayType {
 	return ArrayType{elt: elt}
 }
 
@@ -192,7 +214,7 @@ func (t ArrayType) IsBasic() bool {
 
 func (t ArrayType) Deref() (Type, bool) {
 	if d, ok := t.elt.Deref(); ok {
-		return newArrayType(d), true
+		return NewArrayType(d), true
 	} else {
 		return nil, false
 	}
@@ -210,16 +232,26 @@ func (t ArrayType) Element() (Type, bool) {
 	return t.elt, true
 }
 
+func (t ArrayType) Summary() string {
+	return t.elt.Summary()
+}
+
+func (t ArrayType) Description() string {
+	return t.elt.Description()
+}
+
 var _ Type = ArrayType{}
 
-func newStructType(pkg string, name string, fields []Field) StructType {
-	return StructType{pkg: pkg, name: name, fields: fields}
+func NewStructType(pkg string, name string, fields []Field, summary string, description string) StructType {
+	return StructType{pkg: pkg, name: name, fields: fields, summary: summary, description: description}
 }
 
 type StructType struct {
-	pkg    string
-	name   string
-	fields []Field
+	pkg         string
+	name        string
+	fields      []Field
+	summary     string
+	description string
 }
 
 func (t StructType) Key() string {
@@ -258,9 +290,17 @@ func (t StructType) Element() (Type, bool) {
 	return nil, false
 }
 
+func (t StructType) Summary() string {
+	return t.summary
+}
+
+func (t StructType) Description() string {
+	return t.description
+}
+
 var _ Type = StructType{}
 
-func newMapType(key Type, value Type) MapType {
+func NewMapType(key Type, value Type) MapType {
 	return MapType{key: key, value: value}
 }
 
@@ -299,7 +339,7 @@ func (t MapType) Deref() (Type, bool) {
 		if !vok {
 			v = t.value
 		}
-		return newMapType(k, v), true
+		return NewMapType(k, v), true
 	} else {
 		return nil, false
 	}
@@ -317,98 +357,107 @@ func (t MapType) Element() (Type, bool) {
 	return t.value, true
 }
 
-var _ Type = MapType{}
-
-func TypeOf(t types.Type, mem map[string]Type) Type {
-	switch t := t.(type) {
-	case *types.Named:
-		name := t.Obj().Name()
-		pkg := ""
-		if t.Obj().Pkg() != nil {
-			pkg = t.Obj().Pkg().Name()
-			if IsBuiltinSelectorType(pkg, name) { // for things like time.Time
-				return newBuiltinType(pkg, name)
-			}
-		} else {
-			if IsBuiltinType(name) {
-				return newBuiltinType("", name)
-			}
-		}
-		switch u := t.Underlying().(type) {
-		case *types.Basic:
-			return newAliasType(pkg, name, newBuiltinType("", u.Name()))
-		case *types.Interface:
-			return newInterfaceType(pkg, name)
-		case *types.Map:
-			return newMapType(TypeOf(u.Key(), mem), TypeOf(u.Elem(), mem))
-		case *types.Array:
-			return newArrayType(TypeOf(u.Elem(), mem))
-		case *types.Slice:
-			return newArrayType(TypeOf(u.Elem(), mem))
-		case *types.Pointer:
-			return TypeOf(u.Elem(), mem)
-		case *types.Struct:
-			id := fmt.Sprintf("%s.%s", pkg, name)
-			if ex, ok := mem[id]; ok {
-				return ex
-			}
-			fields := []Field{}
-			r := newStructType(pkg, name, fields)
-			mem[id] = r
-			for i := range u.NumFields() {
-				f := u.Field(i)
-				switch f.Type().Underlying().(type) {
-				case *types.Signature:
-					// skip methods
-				default:
-					typ := TypeOf(f.Type(), mem)
-					tag := u.Tag(i)
-					if field, ok := newField(f.Name(), typ, tag); ok {
-						fields = append(fields, field)
-					}
-				}
-			}
-			r.fields = fields
-			return r
-		default:
-			panic(fmt.Sprintf("! underlying of named %s.%s is not struct but %T", pkg, name, u))
-		}
-	case *types.Basic:
-		return newBuiltinType("", t.Name())
-	case *types.Map:
-		return newMapType(TypeOf(t.Key(), mem), TypeOf(t.Elem(), mem))
-	case *types.Array:
-		return newArrayType(TypeOf(t.Elem(), mem))
-	case *types.Slice:
-		return newArrayType(TypeOf(t.Elem(), mem))
-	case *types.Pointer:
-		return TypeOf(t.Elem(), mem)
-	case *types.Alias:
-		pkg := ""
-		if t.Obj().Pkg() != nil {
-			pkg = t.Obj().Pkg().Name()
-		}
-		return newAliasType(pkg, t.Obj().Name(), TypeOf(t.Underlying(), mem))
-	case *types.Interface:
-		if t.String() == "any" {
-			return newBuiltinType("", "any")
-		} else {
-			panic(fmt.Sprintf("interface? %v\n", t))
-		}
-	case *types.TypeParam:
-		// ignore
-		return nil
-	case *types.Chan:
-		// ignore
-		return nil
-	case *types.Struct:
-		// ignore unnamed struct
-		return nil
-	default:
-		panic(fmt.Sprintf("unsupported: ?: %T: %#v", t, t))
-	}
+func (t MapType) Summary() string {
+	return t.value.Summary() // TODO how to document a map?
 }
 
+func (t MapType) Description() string {
+	return t.value.Description() // TODO how to document a map?
+}
+
+var _ Type = MapType{}
+
+/*
+	func TypeOf(t types.Type, summary string, description string, mem map[string]Type, p *packages.Package) (Type, error) {
+		switch t := t.(type) {
+		case *types.Named:
+			name := t.Obj().Name()
+			pkg := ""
+			if t.Obj().Pkg() != nil {
+				pkg = t.Obj().Pkg().Name()
+				if IsBuiltinSelectorType(pkg, name) { // for things like time.Time
+					return newBuiltinType(pkg, name), nil
+				}
+			} else {
+				if IsBuiltinType(name) {
+					return newBuiltinType("", name), nil
+				}
+			}
+			switch u := t.Underlying().(type) {
+			case *types.Basic:
+				return newAliasType(pkg, name, newBuiltinType("", u.Name())), nil
+			case *types.Interface:
+				return newInterfaceType(pkg, name), nil
+			case *types.Map:
+				return mapOf(u, mem, p)
+			case *types.Array:
+				return arrayOf(u.Elem(), summary, description, mem, p)
+			case *types.Slice:
+				return arrayOf(u.Elem(), summary, description, mem, p)
+			case *types.Pointer:
+				return TypeOf(u.Elem(), summary, description, mem, p) // TODO pointer denotes that it's optional
+			case *types.Struct:
+				id := fmt.Sprintf("%s.%s", pkg, name)
+				if ex, ok := mem[id]; ok {
+					return ex, nil
+				}
+
+				fields := []Field{}
+				r := newStructType(pkg, name, fields, summary, description)
+				mem[id] = r
+				for i := range u.NumFields() {
+					f := u.Field(i)
+					switch f.Type().Underlying().(type) {
+					case *types.Signature:
+						// skip methods
+					default:
+						if typ, err := TypeOf(f.Type(), summary, description, mem, p); err != nil {
+							return nil, err
+						} else {
+							tag := u.Tag(i)
+							if field, ok := newField(f.Name(), typ, tag); ok {
+								fields = append(fields, field)
+							}
+						}
+					}
+				}
+				r.fields = fields
+				return r, nil
+			default:
+				return nil, fmt.Errorf("TypeOf: unsupported underlying type of named %s.%s is a %T: %#v", pkg, name, u, u)
+			}
+		case *types.Basic:
+			return newBuiltinType("", t.Name()), nil
+		case *types.Map:
+			return mapOf(t, mem, p)
+		case *types.Array:
+			return arrayOf(t.Elem(), summary, description, mem, p)
+		case *types.Slice:
+			return arrayOf(t.Elem(), summary, description, mem, p)
+		case *types.Pointer:
+			return TypeOf(t.Elem(), summary, description, mem, p)
+		case *types.Alias:
+			return aliasOf(t, mem, p)
+		case *types.Interface:
+			if t.String() == "any" {
+				return newBuiltinType("", "any"), nil
+			} else {
+				return nil, fmt.Errorf("TypeOf: unsupported: using an interface type that isn't any: %T: %#v", t, t)
+			}
+		case *types.TypeParam:
+			// ignore
+			return nil, nil
+		case *types.Chan:
+			// ignore
+			return nil, nil
+		case *types.Struct:
+			// ignore unnamed struct
+			return nil, nil
+		default:
+			return nil, fmt.Errorf("TypeOf: unsupported type: %T: %#v", t, t)
+		}
+	}
+*/
 var builtins = []string{
 	"any",
 	"bool",

@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"os"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -27,6 +30,7 @@ var (
 )
 
 type OpenApiSink struct {
+	BasePath         string
 	TemplateFile     string
 	IncludeBasicAuth bool
 }
@@ -51,18 +55,46 @@ var (
 )
 
 var (
-	anySchema             = &base.Schema{Type: []string{"object"}}
-	objectSchema          = &base.Schema{Type: []string{"object"}}
-	stringSchema          = &base.Schema{Type: []string{"string"}}
-	integerSchema         = &base.Schema{Type: []string{"integer"}}
-	unsignedIntegerSchema = &base.Schema{Type: []string{"integer"}, Minimum: zerofPtr()}
-	booleanSchema         = &base.Schema{Type: []string{"boolean"}}
-	stringArraySchema     = makeArraySchema(base.CreateSchemaProxy(stringSchema))
-	timeSchema            = &base.Schema{Type: []string{"string"}, Format: "date-time"}
-	patchObjectSchema     = makeArraySchema(base.CreateSchemaProxy(anySchema))
+	//anySchema    = &base.Schema{Type: []string{"object"}}
+	//objectSchema = &base.Schema{Type: []string{"object"}}
+	//stringSchema          = &base.Schema{Type: []string{"string"}}
+	//integerSchema         = &base.Schema{Type: []string{"integer"}}
+	//unsignedIntegerSchema = &base.Schema{Type: []string{"integer"}, Minimum: zerofPtr()}
+	//booleanSchema         = &base.Schema{Type: []string{"boolean"}}
+	//stringArraySchema     = makeArraySchema(base.CreateSchemaProxy(stringSchema))
+	//timeSchema            = &base.Schema{Type: []string{"string"}, Format: "date-time"}
+	patchObjectSchema = arraySchema(base.CreateSchemaProxy(anySchema("")))
 	// numberSchema = &base.Schema{Type: []string{"number"}}
 	// dateSchema = &base.Schema{Type: []string{"string"}, Format: "date"}
 )
+
+func timeSchema(d string) *highbase.Schema {
+	return &base.Schema{Type: []string{"string"}, Format: "date-time", Description: d}
+}
+
+func anySchema(d string) *highbase.Schema {
+	return &base.Schema{Type: []string{"object"}, Description: d}
+}
+
+func objectSchema(d string) *highbase.Schema {
+	return &base.Schema{Type: []string{"object"}, Description: d}
+}
+
+func stringSchema(d string) *highbase.Schema {
+	return &base.Schema{Type: []string{"string"}, Description: d}
+}
+
+func integerSchema(d string) *highbase.Schema {
+	return &base.Schema{Type: []string{"integer"}, Description: d}
+}
+
+func unsignedIntegerSchema(d string) *highbase.Schema {
+	return &base.Schema{Type: []string{"integer"}, Minimum: zerofPtr(), Description: d}
+}
+
+func booleanSchema(d string) *highbase.Schema {
+	return &base.Schema{Type: []string{"boolean"}, Description: d}
+}
 
 func parameterize(p model.Param, in string, requiredByDefault bool, model map[string]model.Param) (*v3.Parameter, error) {
 	if g, ok := model[p.Name]; ok {
@@ -93,13 +125,13 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 	{
 		if s.TemplateFile != "" {
 			if f, err := os.ReadFile(s.TemplateFile); err != nil {
-				return err
+				return fmt.Errorf("failed to load template '%s': %v", s.TemplateFile, err)
 			} else {
 				if d, err := oapi.NewDocument(f); err != nil {
-					return err
+					return fmt.Errorf("failed to create document from template '%s': %v", s.TemplateFile, err)
 				} else {
 					if m, err := d.BuildV3Model(); err != nil {
-						return err
+						return fmt.Errorf("failed to build v3 model from template '%s': %v", s.TemplateFile, err)
 					} else {
 						template = &m.Model
 					}
@@ -163,7 +195,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 				if h.Required {
 					req = true
 				}
-				schemaRef := highbase.CreateSchemaProxy(stringSchema)
+				schemaRef := highbase.CreateSchemaProxy(stringSchema(h.Description + " (x)"))
 				op.Parameters = append(op.Parameters, &v3.Parameter{
 					Name:        h.Name,
 					In:          "header",
@@ -213,7 +245,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 			}
 			key := fmt.Sprintf("%s.%d", t.Key(), code)
 			contentMap := orderedmap.New[string, *v3.MediaType]()
-			if schema, ext, err := schematize(fmt.Sprintf("default response '%s'", t.Name()), t, []string{t.Name()}, typeMap, schemaComponentTypes); err != nil {
+			if schema, ext, err := schematize(fmt.Sprintf("default response '%s'", t.Name()), t, []string{t.Name()}, typeMap, schemaComponentTypes, ""); err != nil {
 				return fmt.Errorf("failed to reference default response type %s: %v", t, err)
 			} else {
 				contentMap.Set("application/json", &v3.MediaType{
@@ -271,12 +303,35 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 						continue
 					}
 					ctx := fmt.Sprintf("resolving schema component type '%s'", t.Key())
-					if schema, _, err := schematize(ctx, t, []string{}, typeMap, moreSchemaComponentTypes); err == nil {
+					if schema, _, err := schematize(ctx, t, []string{}, typeMap, moreSchemaComponentTypes, ""); err == nil {
 						if schema != nil {
 							componentSchemas.Set(t.Key(), schema)
 						}
 					} else {
 						return err
+					}
+				}
+
+				{
+					x := map[string]model.Type{}
+					for k, v := range moreSchemaComponentTypes {
+						if _, ok := componentSchemas.Get(k); ok {
+							// we've already processed this type
+						} else {
+							// haven't done that one yet, keep it in the to-do list
+							x[k] = v
+						}
+					}
+					moreSchemaComponentTypes = x
+				}
+
+				{
+					before := slices.Collect(maps.Keys(schemaComponentTypes))
+					slices.Sort(before)
+					after := slices.Collect(maps.Keys(moreSchemaComponentTypes))
+					slices.Sort(after)
+					if slices.Equal(before, after) {
+						log.Panicf("round %d: failure to resolve the following schema component types, remaining unresolved after an iteration: %s", i, strings.Join(before, ", "))
 					}
 				}
 				schemaComponentTypes = moreSchemaComponentTypes
@@ -300,7 +355,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 			}
 			componentHeaders.Set(name, &v3.Header{
 				Description: desc.Summary,
-				Schema:      highbase.CreateSchemaProxy(stringSchema),
+				Schema:      highbase.CreateSchemaProxy(stringSchema(desc.Summary)),
 				Required:    req,
 				Explode:     explode,
 			})
@@ -330,6 +385,25 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 	}
 	components.SecuritySchemes = securitySchemes
 
+	extensions := orderedmap.New[string, *yaml.Node]()
+	if len(m.Undocumented) > 0 {
+		parent := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		for id, pos := range m.Undocumented {
+			k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: id}
+
+			filename := pos.Filename
+			if relpath, err := filepath.Rel(s.BasePath, filename); err != nil {
+				return err
+			} else {
+				filename = relpath
+			}
+
+			v := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: fmt.Sprintf("%s:%d:%d", filename, pos.Line, pos.Column)}
+			parent.Content = append(parent.Content, k, v)
+		}
+		extensions.Set("x-oc-undocumented", parent)
+	}
+
 	doc := &v3.Document{
 		Version: "3.0.4",
 		Info: &base.Info{
@@ -341,6 +415,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 			PathItems: pathItemMap,
 		},
 		Components: components,
+		Extensions: extensions,
 	}
 	{
 		security := []*highbase.SecurityRequirement{}
@@ -414,25 +489,27 @@ func merge[K comparable, V any](dst **orderedmap.Map[K, V], src *orderedmap.Map[
 	}
 }
 
-func schematize(ctx string, t model.Type, path []string, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type) (*highbase.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
+func schematize(ctx string, t model.Type, path []string, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type, desc string) (*highbase.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
 	if t == nil {
 		return nil, nil, fmt.Errorf("schematize: t is nil (path=%s)", strings.Join(path, " > "))
 	}
 	if elt, ok := t.Element(); ok {
 		if t.IsMap() {
-			if deref, ext, err := schematize(ctx, elt, sappend(path, t.Name()), typeMap, schemaComponentTypes); err != nil {
+			if deref, ext, err := schematize(ctx, elt, sappend(path, t.Name()), typeMap, schemaComponentTypes, ""); err != nil {
 				return nil, nil, err
 			} else {
 				schema := makeObjectSchema(deref)
 				schema.Extensions = ext
+				schema.Description = desc
 				return highbase.CreateSchemaProxy(schema), nil, nil
 			}
 		} else if t.IsArray() {
-			if deref, ext, err := schematize(ctx, elt, sappend(path, t.Name()), typeMap, schemaComponentTypes); err != nil {
+			if deref, ext, err := schematize(ctx, elt, sappend(path, t.Name()), typeMap, schemaComponentTypes, ""); err != nil {
 				return nil, nil, err
 			} else {
-				schema := makeArraySchema(deref)
+				schema := arraySchema(deref)
 				schema.Extensions = ext
+				schema.Description = desc
 				return highbase.CreateSchemaProxy(schema), nil, nil
 			}
 		} else {
@@ -455,36 +532,48 @@ func schematize(ctx string, t model.Type, path []string, typeMap map[string]mode
 		case "error":
 			return nil, ext, nil // TODO where is error even referenced?
 		case "time.Time":
-			return highbase.CreateSchemaProxy(timeSchema), ext, nil
+			return highbase.CreateSchemaProxy(timeSchema(desc)), ext, nil
 		case "string":
-			return highbase.CreateSchemaProxy(stringSchema), ext, nil
+			return highbase.CreateSchemaProxy(stringSchema(desc)), ext, nil
 		case "int":
-			return highbase.CreateSchemaProxy(integerSchema), ext, nil
+			return highbase.CreateSchemaProxy(integerSchema(desc)), ext, nil
 		case "uint":
-			return highbase.CreateSchemaProxy(unsignedIntegerSchema), ext, nil
+			return highbase.CreateSchemaProxy(unsignedIntegerSchema(desc)), ext, nil
 		case "bool":
-			return highbase.CreateSchemaProxy(booleanSchema), ext, nil
+			return highbase.CreateSchemaProxy(booleanSchema(desc)), ext, nil
 		case "any":
-			return highbase.CreateSchemaProxy(anySchema), ext, nil
+			return highbase.CreateSchemaProxy(anySchema(desc)), ext, nil
 		default:
 			return nil, ext, fmt.Errorf("failed to schematize built-in type '%s'/'%s' %#v", t.Key(), d.Key(), t)
 		}
 	}
 
-	props := orderedmap.New[string, *highbase.SchemaProxy]()
+	marked := false
+	if t.Name() == "EmailHeader" || t.Name() == "EmailBodyPart" {
+		marked = true
+	}
+	var _ = marked
+
 	if len(path) == 0 {
+		props := orderedmap.New[string, *highbase.SchemaProxy]()
 		for _, f := range d.Fields() {
 			ctx := fmt.Sprintf("%s.%s", ctx, f.Attr)
-			if fs, _, err := schematize(ctx, f.Type, sappend(path, t.Name()), typeMap, schemaComponentTypes); err != nil {
+			if fs, _, err := schematize(ctx, f.Type, sappend(path, t.Name()), typeMap, schemaComponentTypes, f.Summary); err != nil {
 				return nil, nil, err
 			} else if fs != nil {
 				props.Set(f.Attr, fs)
 			}
 		}
+		objdesc := t.Summary()
+		if t.Description() != "" {
+			objdesc = objdesc + "\n" + t.Description()
+		}
+
 		schema := &highbase.Schema{
-			Type:       []string{"object"},
-			Properties: props,
-			Title:      strings.Join(path, " > "), // for debugging
+			Type:        []string{"object"},
+			Properties:  props,
+			Title:       strings.Join(path, " > "), // for debugging
+			Description: objdesc,
 		}
 		return highbase.CreateSchemaProxy(schema), ext1("x-oc-type-source-struct", t.Key()), nil
 	} else {
@@ -499,25 +588,25 @@ func schematize(ctx string, t model.Type, path []string, typeMap map[string]mode
 	}
 }
 
-func reqschema(ref string, im model.Impl, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type) (*base.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
+func reqschema(ref string, im model.Impl, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type, desc string) (*base.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
 	if t, ok := typeMap[ref]; ok {
-		return schematize("", t, []string{im.Name}, typeMap, schemaComponentTypes)
+		return schematize("", t, []string{im.Name}, typeMap, schemaComponentTypes, "")
 	}
 
 	var schemaRef *base.SchemaProxy = nil
 	var ext *orderedmap.Map[string, *yaml.Node] = nil
 	switch ref {
 	case "map[string]any":
-		schemaRef = base.CreateSchemaProxy(objectSchema)
+		schemaRef = base.CreateSchemaProxy(objectSchema(desc))
 		ref = ""
 	case "string":
-		schemaRef = base.CreateSchemaProxy(stringSchema)
+		schemaRef = base.CreateSchemaProxy(stringSchema(desc))
 		ref = ""
 	case "[]string":
-		schemaRef = base.CreateSchemaProxy(stringArraySchema)
+		schemaRef = base.CreateSchemaProxy(arraySchema(base.CreateSchemaProxy(stringSchema(desc))))
 		ref = ""
 	case "any":
-		schemaRef = base.CreateSchemaProxy(anySchema)
+		schemaRef = base.CreateSchemaProxy(anySchema(desc))
 		ref = ""
 	default:
 		return nil, nil, fmt.Errorf("reqschema: failed to schematize unsupported response type '%s' for endpoint '%s %s' in function '%s'", ref, im.Endpoint.Verb, im.Endpoint.Path, im.Name)
@@ -541,10 +630,10 @@ func bodyparams(refs []string, im model.Impl, typeMap map[string]model.Type, sch
 	case 0:
 		return nil, nil
 	case 1:
-		schemaRef, _, err = reqschema(refs[0], im, typeMap, schemaComponentTypes)
+		schemaRef, _, err = reqschema(refs[0], im, typeMap, schemaComponentTypes, "") // TODO body parameter documentation
 	default:
 		schemaRef, err = mapReduce(refs, func(ref string) (*highbase.SchemaProxy, bool, error) {
-			schemaRef, _, err := reqschema(ref, im, typeMap, schemaComponentTypes)
+			schemaRef, _, err := reqschema(ref, im, typeMap, schemaComponentTypes, "") // TODO body parameter documentation
 			return schemaRef, true, err
 		}, func(schemas []*highbase.SchemaProxy) (*highbase.SchemaProxy, error) {
 			return base.CreateSchemaProxy(&base.Schema{OneOf: schemas}), nil
@@ -567,7 +656,7 @@ func responses(im model.Impl, model model.Model, typeMap map[string]model.Type, 
 		if resp.Type != nil {
 			if schema, ext, err := schematize(
 				fmt.Sprintf("verb='%s' path='%s' fun='%s': response type '%s'", im.Endpoint.Verb, im.Endpoint.Path, im.Endpoint.Fun, resp.Type.Key()),
-				resp.Type, []string{resp.Type.Name()}, typeMap, schemaComponentTypes); err != nil {
+				resp.Type, []string{resp.Type.Name()}, typeMap, schemaComponentTypes, ""); err != nil {
 				return nil, fmt.Errorf("failed to reference response type %s: %v", resp.Type, err)
 			} else {
 				contentMap.Set("application/json", &v3.MediaType{
@@ -575,40 +664,22 @@ func responses(im model.Impl, model model.Model, typeMap map[string]model.Type, 
 					Extensions: ext,
 				})
 			}
-
-			/*
-				if schema, ref, err := s.refType(resp.Type, model); err != nil {
-					return nil, fmt.Errorf("verb='%s' path='%s' fun='%s': failed to reference response type for %s: %v", im.Endpoint.Verb, im.Endpoint.Path, im.Endpoint.Fun, im.Name, err)
-				} else {
-					// use a reference for the response type
-					contentMap.Set("application/json", &v3.MediaType{
-						Schema:     schema,
-						Extensions: ext1("x-oc-ref-source", fmt.Sprintf("response type %s", resp.Type)),
-					})
-					if ref != "" {
-						if _, ok := typeMap[ref]; ok {
-							schemaComponentTypes[ref] = resp.Type
-						} else {
-							log.Panicf("failed to find type ref in typeMap: '%s'", ref)
-						}
-					}
-				}
-			*/
 		} else {
 			// when Type is nil, it means that there is no response object, used with 204 No Content,
 			// but we still have to add the Response object for that code below
 		}
 
-		// TODO extract response summary and description from apidoc annotation
+		// TODO extract response summary from apidoc annotation
 		summary := ""
+		if resp.Type != nil {
+			summary = resp.Type.Summary()
+		}
 		if summary == "" {
 			summary = http.StatusText(code)
 		}
-		description := ""
 
 		respMap.Set(strconv.Itoa(code), &v3.Response{
-			Summary:     summary,
-			Description: description,
+			Description: summary,
 			Content:     contentMap,
 			Extensions:  ext1("x-of-source", fmt.Sprintf("responses of %s:%d", im.Name, im.Line)),
 		})
@@ -664,7 +735,7 @@ func assign(op *v3.Operation, r model.Endpoint, pathItem *v3.PathItem) error {
 	return nil
 }
 
-func makeArraySchema(itemSchema *highbase.SchemaProxy) *highbase.Schema {
+func arraySchema(itemSchema *highbase.SchemaProxy) *highbase.Schema {
 	return &base.Schema{
 		Type:  []string{"array"},
 		Items: &base.DynamicValue[*base.SchemaProxy, bool]{N: 0, A: itemSchema},
@@ -677,43 +748,6 @@ func makeObjectSchema(itemSchema *highbase.SchemaProxy) *highbase.Schema {
 		AdditionalProperties: &base.DynamicValue[*base.SchemaProxy, bool]{N: 0, A: itemSchema},
 	}
 }
-
-/*
-func (s OpenApiSink) _refType(t Type, _ Model) (*highbase.SchemaProxy, string, error) {
-	if t == nil {
-		return nil, "", errors.New("t is nil")
-	}
-
-	if elt, ok := t.Element(); ok {
-		if t.IsArray() {
-			// TODO what's the ref here? t.String() is []xyz, is that what we have in the typeMap?
-			ref := elt.Key()
-			if strings.HasPrefix("[]", ref) {
-				panic("[]")
-			}
-			return base.CreateSchemaProxy(makeArraySchema(base.CreateSchemaProxyRef(SchemaComponentRefPrefix + ref))), ref, nil
-		} else if t.IsMap() {
-			// TODO what's the ref here? t.String() is map[string]xyz, is that what we have in the typeMap?
-			ref := elt.Key()
-			if strings.HasPrefix("map[", ref) {
-				panic("map[]")
-			}
-			return base.CreateSchemaProxy(makeObjectSchema(base.CreateSchemaProxyRef(SchemaComponentRefPrefix + ref))), ref, nil
-		} else {
-			return nil, "", fmt.Errorf("%T has an Element() but is neither array nor map: %#v", t, t)
-		}
-	}
-
-	ref := t.Key()
-	if strings.HasPrefix("[]", ref) {
-		panic("[]")
-	}
-	if strings.HasPrefix("map[", ref) {
-		panic("map[]")
-	}
-	return base.CreateSchemaProxyRef(SchemaComponentRefPrefix + ref), ref, nil
-}
-*/
 
 func ext1(k string, v string) *orderedmap.Map[string, *yaml.Node] {
 	ext := orderedmap.New[string, *yaml.Node]()

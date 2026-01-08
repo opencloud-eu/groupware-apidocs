@@ -2,20 +2,22 @@ package model
 
 import (
 	"go/ast"
+	"go/token"
 	"io"
 	"regexp"
 )
 
 type Field struct {
-	Name string
-	Attr string
-	Type Type
-	Tag  string
+	Name    string
+	Attr    string
+	Type    Type
+	Tag     string
+	Summary string
 }
 
 var tagRegex = regexp.MustCompile(`json:"(.+?)(?:,(omitempty|omitzero))?"`)
 
-func newField(name string, t Type, tag string) (Field, bool) {
+func NewField(name string, t Type, tag string, summary string) (Field, bool) {
 	attr := ""
 	if m := tagRegex.FindAllStringSubmatch(tag, 2); m != nil {
 		attr = m[0][1]
@@ -24,10 +26,11 @@ func newField(name string, t Type, tag string) (Field, bool) {
 		return Field{}, false
 	}
 	return Field{
-		Name: name,
-		Attr: attr,
-		Type: t,
-		Tag:  tag,
+		Name:    name,
+		Attr:    attr,
+		Type:    t,
+		Tag:     tag,
+		Summary: summary,
 	}, true
 }
 
@@ -41,6 +44,8 @@ type Type interface {
 	String() string
 	Fields() []Field
 	Element() (Type, bool)
+	Summary() string
+	Description() string
 }
 
 type ResponseHeaderDesc struct {
@@ -53,32 +58,6 @@ type RequestHeaderDesc struct {
 	Name        string
 	Description string
 	Required    bool
-}
-
-type Model struct {
-	Routes                 []Endpoint
-	PathParams             map[string]Param
-	QueryParams            map[string]Param
-	HeaderParams           map[string]Param
-	Impls                  []Impl
-	Types                  []Type
-	Enums                  map[string][]string
-	DefaultResponses       map[int]Type
-	DefaultResponseHeaders map[string]ResponseHeaderDesc
-	CommonRequestHeaders   []RequestHeaderDesc
-}
-
-func (m Model) ResolveType(k string) (Type, bool) {
-	for _, t := range m.Types {
-		if t.Key() == k {
-			return t, true
-		}
-	}
-	return nil, false
-}
-
-type Sink interface {
-	Output(model Model, w io.Writer) error
 }
 
 type Endpoint struct {
@@ -112,4 +91,31 @@ type Impl struct {
 	Tags         []string
 	Summary      string
 	Description  string
+}
+
+type Model struct {
+	Routes                 []Endpoint
+	PathParams             map[string]Param
+	QueryParams            map[string]Param
+	HeaderParams           map[string]Param
+	Impls                  []Impl
+	Types                  []Type
+	Enums                  map[string][]string
+	DefaultResponses       map[int]Type
+	DefaultResponseHeaders map[string]ResponseHeaderDesc
+	CommonRequestHeaders   []RequestHeaderDesc
+	Undocumented           map[string]token.Position
+}
+
+func (m Model) ResolveType(k string) (Type, bool) {
+	for _, t := range m.Types {
+		if t.Key() == k {
+			return t, true
+		}
+	}
+	return nil, false
+}
+
+type Sink interface {
+	Output(model Model, w io.Writer) error
 }

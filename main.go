@@ -45,6 +45,7 @@ func main() {
 		o := openapi.OpenApiSink{
 			TemplateFile:     template,
 			IncludeBasicAuth: false,
+			BasePath:         basepath,
 		}
 		if err := o.Output(model, os.Stdout); err != nil {
 			panic(err)

@@ -374,3 +374,11 @@ func hasAnyPrefix(s string, options []string) bool {
 	}
 	return false
 }
+
+func collect[A, B any](s []A, mapper func(A) B) []B {
+	r := make([]B, len(s))
+	for i, a := range s {
+		r[i] = mapper(a)
+	}
+	return r
+}
