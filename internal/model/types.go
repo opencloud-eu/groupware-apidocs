@@ -6,7 +6,35 @@ import (
 	"opencloud.eu/groupware-apidocs/internal/config"
 )
 
+var builtins = []string{
+	"any",
+	"bool",
+	"string",
+	"int",
+	"uint",
+	"error",
+}
+
+func IsBuiltinType(t string) bool {
+	return slices.Contains(builtins, t)
+}
+
+func IsBuiltinSelectorType(pkg string, _ string) bool {
+	return !slices.Contains(config.PackagesOfInterest, pkg)
+}
+
+var (
+	IntType    = NewBuiltinType("", "int")
+	UIntType   = NewBuiltinType("", "uint")
+	StringType = NewBuiltinType("", "string")
+	BoolType   = NewBuiltinType("", "bool")
+	TimeType   = NewBuiltinType("time", "Time")
+)
+
 func NewAliasType(pkg string, name string, typeRef Type) AliasType {
+	if typeRef == nil {
+		panic("elt is nil")
+	}
 	return AliasType{pkg: pkg, name: name, typeRef: typeRef}
 }
 
@@ -185,6 +213,9 @@ func (t BuiltinType) Description() string {
 var _ Type = BuiltinType{}
 
 func NewArrayType(elt Type) ArrayType {
+	if elt == nil {
+		panic("elt is nil")
+	}
 	return ArrayType{elt: elt}
 }
 
@@ -301,6 +332,12 @@ func (t StructType) Description() string {
 var _ Type = StructType{}
 
 func NewMapType(key Type, value Type) MapType {
+	if key == nil {
+		panic("key is nil")
+	}
+	if value == nil {
+		panic("value is nil")
+	}
 	return MapType{key: key, value: value}
 }
 
@@ -366,111 +403,3 @@ func (t MapType) Description() string {
 }
 
 var _ Type = MapType{}
-
-/*
-	func TypeOf(t types.Type, summary string, description string, mem map[string]Type, p *packages.Package) (Type, error) {
-		switch t := t.(type) {
-		case *types.Named:
-			name := t.Obj().Name()
-			pkg := ""
-			if t.Obj().Pkg() != nil {
-				pkg = t.Obj().Pkg().Name()
-				if IsBuiltinSelectorType(pkg, name) { // for things like time.Time
-					return newBuiltinType(pkg, name), nil
-				}
-			} else {
-				if IsBuiltinType(name) {
-					return newBuiltinType("", name), nil
-				}
-			}
-			switch u := t.Underlying().(type) {
-			case *types.Basic:
-				return newAliasType(pkg, name, newBuiltinType("", u.Name())), nil
-			case *types.Interface:
-				return newInterfaceType(pkg, name), nil
-			case *types.Map:
-				return mapOf(u, mem, p)
-			case *types.Array:
-				return arrayOf(u.Elem(), summary, description, mem, p)
-			case *types.Slice:
-				return arrayOf(u.Elem(), summary, description, mem, p)
-			case *types.Pointer:
-				return TypeOf(u.Elem(), summary, description, mem, p) // TODO pointer denotes that it's optional
-			case *types.Struct:
-				id := fmt.Sprintf("%s.%s", pkg, name)
-				if ex, ok := mem[id]; ok {
-					return ex, nil
-				}
-
-				fields := []Field{}
-				r := newStructType(pkg, name, fields, summary, description)
-				mem[id] = r
-				for i := range u.NumFields() {
-					f := u.Field(i)
-					switch f.Type().Underlying().(type) {
-					case *types.Signature:
-						// skip methods
-					default:
-						if typ, err := TypeOf(f.Type(), summary, description, mem, p); err != nil {
-							return nil, err
-						} else {
-							tag := u.Tag(i)
-							if field, ok := newField(f.Name(), typ, tag); ok {
-								fields = append(fields, field)
-							}
-						}
-					}
-				}
-				r.fields = fields
-				return r, nil
-			default:
-				return nil, fmt.Errorf("TypeOf: unsupported underlying type of named %s.%s is a %T: %#v", pkg, name, u, u)
-			}
-		case *types.Basic:
-			return newBuiltinType("", t.Name()), nil
-		case *types.Map:
-			return mapOf(t, mem, p)
-		case *types.Array:
-			return arrayOf(t.Elem(), summary, description, mem, p)
-		case *types.Slice:
-			return arrayOf(t.Elem(), summary, description, mem, p)
-		case *types.Pointer:
-			return TypeOf(t.Elem(), summary, description, mem, p)
-		case *types.Alias:
-			return aliasOf(t, mem, p)
-		case *types.Interface:
-			if t.String() == "any" {
-				return newBuiltinType("", "any"), nil
-			} else {
-				return nil, fmt.Errorf("TypeOf: unsupported: using an interface type that isn't any: %T: %#v", t, t)
-			}
-		case *types.TypeParam:
-			// ignore
-			return nil, nil
-		case *types.Chan:
-			// ignore
-			return nil, nil
-		case *types.Struct:
-			// ignore unnamed struct
-			return nil, nil
-		default:
-			return nil, fmt.Errorf("TypeOf: unsupported type: %T: %#v", t, t)
-		}
-	}
-*/
-var builtins = []string{
-	"any",
-	"bool",
-	"string",
-	"int",
-	"uint",
-	"error",
-}
-
-func IsBuiltinType(t string) bool {
-	return slices.Contains(builtins, t)
-}
-
-func IsBuiltinSelectorType(pkg string, _ string) bool {
-	return !slices.Contains(config.PackagesOfInterest, pkg)
-}

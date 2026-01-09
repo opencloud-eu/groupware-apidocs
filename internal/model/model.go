@@ -25,6 +25,9 @@ func NewField(name string, t Type, tag string, summary string) (Field, bool) {
 	if attr == "-" {
 		return Field{}, false
 	}
+	if attr == "" {
+		attr = name
+	}
 	return Field{
 		Name:    name,
 		Attr:    attr,
@@ -74,6 +77,7 @@ type Param struct {
 	Name        string
 	Description string
 	Required    bool
+	Type        Type
 }
 
 type Impl struct {
@@ -87,7 +91,7 @@ type Impl struct {
 	QueryParams  []Param
 	PathParams   []Param
 	HeaderParams []Param
-	BodyParams   []string
+	BodyParams   []Param
 	Tags         []string
 	Summary      string
 	Description  string

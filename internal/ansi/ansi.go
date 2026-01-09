@@ -12,6 +12,7 @@ import (
 )
 
 type AnsiSink struct {
+	Verbose bool
 }
 
 var _ model.Sink = AnsiSink{}
@@ -26,18 +27,16 @@ func (s AnsiSink) Output(m model.Model, w io.Writer) error {
 		imMap[im.Name] = im
 	}
 
-	/*
-		if verbose {
-			fmt.Fprintf(w, "\x1b[4mTypes:\x1b[0m\n")
-			for _, t := range m.Types {
-				fmt.Fprintf(w, "  \x1b[33m%s\x1b[0m\n", t.Key())
-				for _, f := range t.Fields() {
-					fmt.Fprintf(w, "    · \x1b[34m%s\x1b[0m %s\n", f.Name, f.Type)
-				}
+	if s.Verbose {
+		fmt.Fprintf(w, "\x1b[4mTypes:\x1b[0m\n")
+		for _, t := range m.Types {
+			fmt.Fprintf(w, "  \x1b[33m%s\x1b[0m\n", t.Key())
+			for _, f := range t.Fields() {
+				fmt.Fprintf(w, "    · \x1b[34m%s\x1b[0m %s\n", f.Name, f.Type)
 			}
-			fmt.Fprintf(w, "\n")
 		}
-	*/
+		fmt.Fprintf(w, "\n")
+	}
 
 	fmt.Fprintf(w, "\x1b[4mRoutes:\x1b[0m\n")
 	for _, r := range m.Routes {
@@ -58,7 +57,7 @@ func (s AnsiSink) Output(m model.Model, w io.Writer) error {
 			}
 			for _, p := range im.BodyParams {
 				fmt.Fprintf(w, "        \x1b[36m· {\x1b[0m")
-				if t, ok := typeMap[p]; ok {
+				if t, ok := typeMap[p.Name]; ok {
 					pfx := "          "
 					if err := printType(w, t, m, 0, pfx, []string{}); err != nil {
 						return err

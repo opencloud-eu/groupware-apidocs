@@ -41,7 +41,7 @@ func main() {
 	if model, err := parser.Parse(chdir, basepath); err != nil {
 		panic(err)
 	} else {
-		//o := AnsiSink{}
+		//o := AnsiSink{Verbose: verbose}
 		o := openapi.OpenApiSink{
 			TemplateFile:     template,
 			IncludeBasicAuth: false,

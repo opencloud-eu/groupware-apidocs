@@ -24,8 +24,8 @@ import (
 
 var (
 	objs          = regexp.MustCompile(`^([^/]+?s)/?$`)
-	objById       = regexp.MustCompile(`^([^/]+?)s/{[^/]*?id}$`)
-	objsInObjById = regexp.MustCompile(`^([^/]+?)s/{[^/]*?id}/([^/]+?)s$`)
+	objById       = regexp.MustCompile(`^([^/]+?s)/{[^/]*?id}$`)
+	objsInObjById = regexp.MustCompile(`^([^/]+?s)/{[^/]*?id}/([^/]+?s)$`)
 	apiTag        = regexp.MustCompile(`^\s*@api:tags?\s+(.+)\s*$`)
 )
 
@@ -100,13 +100,26 @@ func scrapeGlobalParamDecls(decls []ast.Decl) (GlobalParamDecls, error) {
 		for _, c := range consts(decl) {
 			if hasAnyPrefix(c.Name, config.PathParamPrefixes) {
 				desc := describeParam(c.Comments)
-				pathParams[c.Name] = model.Param{Name: c.Value, Description: desc, Required: true}
+				pathParams[c.Name] = model.Param{
+					Name:        c.Value,
+					Description: desc,
+					Required:    true,
+					Type:        model.NewBuiltinType("", "string"),
+				}
 			} else if hasAnyPrefix(c.Name, config.QueryParamPrefixes) {
 				desc := describeParam(c.Comments)
-				queryParams[c.Name] = model.Param{Name: c.Value, Description: desc, Required: false}
+				queryParams[c.Name] = model.Param{
+					Name:        c.Value,
+					Description: desc,
+					Required:    false,
+				}
 			} else if hasAnyPrefix(c.Name, config.HeaderParamPrefixes) {
 				desc := describeParam(c.Comments)
-				headerParams[c.Name] = model.Param{Name: c.Value, Description: desc, Required: false}
+				headerParams[c.Name] = model.Param{
+					Name:        c.Value,
+					Description: desc,
+					Required:    false,
+				}
 			}
 		}
 	}
@@ -298,10 +311,11 @@ func summarizeEndpoint(verb string, path string, comments []string) (string, str
 
 		if m := objById.FindAllStringSubmatch(obj, -1); m != nil {
 			n := ""
-			if voweled(m[0][1]) {
+			obj = m[0][1]
+			if voweled(obj) {
 				n = "n"
 			}
-			obj := singularize(m[0][1])
+			obj = singularize(obj)
 			summary = fmt.Sprintf("%s a%s %s by its identifier", action, n, obj)
 		} else if m := objs.FindAllStringSubmatch(obj, -1); m != nil {
 			qual := "a"
@@ -386,7 +400,7 @@ func (v returnVisitor) isResponseFunc(r *ast.ReturnStmt) (ast.Expr, int, bool) {
 	return nil, 0, false
 }
 
-func (v returnVisitor) resolve(x *ast.Ident) (model.Type, error) {
+func (v returnVisitor) resolveIdent(x *ast.Ident) (model.Type, error) {
 	z, ok := v.pkg.TypesInfo.Uses[x]
 	if !ok {
 		z, ok = v.pkg.TypesInfo.Defs[x]
@@ -394,8 +408,11 @@ func (v returnVisitor) resolve(x *ast.Ident) (model.Type, error) {
 	if !ok {
 		return nil, fmt.Errorf("failed to find in TypesInfo.Uses or TypesInfo.Defs: %#v", x)
 	}
-
 	t := z.Type()
+	return v.resolveType(t)
+}
+
+func (v returnVisitor) resolveType(t types.Type) (model.Type, error) {
 	name := ""
 	var pos token.Pos
 	summary := ""
@@ -408,20 +425,25 @@ func (v returnVisitor) resolve(x *ast.Ident) (model.Type, error) {
 			if p != nil {
 				name = p.Name() + "." + n.Obj().Name()
 			} else {
-				name = p.Name() + "." + n.Obj().Name()
+				name = n.Obj().Name()
 			}
 		}
 		pos = n.Obj().Pos()
 	}
 	r, err := typeOf(t, summary, description, v.typeMap, v.pkg)
-	{
+	if err != nil {
+		return nil, err
+	}
+	if r == nil {
+		log.Panicf("failed to resolve type %v", t)
+	} else {
 		if r.Summary() == "" {
 			if name != "" {
 				v.undocumented[name] = v.pkg.Fset.Position(pos)
 			}
 		}
 	}
-	return r, err
+	return r, nil
 }
 
 func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
@@ -432,11 +454,45 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 	if !ok {
 		return v
 	}
-	if arg, code, ok := v.isResponseFunc(r); ok {
-		if arg != nil {
-			switch x := arg.(type) {
-			case *ast.SelectorExpr:
-				key := x.X.(*ast.Ident).Name + "." + x.Sel.Name
+	arg, code, ok := v.isResponseFunc(r)
+	if !ok {
+		return v
+	}
+	if arg == nil {
+		// if a is nil, it means that there is no body
+		v.responseTypes[code] = nil
+		return v
+	}
+
+	switch arg := arg.(type) {
+	case *ast.SelectorExpr:
+		key := arg.X.(*ast.Ident).Name + "." + arg.Sel.Name
+		if m, ok := v.typeMap[key]; ok {
+			v.responseTypes[code] = m
+		} else {
+			fmt.Fprintf(os.Stderr, "failed to find the type '%s' in the typeMap, has the following types:\n", key)
+			for _, k := range keysort(v.typeMap) {
+				fmt.Fprintf(os.Stderr, "  - %s\n", k)
+			}
+			buf := new(bytes.Buffer)
+			if err := ast.Fprint(buf, v.fset, arg, nil); err == nil {
+				log.Panicf("failed to find the type '%s' in the typeMap, used as the response type for %#v in %s", key, arg, buf.String())
+			} else {
+				log.Panicf("failed to find the type '%s' in the typeMap, used as the response type for %#v", key, arg)
+			}
+		}
+	case *ast.CompositeLit:
+		switch t := arg.Type.(type) {
+		case *ast.Ident:
+			if t.Obj.Kind != ast.Typ {
+				log.Panicf("unsupported compositelit type is an ident but not of kind Typ: %T: %#v", t, t)
+			} else {
+				key := t.Obj.Name
+				if !strings.Contains(key, ".") {
+					if !model.IsBuiltinType(key) {
+						key = v.pkg.Name + "." + key
+					}
+				}
 				if m, ok := v.typeMap[key]; ok {
 					v.responseTypes[code] = m
 				} else {
@@ -451,69 +507,134 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 						log.Panicf("failed to find the type '%s' in the typeMap, used as the response type for %#v", key, arg)
 					}
 				}
-			case *ast.Ident:
-				if x.Obj == nil {
-					log.Panicf("response body argument is an ident that has a nil Obj: %v", x)
-				} else {
-					switch d := x.Obj.Decl.(type) {
-					case *ast.AssignStmt:
-						var a *ast.Ident = nil
-						for _, l := range d.Lhs {
-							if v, ok := isIdent(l); ok {
-								if v.Name == x.Name {
-									a = v
-									break
-								}
-							}
-						}
-						if a == nil {
-							log.Panicf("failed to find matching variable on LHS of assign statement") // TODO return proper err
-						} else {
-							if t, err := v.resolve(a); err != nil {
-								panic(err) // TODO collect and abort instead
-							} else {
-								v.responseTypes[code] = t
-							}
-						}
-					case *ast.ValueSpec:
-						if len(d.Names) == 1 {
-							if t, ok := isIdent(d.Names[0]); ok {
-								if strings.HasPrefix(t.Name, "RBODY") {
-									suffix := t.Name[5:]
-									if suffix != "" {
-										var err error
-										code, err = strconv.Atoi(suffix)
-										if err != nil {
-											log.Panicf("failed to parse integer status code in variable name '%v': %s\n", t.Name, err)
-										}
-									}
-								}
-
-								if t, err := v.resolve(x); err != nil {
-									panic(err) // TODO collect and abort instead
-								} else {
-									v.responseTypes[code] = t
-								}
-							} else {
-								log.Panicf("body result return variable is not an ident: %#v", d)
-							}
-						} else {
-							log.Panicf("d.Names len is not == 1 but %d", len(d.Names))
-						}
-					default:
-						buf := new(bytes.Buffer)
-						if err := ast.Fprint(buf, v.fset, arg, nil); err == nil {
-							log.Panicf("unsupported return decl: %T %v: %s", d, d, buf.String())
-						} else {
-							log.Panicf("unsupported return decl: %T %v", d, d)
+			}
+		default:
+			log.Panicf("unsupported compositelit type: %T: %#v", arg.Type, arg.Type)
+		}
+	case *ast.Ident:
+		if arg.Obj == nil {
+			log.Panicf("response body argument is an ident that has a nil Obj: %v", arg)
+		} else {
+			switch d := arg.Obj.Decl.(type) {
+			case *ast.AssignStmt:
+				var a *ast.Ident = nil
+				for _, l := range d.Lhs {
+					if v, ok := isIdent(l); ok {
+						if v.Name == arg.Name {
+							a = v
+							break
 						}
 					}
 				}
+				if a == nil {
+					log.Panicf("failed to find matching variable on LHS of assign statement") // TODO return proper err
+				} else {
+					if t, err := v.resolveIdent(a); err != nil {
+						panic(err) // TODO collect and abort instead
+					} else {
+						v.responseTypes[code] = t
+					}
+				}
+			case *ast.ValueSpec:
+				if len(d.Names) == 1 {
+					if t, ok := isIdent(d.Names[0]); ok {
+						if strings.HasPrefix(t.Name, "RBODY") {
+							suffix := t.Name[5:]
+							if suffix != "" {
+								var err error
+								code, err = strconv.Atoi(suffix)
+								if err != nil {
+									log.Panicf("failed to parse integer status code in variable name '%v': %s\n", t.Name, err)
+								}
+							}
+						}
+
+						if t, err := v.resolveIdent(arg); err != nil {
+							panic(err) // TODO collect and abort instead
+						} else {
+							v.responseTypes[code] = t
+						}
+					} else {
+						log.Panicf("body result return variable is not an ident: %#v", d)
+					}
+				} else {
+					log.Panicf("d.Names len is not == 1 but %d", len(d.Names))
+				}
+			default:
+				buf := new(bytes.Buffer)
+				if err := ast.Fprint(buf, v.fset, arg, nil); err == nil {
+					log.Panicf("unsupported return decl: %T %v: %s", d, d, buf.String())
+				} else {
+					log.Panicf("unsupported return decl: %T %v", d, d)
+				}
 			}
-		} else {
-			// if a is nil, it means that there is no body
-			v.responseTypes[code] = nil
 		}
+	case *ast.CallExpr:
+		if i, ok := isIdent(arg.Fun); ok {
+			switch d := i.Obj.Decl.(type) {
+			case *ast.FuncDecl:
+				if d.Type.Results != nil && len(d.Type.Results.List) > 0 {
+					ret := d.Type.Results.List[0].Type
+					if tv, ok := v.pkg.TypesInfo.Types[ret]; ok {
+						if t, err := v.resolveType(tv.Type); err != nil {
+							panic(err)
+						} else if t == nil {
+							panic("failed to resolve tv")
+						} else {
+							v.responseTypes[code] = t
+						}
+					} else {
+						panic("failed to find return type expr in TypesInfo")
+					}
+				} else {
+					panic("callexpr fun has no results")
+				}
+			default:
+				panic("callexpr fun is not a funcdecl")
+			}
+
+		} else {
+			panic("callexpr fun is not an ident")
+		}
+	case *ast.IndexExpr:
+		switch x := arg.X.(type) {
+		case *ast.SelectorExpr:
+			if sel, ok := v.pkg.TypesInfo.Selections[x]; ok {
+				p := sel.Obj().Type()
+				switch u := p.(type) {
+				case *types.Slice:
+					switch n := u.Elem().(type) {
+					case *types.Named:
+						if t, err := v.resolveType(n); err != nil {
+							panic(err)
+						} else {
+							v.responseTypes[code] = t
+						}
+					default:
+						panic("slice elem is not named")
+					}
+				default:
+					panic("sel is not a slice")
+				}
+			} else {
+				def, ok := v.pkg.TypesInfo.Defs[x.Sel]
+				if ok {
+					buf := new(bytes.Buffer)
+					ast.Fprint(buf, v.fset, arg, nil)
+					log.Printf("definition of %s:\n%s", x.X.(*ast.Ident).Name, def.Name())
+				} else {
+					tv, ok := v.pkg.TypesInfo.Types[x.Sel]
+					if !ok {
+						panic("failed to find something")
+					}
+					log.Printf("found type: %v", tv)
+				}
+			}
+		}
+	default:
+		buf := new(bytes.Buffer)
+		ast.Fprint(buf, v.fset, arg, nil)
+		panic("what's this?\n" + buf.String()) // TODO remove debugging
 	}
 	return v
 }
@@ -526,7 +647,7 @@ type paramsVisitor struct {
 	headerParams  map[string]model.Param
 	queryParams   map[string]model.Param
 	pathParams    map[string]model.Param
-	bodyParams    map[string]bool
+	bodyParams    map[string]model.Param
 	responseTypes map[int]model.Type
 	responseFuncs map[string]responseFunc
 	undocumented  map[string]token.Position
@@ -542,7 +663,7 @@ func newParamsVisitor(fset *token.FileSet, pkg *packages.Package, fun string, ty
 		headerParams:  map[string]model.Param{},
 		queryParams:   map[string]model.Param{},
 		pathParams:    map[string]model.Param{},
-		bodyParams:    map[string]bool{},
+		bodyParams:    map[string]model.Param{},
 		responseTypes: map[int]model.Type{},
 		responseFuncs: responseFuncs,
 		undocumented:  map[string]token.Position{},
@@ -610,10 +731,6 @@ func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Type, ma
 						ast.Walk(rv, c)
 						if len(rv.responseTypes) > 0 {
 							return rv.responseTypes, rv.undocumented, true
-						} else {
-							//buf := new(bytes.Buffer)
-							//ast.Fprint(buf, v.fset, c, nil) // TODO remove debugging
-							//log.Panicf("Groupware.respond has no returns? %s", buf.String())
 						}
 					}
 				}
@@ -653,42 +770,61 @@ func (v paramsVisitor) isNeedAccountCall(call *ast.CallExpr) (string, string, bo
 	return "", "", false
 }
 
-var parse = regexp.MustCompile(`^parse[A-Z].*?Param$`)
+var parse = regexp.MustCompile(`^parse([A-Z].*?)Param$`)
 
-func (v paramsVisitor) isParseQueryParamCall(call *ast.CallExpr) (string, string, bool) {
+func (v paramsVisitor) isParseQueryParamCall(call *ast.CallExpr) (string, string, model.Type, bool, error) {
 	if s, ok := isSelector(call.Fun); ok {
 		if x, ok := isIdent(s.X); ok && len(call.Args) == 2 && x.Obj != nil {
 			if m := parse.FindAllStringSubmatch(s.Sel.Name, 2); m != nil {
+				var typ model.Type = nil
+				{
+					switch m[0][1] {
+					case "Int":
+						typ = model.IntType
+					case "UInt":
+						typ = model.UIntType
+					case "Date":
+						typ = model.StringType
+					case "Bool":
+						typ = model.BoolType
+					case "Map":
+						typ = model.NewMapType(model.StringType, model.StringType)
+					default:
+						return "", "", nil, true, fmt.Errorf("unsupported type '%s' for query parameter through call to '%s'", m[0][1], s.Sel.Name)
+					}
+				}
+
 				if f, ok := isField(x.Obj.Decl); ok {
 					if t, ok := isIdent(f.Type); ok && t.Name == "Request" {
 						if a, ok := isIdent(call.Args[0]); ok {
-							return a.Name, "", true
+							return a.Name, "", typ, true, nil
 						}
 					}
 				}
 			}
 		}
 	}
-	return "", "", false
+	return "", "", nil, false, nil
 }
 
-func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (string, string, bool) {
+func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (string, string, model.Type, bool) {
 	if len(call.Args) == 2 && isStaticFunc(call, "chi", "URLParam") {
 		if a, ok := isIdent(call.Args[1]); ok {
-			return a.Name, "", true
+			return a.Name, "", nil, true
 		}
 	} else if len(call.Args) == 2 && isMemberFunc(call, "Request", "PathParamDoc") {
 		if a, ok := isIdent(call.Args[0]); ok {
 			if b, ok := isString(call.Args[1]); ok {
-				return a.Name, b, true
+				return a.Name, b, model.StringType, true
 			}
 		}
 	} else if len(call.Args) == 1 && isMemberFunc(call, "Request", "PathParam") {
 		if a, ok := isIdent(call.Args[0]); ok {
-			return a.Name, "", true
+			return a.Name, "", model.StringType, true
 		}
 	}
-	return "", "", false
+	// TODO PathParam methods that also cast to a different type (int, ...), if needed
+	return "", "", nil, false
 }
 
 func (v paramsVisitor) isHeaderParamCall(call *ast.CallExpr) (string, string, bool, bool) {
@@ -736,20 +872,40 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 			*v.errs = append(*v.errs, err)
 			return nil
 		} else if ok {
-			v.bodyParams[t] = true
-		} else if v.isAccountCall(d) {
-			v.pathParams[config.AccountIdUriParamName] = model.Param{Name: config.AccountIdUriParamName, Description: "", Required: true}
-		} else if r, undocumented, ok := v.isRespondCall(d); ok {
+			v.bodyParams[t] = model.Param{Name: t, Description: "", Required: false} // TODO body parameter descriptions
+			return v
+		}
+
+		if v.isAccountCall(d) {
+			v.pathParams[config.AccountIdUriParamName] = model.Param{Name: config.AccountIdUriParamName, Description: "", Required: true, Type: model.StringType}
+			return v
+		}
+
+		if r, undocumented, ok := v.isRespondCall(d); ok {
 			maps.Copy(v.responseTypes, r)
 			maps.Copy(v.undocumented, undocumented)
-		} else if z, desc, ok := v.isNeedAccountCall(d); ok {
-			v.pathParams[z] = model.Param{Name: z, Description: desc, Required: true}
-		} else if z, desc, ok := v.isPathParamCall(d); ok {
-			v.pathParams[z] = model.Param{Name: z, Description: desc, Required: true}
-		} else if z, desc, ok := v.isParseQueryParamCall(d); ok {
-			v.queryParams[z] = model.Param{Name: z, Description: desc, Required: false}
-		} else if z, desc, req, ok := v.isHeaderParamCall(d); ok {
+			return v
+		}
+		if z, desc, ok := v.isNeedAccountCall(d); ok {
+			v.pathParams[z] = model.Param{Name: z, Description: desc, Required: true, Type: model.StringType}
+			return v
+		}
+		if z, desc, typ, ok := v.isPathParamCall(d); ok {
+			v.pathParams[z] = model.Param{Name: z, Description: desc, Required: true, Type: typ}
+			return v
+		}
+
+		if z, desc, typ, ok, err := v.isParseQueryParamCall(d); err != nil {
+			*v.errs = append(*v.errs, err)
+			return nil
+		} else if ok {
+			v.queryParams[z] = model.Param{Name: z, Description: desc, Required: false, Type: typ}
+			return v
+		}
+
+		if z, desc, req, ok := v.isHeaderParamCall(d); ok {
 			v.headerParams[z] = model.Param{Name: z, Description: desc, Required: req}
+			return v
 		}
 	}
 	return v
@@ -1058,7 +1214,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 							QueryParams:  valuesOf(v.queryParams),
 							PathParams:   valuesOf(v.pathParams),
 							HeaderParams: valuesOf(v.headerParams),
-							BodyParams:   keysOf(v.bodyParams),
+							BodyParams:   valuesOf(v.bodyParams),
 							Tags:         tags,
 							Summary:      summary,
 							Description:  description,
@@ -1160,31 +1316,35 @@ func typeOf(t types.Type, summary string, description string, mem map[string]mod
 				return ex, nil
 			}
 
+			structFields, err := decompose(name, u, 0)
+			if err != nil {
+				return nil, err
+			}
+
 			fields := []model.Field{}
+			// add the struct with an empty list of fields into the memory (mem) to avoid
+			// endless looping when attempting to resolve the type using typeOf(), in case
+			// of circular references
 			r := model.NewStructType(pkg, name, fields, summary, description)
 			mem[id] = r
-			for i := range u.NumFields() {
-				f := u.Field(i)
-				summary := strings.Join(findComments(f.Pos(), token.VAR, p), "\n")
-				switch f.Type().Underlying().(type) {
-				case *types.Signature:
-					// skip methods
-				default:
-					if typ, err := typeOf(f.Type(), summary, description, mem, p); err != nil {
+			{
+				for _, f := range structFields {
+					summary := strings.Join(findComments(f.pos, token.VAR, p), "\n")
+					if typ, err := typeOf(f.typ, summary, description, mem, p); err != nil {
 						return nil, err
 					} else {
-						tag := u.Tag(i)
-						if field, ok := model.NewField(f.Name(), typ, tag, summary); ok {
+						if field, ok := model.NewField(f.name, typ, f.tag, summary); ok {
 							fields = append(fields, field)
 						}
 					}
 				}
 			}
+			// and now overwrite the struct type with a definition that contains the fields
 			r = model.NewStructType(pkg, name, fields, summary, description)
 			mem[id] = r
 			return r, nil
 		default:
-			return nil, fmt.Errorf("TypeOf: unsupported underlying type of named %s.%s is a %T: %#v", pkg, name, u, u)
+			return nil, fmt.Errorf("typeOf: unsupported underlying type of named %s.%s is a %T: %#v", pkg, name, u, u)
 		}
 	case *types.Basic:
 		return model.NewBuiltinType("", t.Name()), nil
@@ -1202,7 +1362,7 @@ func typeOf(t types.Type, summary string, description string, mem map[string]mod
 		if t.String() == "any" {
 			return model.NewBuiltinType("", "any"), nil
 		} else {
-			return nil, fmt.Errorf("TypeOf: unsupported: using an interface type that isn't any: %T: %#v", t, t)
+			return nil, fmt.Errorf("typeOf: unsupported: using an interface type that isn't any: %T: %#v", t, t)
 		}
 	case *types.TypeParam:
 		// ignore
@@ -1214,8 +1374,68 @@ func typeOf(t types.Type, summary string, description string, mem map[string]mod
 		// ignore unnamed struct
 		return nil, nil
 	default:
-		return nil, fmt.Errorf("TypeOf: unsupported type: %T: %#v", t, t)
+		return nil, fmt.Errorf("typeOf: unsupported type: %T: %#v", t, t)
 	}
+}
+
+type field struct {
+	name string
+	tag  string
+	typ  types.Type
+	pos  token.Pos
+}
+
+func decompose(name string, u *types.Struct, level int) ([]field, error) {
+	if level > 10 {
+		log.Panicf("recursing level %d", level)
+	}
+	structFields := []field{}
+	for i := range u.NumFields() {
+		f := u.Field(i)
+		switch f.Type().Underlying().(type) {
+		case *types.Signature:
+			// ignore
+		default:
+			tag := u.Tag(i)
+			if f.Embedded() {
+				var c *types.Struct = nil
+				switch t := f.Type().(type) {
+				case *types.Named:
+					switch ut := t.Underlying().(type) {
+					case *types.Struct:
+						c = ut
+					case *types.Interface:
+						// ignore
+						continue
+						// return nil, fmt.Errorf("found an interface")
+					default:
+						return nil, fmt.Errorf("while typeOf('%s'): (underlying) embedded field is not a struct but a %T", name, ut)
+					}
+				case *types.Struct:
+					c = t
+				default:
+					return nil, fmt.Errorf("while typeOf('%s'): embedded field is not a struct but a %T", name, u)
+				}
+				if c == nil {
+					return nil, fmt.Errorf("while typeOf('%s'): embedded field is not a struct but a %T", name, u)
+				} else {
+					if sub, err := decompose(name, c, level+1); err != nil { // this could cause an infinite loop
+						return nil, err
+					} else {
+						structFields = append(structFields, sub...)
+					}
+				}
+			} else {
+				structFields = append(structFields, field{
+					name: f.Name(),
+					typ:  f.Type(),
+					pos:  f.Pos(),
+					tag:  tag,
+				})
+			}
+		}
+	}
+	return structFields, nil
 }
 
 func arrayOf(t types.Type, summary string, description string, mem map[string]model.Type, p *packages.Package) (model.Type, error) {

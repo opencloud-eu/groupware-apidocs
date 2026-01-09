@@ -96,8 +96,10 @@ func booleanSchema(d string) *highbase.Schema {
 	return &base.Schema{Type: []string{"boolean"}, Description: d}
 }
 
-func parameterize(p model.Param, in string, requiredByDefault bool, model map[string]model.Param) (*v3.Parameter, error) {
-	if g, ok := model[p.Name]; ok {
+func parameterize(p model.Param, in string, requiredByDefault bool, m map[string]model.Param,
+	typeMap map[string]model.Type,
+	schemaComponentTypes map[string]model.Type) (*v3.Parameter, error) {
+	if g, ok := m[p.Name]; ok {
 		req := requiredByDefault
 		if p.Required {
 			req = true
@@ -109,11 +111,23 @@ func parameterize(p model.Param, in string, requiredByDefault bool, model map[st
 		if desc == "" {
 			desc = g.Description
 		}
+		var schema *highbase.SchemaProxy
+		var ext *orderedmap.Map[string, *yaml.Node]
+		if p.Type != nil {
+			if s, e, err := schematize(fmt.Sprintf("parameterize(%v, %s)", p, in), p.Type, []string{p.Name}, typeMap, schemaComponentTypes, desc); err != nil {
+				return nil, err
+			} else {
+				schema = s
+				ext = e
+			}
+		}
 		return &v3.Parameter{
 			Name:        g.Name,
 			In:          in,
 			Required:    &req,
 			Description: desc,
+			Schema:      schema,
+			Extensions:  ext,
 		}, nil
 	} else {
 		return nil, fmt.Errorf("failed to resolve %s parameter '%s'", in, p.Name)
@@ -164,7 +178,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 			// path parameters
 			for _, p := range im.PathParams {
-				if param, err := parameterize(p, "path", true, m.PathParams); err != nil {
+				if param, err := parameterize(p, "path", true, m.PathParams, typeMap, schemaComponentTypes); err != nil {
 					return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
 				} else {
 					op.Parameters = append(op.Parameters, param)
@@ -173,7 +187,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 			// query parameters
 			for _, p := range im.QueryParams {
-				if param, err := parameterize(p, "query", false, m.QueryParams); err != nil {
+				if param, err := parameterize(p, "query", false, m.QueryParams, typeMap, schemaComponentTypes); err != nil {
 					return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
 				} else {
 					op.Parameters = append(op.Parameters, param)
@@ -182,7 +196,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 			// header parameters
 			for _, p := range im.HeaderParams {
-				if param, err := parameterize(p, "header", false, m.HeaderParams); err != nil {
+				if param, err := parameterize(p, "header", false, m.HeaderParams, typeMap, schemaComponentTypes); err != nil {
 					return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
 				} else {
 					op.Parameters = append(op.Parameters, param)
@@ -493,6 +507,11 @@ func schematize(ctx string, t model.Type, path []string, typeMap map[string]mode
 	if t == nil {
 		return nil, nil, fmt.Errorf("schematize: t is nil (path=%s)", strings.Join(path, " > "))
 	}
+	marked := false
+	if t.Name() == "AccountWithIdAndIdentities" {
+		marked = true
+	}
+	var _ = marked
 	if elt, ok := t.Element(); ok {
 		if t.IsMap() {
 			if deref, ext, err := schematize(ctx, elt, sappend(path, t.Name()), typeMap, schemaComponentTypes, ""); err != nil {
@@ -548,12 +567,6 @@ func schematize(ctx string, t model.Type, path []string, typeMap map[string]mode
 		}
 	}
 
-	marked := false
-	if t.Name() == "EmailHeader" || t.Name() == "EmailBodyPart" {
-		marked = true
-	}
-	var _ = marked
-
 	if len(path) == 0 {
 		props := orderedmap.New[string, *highbase.SchemaProxy]()
 		for _, f := range d.Fields() {
@@ -561,6 +574,9 @@ func schematize(ctx string, t model.Type, path []string, typeMap map[string]mode
 			if fs, _, err := schematize(ctx, f.Type, sappend(path, t.Name()), typeMap, schemaComponentTypes, f.Summary); err != nil {
 				return nil, nil, err
 			} else if fs != nil {
+				if f.Attr == "" {
+					return nil, nil, fmt.Errorf("struct property in '%s' has no attr value: %#v", t.Key(), f)
+				}
 				props.Set(f.Attr, fs)
 			}
 		}
@@ -588,52 +604,41 @@ func schematize(ctx string, t model.Type, path []string, typeMap map[string]mode
 	}
 }
 
-func reqschema(ref string, im model.Impl, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type, desc string) (*base.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
-	if t, ok := typeMap[ref]; ok {
+func reqschema(param model.Param, im model.Impl, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type, desc string) (*base.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
+	if t, ok := typeMap[param.Name]; ok {
 		return schematize("", t, []string{im.Name}, typeMap, schemaComponentTypes, "")
 	}
 
 	var schemaRef *base.SchemaProxy = nil
 	var ext *orderedmap.Map[string, *yaml.Node] = nil
-	switch ref {
+	switch param.Name {
 	case "map[string]any":
 		schemaRef = base.CreateSchemaProxy(objectSchema(desc))
-		ref = ""
 	case "string":
 		schemaRef = base.CreateSchemaProxy(stringSchema(desc))
-		ref = ""
 	case "[]string":
 		schemaRef = base.CreateSchemaProxy(arraySchema(base.CreateSchemaProxy(stringSchema(desc))))
-		ref = ""
 	case "any":
 		schemaRef = base.CreateSchemaProxy(anySchema(desc))
-		ref = ""
 	default:
-		return nil, nil, fmt.Errorf("reqschema: failed to schematize unsupported response type '%s' for endpoint '%s %s' in function '%s'", ref, im.Endpoint.Verb, im.Endpoint.Path, im.Name)
+		return nil, nil, fmt.Errorf("reqschema: failed to schematize unsupported response type '%s' for endpoint '%s %s' in function '%s'", param.Name, im.Endpoint.Verb, im.Endpoint.Path, im.Name)
 		//schemaRef = base.CreateSchemaProxyRef(SchemaComponentRefPrefix + ref)
 		//ext = ext1("x-oc-ref-source", "bodyparam of "+im.Name)
-	}
-	if ref != "" {
-		if t, ok := typeMap[ref]; ok {
-			schemaComponentTypes[ref] = t
-		} else {
-			return nil, nil, fmt.Errorf("verb='%s' path='%s' fun='%s': failed to find type definition in type map for request body '%s'", im.Endpoint.Verb, im.Endpoint.Path, im.Endpoint.Fun, ref)
-		}
 	}
 	return schemaRef, ext, nil
 }
 
-func bodyparams(refs []string, im model.Impl, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type) (*v3.RequestBody, error) {
+func bodyparams(params []model.Param, im model.Impl, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type) (*v3.RequestBody, error) {
 	var schemaRef *highbase.SchemaProxy
 	var err error
-	switch len(refs) {
+	switch len(params) {
 	case 0:
 		return nil, nil
 	case 1:
-		schemaRef, _, err = reqschema(refs[0], im, typeMap, schemaComponentTypes, "") // TODO body parameter documentation
+		schemaRef, _, err = reqschema(params[0], im, typeMap, schemaComponentTypes, params[0].Description)
 	default:
-		schemaRef, err = mapReduce(refs, func(ref string) (*highbase.SchemaProxy, bool, error) {
-			schemaRef, _, err := reqschema(ref, im, typeMap, schemaComponentTypes, "") // TODO body parameter documentation
+		schemaRef, err = mapReduce(params, func(ref model.Param) (*highbase.SchemaProxy, bool, error) {
+			schemaRef, _, err := reqschema(ref, im, typeMap, schemaComponentTypes, ref.Description)
 			return schemaRef, true, err
 		}, func(schemas []*highbase.SchemaProxy) (*highbase.SchemaProxy, error) {
 			return base.CreateSchemaProxy(&base.Schema{OneOf: schemas}), nil
