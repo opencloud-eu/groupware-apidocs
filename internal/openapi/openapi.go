@@ -160,90 +160,114 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 	pathItemMap := orderedmap.New[string, *v3.PathItem]()
 	schemaComponentTypes := map[string]model.Type{} // collects items that need to be documented in /components/schemas
-	for path, endpoints := range paths {
+
+	pathKeys := slices.Collect(maps.Keys(paths))
+	slices.Sort(pathKeys)
+
+	for _, path := range pathKeys {
 		var pathItem *v3.PathItem = nil
+		{
+			opByVerb := map[string]*v3.Operation{}
 
-		for _, r := range endpoints {
-			im, ok := imMap[r.Fun]
-			if !ok {
-				return fmt.Errorf("verb='%s' path='%s' fun='%s': failed to find function in imMap for '%s'", r.Verb, r.Path, r.Fun, r.Fun)
-			}
+			for _, r := range paths[path] {
+				var op *v3.Operation = nil
+				{
+					im, ok := imMap[r.Fun]
+					if !ok {
+						return fmt.Errorf("verb='%s' path='%s' fun='%s': failed to find function in imMap for '%s'", r.Verb, r.Path, r.Fun, r.Fun)
+					}
 
-			if pathItem == nil {
-				pathItem = s.newPathItem(r.Verb, path, im)
-			}
+					if pathItem == nil {
+						pathItem = s.newPathItem(r.Verb, path, im)
+					}
 
-			opid := r.Fun
-			op := s.newOperation(opid, r.Verb, path, im)
+					opid := r.Fun
+					op = s.newOperation(opid, r.Verb, path, im)
 
-			// path parameters
-			for _, p := range im.PathParams {
-				if param, err := parameterize(p, "path", true, m.PathParams, typeMap, schemaComponentTypes); err != nil {
-					return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
-				} else {
-					op.Parameters = append(op.Parameters, param)
+					// path parameters
+					for _, p := range im.PathParams {
+						if param, err := parameterize(p, "path", true, m.PathParams, typeMap, schemaComponentTypes); err != nil {
+							return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
+						} else {
+							op.Parameters = append(op.Parameters, param)
+						}
+					}
+
+					// query parameters
+					for _, p := range im.QueryParams {
+						if param, err := parameterize(p, "query", false, m.QueryParams, typeMap, schemaComponentTypes); err != nil {
+							return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
+						} else {
+							op.Parameters = append(op.Parameters, param)
+						}
+					}
+
+					// header parameters
+					for _, p := range im.HeaderParams {
+						if param, err := parameterize(p, "header", false, m.HeaderParams, typeMap, schemaComponentTypes); err != nil {
+							return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
+						} else {
+							op.Parameters = append(op.Parameters, param)
+						}
+					}
+
+					// common header parameters
+					for _, h := range m.CommonRequestHeaders {
+						req := false
+						if h.Required {
+							req = true
+						}
+						schemaRef := highbase.CreateSchemaProxy(stringSchema(h.Description + " (x)"))
+						op.Parameters = append(op.Parameters, &v3.Parameter{
+							Name:        h.Name,
+							In:          "header",
+							Schema:      schemaRef,
+							Description: h.Description,
+							Required:    &req,
+						})
+					}
+
+					// body parameters
+					if requestBody, err := bodyparams(im.BodyParams, im, typeMap, schemaComponentTypes); err != nil {
+						return err
+					} else if requestBody != nil {
+						op.RequestBody = requestBody
+					}
+
+					// responses
+					if responses, err := responses(im, m, typeMap, schemaComponentTypes); err != nil {
+						return err
+					} else if responses != nil {
+						op.Responses = responses
+					} else {
+						log.Printf("impl has no responses: %#v", im) // for debugging
+					}
+
+					op.Tags = im.Tags
+					if strings.HasPrefix(path, "/accounts/all/") || path == "/accounts/all" {
+						op.Tags = append(op.Tags, "unified")
+					}
+
+					op.Extensions = ext1("x-oc-source", fmt.Sprintf("%s:%d", im.Source, im.Line))
+				}
+
+				if op != nil {
+					if _, ok := opByVerb[r.Verb]; ok {
+						return fmt.Errorf("conflict: path '%s' already has an operation assigned to the verb '%s'", r.Path, r.Verb)
+					} else {
+						opByVerb[r.Verb] = op
+					}
 				}
 			}
 
-			// query parameters
-			for _, p := range im.QueryParams {
-				if param, err := parameterize(p, "query", false, m.QueryParams, typeMap, schemaComponentTypes); err != nil {
-					return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
-				} else {
-					op.Parameters = append(op.Parameters, param)
+			opVerbs := slices.Collect(maps.Keys(opByVerb))
+			slices.SortFunc(opVerbs, verbSort)
+			for _, verb := range opVerbs {
+				if op, ok := opByVerb[verb]; ok {
+					if err := assign(op, verb, pathItem); err != nil {
+						return err
+					}
 				}
-			}
-
-			// header parameters
-			for _, p := range im.HeaderParams {
-				if param, err := parameterize(p, "header", false, m.HeaderParams, typeMap, schemaComponentTypes); err != nil {
-					return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
-				} else {
-					op.Parameters = append(op.Parameters, param)
-				}
-			}
-
-			// common header parameters
-			for _, h := range m.CommonRequestHeaders {
-				req := false
-				if h.Required {
-					req = true
-				}
-				schemaRef := highbase.CreateSchemaProxy(stringSchema(h.Description + " (x)"))
-				op.Parameters = append(op.Parameters, &v3.Parameter{
-					Name:        h.Name,
-					In:          "header",
-					Schema:      schemaRef,
-					Description: h.Description,
-					Required:    &req,
-				})
-			}
-
-			// body parameters
-			if requestBody, err := bodyparams(im.BodyParams, im, typeMap, schemaComponentTypes); err != nil {
-				return err
-			} else if requestBody != nil {
-				op.RequestBody = requestBody
-			}
-
-			// responses
-			if responses, err := responses(im, m, typeMap, schemaComponentTypes); err != nil {
-				return err
-			} else if responses != nil {
-				op.Responses = responses
-			} else {
-				log.Printf("impl has no responses: %#v", im) // for debugging
-			}
-
-			op.Tags = im.Tags
-			if strings.HasPrefix(path, "/accounts/all/") || path == "/accounts/all" {
-				op.Tags = append(op.Tags, "unified")
-			}
-
-			op.Extensions = ext1("x-oc-source", fmt.Sprintf("%s:%d", im.Source, im.Line))
-
-			if err := assign(op, r, pathItem); err != nil {
-				return err
 			}
 		}
 		if pathItem != nil {
@@ -268,23 +292,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 				})
 			}
 
-			/*
-				if schema, ref, err := s.refType(t, model); err != nil {
-					return fmt.Errorf("failed to reference default response type %s: %v", t, err)
-				} else {
-					contentMap.Set("application/json", &v3.MediaType{
-						Schema: schema,
-					})
-					if ref != "" {
-						if _, ok := typeMap[ref]; ok {
-							schemaComponentTypes[ref] = t
-						} else {
-							log.Panicf("failed to find type ref in typeMap: '%s'", ref)
-						}
-					}
-				}
-			*/
-			// TODO extract default response summary and description from @api
+			// TODO extract default response summary and description from comments
 			summary := ""
 			description := ""
 
@@ -303,6 +311,8 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 	// add the schema of types that are referenced as body parameters or responses
 	componentSchemas := orderedmap.New[string, *highbase.SchemaProxy]()
 	{
+		m := map[string]*highbase.SchemaProxy{}
+
 		// since each type may reference other types (typically struct fields), we have to loop
 		// indefinitely until we don't have any additional types to document that haven't been
 		// documented yet
@@ -319,7 +329,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 					ctx := fmt.Sprintf("resolving schema component type '%s'", t.Key())
 					if schema, _, err := schematize(ctx, t, []string{}, typeMap, moreSchemaComponentTypes, ""); err == nil {
 						if schema != nil {
-							componentSchemas.Set(t.Key(), schema)
+							m[t.Key()] = schema
 						}
 					} else {
 						return err
@@ -329,7 +339,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 				{
 					x := map[string]model.Type{}
 					for k, v := range moreSchemaComponentTypes {
-						if _, ok := componentSchemas.Get(k); ok {
+						if _, ok := m[k]; ok {
 							// we've already processed this type
 						} else {
 							// haven't done that one yet, keep it in the to-do list
@@ -352,6 +362,15 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 			}
 			if i >= maxIterations {
 				log.Panicf("documenting the schemas of types has iterated %d times, which is more than the limit of %d", i, maxIterations)
+			}
+		}
+
+		// sort them by keys to have a predictable output
+		mkeys := slices.Collect(maps.Keys(m))
+		slices.Sort(mkeys)
+		for _, k := range mkeys {
+			if v, ok := m[k]; ok {
+				componentSchemas.Set(k, v)
 			}
 		}
 	}
@@ -474,6 +493,36 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 		return err
 	}
 	return nil
+}
+
+var verbSortOrder = []string{
+	"GET",
+	"QUERY",
+	"HEAD",
+	"POST",
+	"PUT",
+	"DELETE",
+	"PATCH",
+	"OPTIONS",
+	"TRACE",
+}
+
+func verbSort(a, b string) int {
+	i := slices.Index(verbSortOrder, a)
+	j := slices.Index(verbSortOrder, b)
+	if i >= 0 {
+		if j >= 0 {
+			return i - j
+		} else {
+			return -1
+		}
+	} else {
+		if j >= 0 {
+			return 1
+		} else {
+			return strings.Compare(a, b)
+		}
+	}
 }
 
 func find[E any](s []E, matcher func(E) bool) (E, bool) {
@@ -711,8 +760,8 @@ func responses(im model.Impl, model model.Model, typeMap map[string]model.Type, 
 	return &v3.Responses{Codes: respMap}, nil
 }
 
-func assign(op *v3.Operation, r model.Endpoint, pathItem *v3.PathItem) error {
-	switch r.Verb {
+func assign(op *v3.Operation, verb string, pathItem *v3.PathItem) error {
+	switch verb {
 	case "GET":
 		pathItem.Get = op
 	case "PUT":
@@ -735,7 +784,7 @@ func assign(op *v3.Operation, r model.Endpoint, pathItem *v3.PathItem) error {
 		if pathItem.AdditionalOperations == nil {
 			pathItem.AdditionalOperations = orderedmap.New[string, *v3.Operation]()
 		}
-		pathItem.AdditionalOperations.Set(r.Verb, op)
+		pathItem.AdditionalOperations.Set(verb, op)
 	}
 	return nil
 }

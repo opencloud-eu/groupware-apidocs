@@ -351,6 +351,8 @@ func summarizeEndpoint(verb string, path string, comments []string) (string, str
 	summary = title(summary)
 	description = title(description)
 
+	summary = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(summary), "."))
+
 	return summary, description
 }
 
