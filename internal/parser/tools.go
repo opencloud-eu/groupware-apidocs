@@ -343,7 +343,7 @@ func voweled(str string) bool {
 	}
 	c, _ := utf8.DecodeRuneInString(str)
 	switch c {
-	case 'a', 'i', 'e', 'o', 'u':
+	case 'a', 'i', 'e', 'o', 'u', 'y', 'A', 'I', 'E', 'O', 'U', 'Y':
 		return true
 	}
 	return false

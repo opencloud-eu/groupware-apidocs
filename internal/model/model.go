@@ -103,6 +103,13 @@ type Undocumented struct {
 	Endpoint Endpoint
 }
 
+type Example struct {
+	Key    string
+	Title  string
+	Text   string
+	Origin string
+}
+
 type Model struct {
 	Routes                    []Endpoint
 	PathParams                map[string]Param
@@ -110,6 +117,7 @@ type Model struct {
 	HeaderParams              map[string]Param
 	Impls                     []Impl
 	Types                     []Type
+	Examples                  map[string]Example
 	Enums                     map[string][]string
 	DefaultResponses          map[int]Type
 	DefaultResponseHeaders    map[string]ResponseHeaderDesc

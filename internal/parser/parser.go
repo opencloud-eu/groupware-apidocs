@@ -7,6 +7,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"io/fs"
 	"log"
 	"maps"
 	"net/http"
@@ -1021,6 +1022,9 @@ func isRouteFun(f *types.Func) bool {
 func findFun(n string, p *packages.Package, _ *types.Func) (*ast.FuncDecl, string, bool) {
 	for i, f := range p.CompiledGoFiles {
 		s := p.Syntax[i] // TODO doesn't necessarily fit, can have nils that are compacted away
+		if s == nil {
+			continue
+		}
 		for _, d := range s.Decls {
 			switch x := d.(type) {
 			case *ast.FuncDecl:
@@ -1175,130 +1179,202 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 			}
 		}
 
-		for _, p := range pkgs {
-			if p.ID != config.GroupwarePackageID {
-				continue
+		// find the Package for "groupware"
+		var groupware *packages.Package = nil
+		{
+			for _, p := range pkgs {
+				if p.ID == config.GroupwarePackageID {
+					groupware = p
+					break
+				}
 			}
-			for _, d := range p.TypesInfo.Defs {
+			if groupware == nil {
+				panic("failed to find the groupware package " + config.GroupwarePackageID)
+			}
+		}
+
+		// fill routeFuncs
+		{
+			for _, d := range groupware.TypesInfo.Defs {
 				if d == nil {
 					continue
 				}
 				if f, ok := d.(*types.Func); ok && isRouteFun(f) {
-					routeFuncs[p.Name+"."+f.Name()] = f
+					routeFuncs[groupware.Name+"."+f.Name()] = f
 				}
 			}
+		}
 
+		// analyze routes, route functions and definitions of path and query parameter name
+		// constants in groupware_route.go
+		{
 			var syntax *ast.File = nil
-			for i, f := range p.CompiledGoFiles {
-				if rf, err := filepath.Rel(basepath, f); err != nil {
-					panic(err)
-				} else if rf == "services/groupware/pkg/groupware/groupware_route.go" {
-					syntax = p.Syntax[i]
+			{
+				for i, f := range groupware.CompiledGoFiles {
+					if rf, err := filepath.Rel(basepath, f); err != nil {
+						panic(err)
+					} else if rf == "services/groupware/pkg/groupware/groupware_route.go" {
+						syntax = groupware.Syntax[i]
+						break
+					}
+				}
+				if syntax == nil {
+					panic("failed to find syntax for groupware_route.go")
 				}
 			}
-			if syntax != nil {
-				routeFunc := findRouteDefinition(syntax)
-				if routeFunc == nil {
-					log.Fatal("failed to find Route() method")
+
+			routeFunc := findRouteDefinition(syntax)
+			if routeFunc == nil {
+				log.Fatal("failed to find Route() method")
+			}
+
+			{
+				if r, err := endpoints("/", routeFunc.Body.List, groupware.Name); err != nil {
+					panic(err)
+				} else {
+					routes = append(routes, r...)
 				}
-
-				{
-					if r, err := endpoints("/", routeFunc.Body.List, p.Name); err != nil {
-						panic(err)
-					} else {
-						routes = append(routes, r...)
-					}
+			}
+			{
+				if g, err := scrapeGlobalParamDecls(syntax.Decls); err != nil {
+					panic(err)
+				} else {
+					maps.Copy(pathParams, g.pathParams)
+					maps.Copy(queryParams, g.queryParams)
+					maps.Copy(headerParams, g.headerParams)
 				}
-				{
-					if g, err := scrapeGlobalParamDecls(syntax.Decls); err != nil {
-						panic(err)
-					} else {
-						maps.Copy(pathParams, g.pathParams)
-						maps.Copy(queryParams, g.queryParams)
-						maps.Copy(headerParams, g.headerParams)
-					}
-				}
+			}
+		}
 
-				for n, f := range routeFuncs {
-					if fun, source, ok := findFun(n, p, f); ok {
-						comments := []string{}
-						if fun.Doc != nil && len(fun.Doc.List) > 0 {
-							for _, doc := range fun.Doc.List {
-								comments = append(comments, parseComment(doc.Text))
-							}
-						}
-
-						v := newParamsVisitor(p.Fset, p, n, typeMap, responseFuncs)
-						resp := map[int]model.Resp{}
-
-						if fun.Body != nil {
-							ast.Walk(v, fun.Body)
-							if err := errors.Join(*v.errs...); err != nil {
-								panic(err)
-							}
-							for code, typename := range v.responseTypes {
-								resp[code] = model.Resp{Type: typename}
-							}
-						}
-						source, err := filepath.Rel(basepath, source)
-						if err != nil {
-							panic(err)
-						}
-						line := p.Fset.Position(fun.Pos()).Line
-
-						var route model.Endpoint
-						{
-							foundRoute := false
-							for _, r := range routes {
-								if r.Fun == n {
-									route = r
-									foundRoute = true
-									break
-								}
-							}
-							if !foundRoute {
-								log.Panicf("failed to find endpoint for route function '%s'", n)
-							}
-						}
-
-						tags := tags(route.Verb, route.Path, comments)
-						summary, description := summarizeEndpoint(route.Verb, route.Path, comments)
-
-						ims = append(ims, model.Impl{
-							Endpoint:     route,
-							Name:         n,
-							Fun:          fun,
-							Source:       source,
-							Line:         line,
-							Comments:     comments,
-							Resp:         resp,
-							QueryParams:  valuesOf(v.queryParams),
-							PathParams:   valuesOf(v.pathParams),
-							HeaderParams: valuesOf(v.headerParams),
-							BodyParams:   valuesOf(v.bodyParams),
-							Tags:         tags,
-							Summary:      summary,
-							Description:  description,
-						})
-
-						for k, pos := range v.undocumentedResults {
-							undocumentedResults[k] = model.Undocumented{
-								Pos:      pos,
-								Endpoint: route,
-							}
-						}
-						for k, pos := range v.undocumentedRequestBodies {
-							undocumentedResultBodies[k] = model.Undocumented{
-								Pos:      pos,
-								Endpoint: route,
-							}
-						}
-					} else {
-						log.Panicf("failed to find syntax for route function '%s'", n)
-					}
-				}
+		for n, f := range routeFuncs {
+			if fun, source, ok := findFun(n, groupware, f); !ok {
+				log.Panicf("failed to find function declaration for route function '%s' in package '%s'", n, groupware.Name)
 			} else {
-				panic("failed to find syntax for groupware_route.go")
+				comments := []string{}
+				if fun.Doc != nil && len(fun.Doc.List) > 0 {
+					for _, doc := range fun.Doc.List {
+						comments = append(comments, parseComment(doc.Text))
+					}
+				}
+
+				v := newParamsVisitor(groupware.Fset, groupware, n, typeMap, responseFuncs)
+				resp := map[int]model.Resp{}
+
+				if fun.Body != nil {
+					ast.Walk(v, fun.Body)
+					if err := errors.Join(*v.errs...); err != nil {
+						panic(err)
+					}
+					for code, typename := range v.responseTypes {
+						resp[code] = model.Resp{Type: typename}
+					}
+				}
+				source, err := filepath.Rel(basepath, source)
+				if err != nil {
+					panic(err)
+				}
+				line := groupware.Fset.Position(fun.Pos()).Line
+
+				var route model.Endpoint
+				{
+					foundRoute := false
+					for _, r := range routes {
+						if r.Fun == n {
+							route = r
+							foundRoute = true
+							break
+						}
+					}
+					if !foundRoute {
+						log.Panicf("failed to find endpoint for route function '%s'", n)
+					}
+				}
+
+				tags := tags(route.Verb, route.Path, comments)
+				summary, description := summarizeEndpoint(route.Verb, route.Path, comments)
+
+				ims = append(ims, model.Impl{
+					Endpoint:     route,
+					Name:         n,
+					Fun:          fun,
+					Source:       source,
+					Line:         line,
+					Comments:     comments,
+					Resp:         resp,
+					QueryParams:  valuesOf(v.queryParams),
+					PathParams:   valuesOf(v.pathParams),
+					HeaderParams: valuesOf(v.headerParams),
+					BodyParams:   valuesOf(v.bodyParams),
+					Tags:         tags,
+					Summary:      summary,
+					Description:  description,
+				})
+
+				for k, pos := range v.undocumentedResults {
+					undocumentedResults[k] = model.Undocumented{
+						Pos:      pos,
+						Endpoint: route,
+					}
+				}
+				for k, pos := range v.undocumentedRequestBodies {
+					undocumentedResultBodies[k] = model.Undocumented{
+						Pos:      pos,
+						Endpoint: route,
+					}
+				}
+			}
+		}
+	}
+
+	exampleMap := map[string]model.Example{}
+	{
+		for _, d := range config.SourceDirectories {
+			p := filepath.Join(chdir, d)
+			root := os.DirFS(p)
+			if files, err := fs.Glob(root, "example.*.json"); err != nil {
+				panic(err)
+			} else {
+				for _, f := range files {
+					k := strings.TrimSuffix(strings.TrimPrefix(f, "example."), ".json")
+					n := k
+					{
+						i := strings.Index(k, ".")
+						if i >= 0 {
+							n = n[i+1:]
+						}
+					}
+					q := filepath.Join(chdir, d, f)
+					if b, err := os.ReadFile(q); err != nil {
+						panic(err)
+					} else {
+						title := ""
+						text := ""
+						{
+							lines := strings.Split(string(b), "\n")
+							if len(lines) > 0 && strings.HasPrefix(lines[0], "#") {
+								title = strings.TrimSpace(strings.TrimPrefix(lines[0], "#"))
+								text = strings.Join(lines[1:], "\n")
+							} else {
+								text = string(b)
+							}
+						}
+
+						if title == "" {
+							v := ""
+							if voweled(n) {
+								v = "n"
+							}
+							title = fmt.Sprintf("A%s %s", v, n)
+						}
+
+						exampleMap[k] = model.Example{
+							Key:    k,
+							Title:  title,
+							Text:   text,
+							Origin: filepath.Join(d, f),
+						}
+					}
+				}
 			}
 		}
 	}
@@ -1348,6 +1424,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 		HeaderParams:              headerParams,
 		Impls:                     ims,
 		Types:                     types,
+		Examples:                  exampleMap,
 		Enums:                     enums,
 		DefaultResponses:          defaultResponses,
 		DefaultResponseHeaders:    defaultResponseHeaders,

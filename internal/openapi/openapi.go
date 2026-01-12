@@ -1,6 +1,7 @@
 package openapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -52,6 +53,7 @@ func (s OpenApiSink) newOperation(id string, _ string, _ string, im model.Impl) 
 var (
 	SchemaComponentRefPrefix   = "#/components/schemas/"
 	ResponseComponentRefPrefix = "#/components/responses/"
+	ExampleComponentRefPrefix  = "#/components/examples/"
 )
 
 var (
@@ -395,10 +397,37 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 		}
 	}
 
+	componentExamples := orderedmap.New[string, *highbase.Example]()
+	{
+		for name, example := range m.Examples {
+			var data yaml.Node
+			{
+				var m map[string]any
+				if err := json.Unmarshal([]byte(example.Text), &m); err != nil {
+					panic(err)
+				}
+				if b, err := yaml.Marshal(m); err != nil {
+					panic(err)
+				} else {
+					if err := yaml.Unmarshal(b, &data); err != nil {
+						panic(err)
+					}
+				}
+			}
+			componentExamples.Set(name, &highbase.Example{
+				Summary:     "todo",
+				Description: example.Title,
+				Value:       &data,
+				Extensions:  ext1("oc-example-source-file", example.Origin),
+			})
+		}
+	}
+
 	components := &v3.Components{
 		Schemas:   componentSchemas,
 		Responses: componentResponses,
 		Headers:   componentHeaders,
+		Examples:  componentExamples,
 	}
 
 	var securitySchemes *orderedmap.Map[string, *v3.SecurityScheme] = orderedmap.New[string, *v3.SecurityScheme]()
@@ -829,7 +858,7 @@ func (s OpenApiSink) bodyparams(params []model.Param, im model.Impl, typeMap map
 	}, nil
 }
 
-func (s OpenApiSink) responses(im model.Impl, model model.Model, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type) (*v3.Responses, error) {
+func (s OpenApiSink) responses(im model.Impl, m model.Model, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type) (*v3.Responses, error) {
 	respMap := orderedmap.New[string, *v3.Response]()
 	for code, resp := range im.Resp {
 		contentMap := orderedmap.New[string, *v3.MediaType]()
@@ -839,9 +868,14 @@ func (s OpenApiSink) responses(im model.Impl, model model.Model, typeMap map[str
 				resp.Type, []string{resp.Type.Name()}, typeMap, schemaComponentTypes, ""); err != nil {
 				return nil, fmt.Errorf("failed to reference response type %s: %v", resp.Type, err)
 			} else {
+				var examples *orderedmap.Map[string, *highbase.Example]
+				if _, ok := m.Examples[resp.Type.Key()]; ok {
+					examples = omap1("ok", highbase.CreateExampleRef(ExampleComponentRefPrefix+resp.Type.Key()))
+				}
 				contentMap.Set("application/json", &v3.MediaType{
 					Schema:     schema,
 					Extensions: ext,
+					Examples:   examples,
 				})
 			}
 		} else {
@@ -865,7 +899,7 @@ func (s OpenApiSink) responses(im model.Impl, model model.Model, typeMap map[str
 		})
 	}
 	// also add the default responses in every operation
-	for code, respType := range model.DefaultResponses {
+	for code, respType := range m.DefaultResponses {
 		codeKey := strconv.Itoa(code)
 		if _, ok := respMap.Get(codeKey); ok {
 			// that code is already defined for that function, which overrides the generic default
