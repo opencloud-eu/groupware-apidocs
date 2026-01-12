@@ -49,6 +49,7 @@ type Type interface {
 	Element() (Type, bool)
 	Summary() string
 	Description() string
+	Pos() (token.Position, bool)
 }
 
 type ResponseHeaderDesc struct {
@@ -97,18 +98,24 @@ type Impl struct {
 	Description  string
 }
 
+type Undocumented struct {
+	Pos      token.Position
+	Endpoint Endpoint
+}
+
 type Model struct {
-	Routes                 []Endpoint
-	PathParams             map[string]Param
-	QueryParams            map[string]Param
-	HeaderParams           map[string]Param
-	Impls                  []Impl
-	Types                  []Type
-	Enums                  map[string][]string
-	DefaultResponses       map[int]Type
-	DefaultResponseHeaders map[string]ResponseHeaderDesc
-	CommonRequestHeaders   []RequestHeaderDesc
-	Undocumented           map[string]token.Position
+	Routes                    []Endpoint
+	PathParams                map[string]Param
+	QueryParams               map[string]Param
+	HeaderParams              map[string]Param
+	Impls                     []Impl
+	Types                     []Type
+	Enums                     map[string][]string
+	DefaultResponses          map[int]Type
+	DefaultResponseHeaders    map[string]ResponseHeaderDesc
+	CommonRequestHeaders      []RequestHeaderDesc
+	UndocumentedResults       map[string]Undocumented
+	UndocumentedRequestBodies map[string]Undocumented
 }
 
 func (m Model) ResolveType(k string) (Type, bool) {

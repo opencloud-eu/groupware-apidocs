@@ -1,6 +1,7 @@
 package model
 
 import (
+	"go/token"
 	"slices"
 
 	"opencloud.eu/groupware-apidocs/internal/config"
@@ -31,17 +32,18 @@ var (
 	TimeType   = NewBuiltinType("time", "Time")
 )
 
-func NewAliasType(pkg string, name string, typeRef Type) AliasType {
+func NewAliasType(pkg string, name string, typeRef Type, pos token.Position) AliasType {
 	if typeRef == nil {
 		panic("elt is nil")
 	}
-	return AliasType{pkg: pkg, name: name, typeRef: typeRef}
+	return AliasType{pkg: pkg, name: name, typeRef: typeRef, pos: pos}
 }
 
 type AliasType struct {
 	pkg     string
 	name    string
 	typeRef Type
+	pos     token.Position
 }
 
 func (t AliasType) Key() string {
@@ -92,15 +94,20 @@ func (t AliasType) Description() string {
 	return ""
 }
 
+func (t AliasType) Pos() (token.Position, bool) {
+	return t.pos, true
+}
+
 var _ Type = AliasType{}
 
-func NewInterfaceType(pkg string, name string) InterfaceType {
-	return InterfaceType{pkg: pkg, name: name}
+func NewInterfaceType(pkg string, name string, pos token.Position) InterfaceType {
+	return InterfaceType{pkg: pkg, name: name, pos: pos}
 }
 
 type InterfaceType struct {
 	pkg  string
 	name string
+	pos  token.Position
 }
 
 func (t InterfaceType) Key() string {
@@ -145,6 +152,10 @@ func (t InterfaceType) Summary() string {
 
 func (t InterfaceType) Description() string {
 	return ""
+}
+
+func (t InterfaceType) Pos() (token.Position, bool) {
+	return t.pos, true
 }
 
 var _ Type = InterfaceType{}
@@ -210,6 +221,10 @@ func (t BuiltinType) Description() string {
 	return ""
 }
 
+func (t BuiltinType) Pos() (token.Position, bool) {
+	return token.Position{}, false
+}
+
 var _ Type = BuiltinType{}
 
 func NewArrayType(elt Type) ArrayType {
@@ -271,10 +286,14 @@ func (t ArrayType) Description() string {
 	return t.elt.Description()
 }
 
+func (t ArrayType) Pos() (token.Position, bool) {
+	return t.elt.Pos()
+}
+
 var _ Type = ArrayType{}
 
-func NewStructType(pkg string, name string, fields []Field, summary string, description string) StructType {
-	return StructType{pkg: pkg, name: name, fields: fields, summary: summary, description: description}
+func NewStructType(pkg string, name string, fields []Field, summary string, description string, pos token.Position) StructType {
+	return StructType{pkg: pkg, name: name, fields: fields, summary: summary, description: description, pos: pos}
 }
 
 type StructType struct {
@@ -283,6 +302,7 @@ type StructType struct {
 	fields      []Field
 	summary     string
 	description string
+	pos         token.Position
 }
 
 func (t StructType) Key() string {
@@ -327,6 +347,10 @@ func (t StructType) Summary() string {
 
 func (t StructType) Description() string {
 	return t.description
+}
+
+func (t StructType) Pos() (token.Position, bool) {
+	return t.pos, true
 }
 
 var _ Type = StructType{}
@@ -400,6 +424,10 @@ func (t MapType) Summary() string {
 
 func (t MapType) Description() string {
 	return t.value.Description() // TODO how to document a map?
+}
+
+func (t MapType) Pos() (token.Position, bool) {
+	return t.value.Pos()
 }
 
 var _ Type = MapType{}

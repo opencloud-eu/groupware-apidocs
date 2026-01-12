@@ -137,10 +137,6 @@ func nameOf(expr ast.Expr, pkg string) (string, error) {
 	return "", fmt.Errorf("nameOf(): unsupported expression type: %T %v", expr, expr)
 }
 
-func keysOf[K comparable, V any](m map[K]V) []K {
-	return slices.Collect(maps.Keys(m))
-}
-
 func valuesOf[K comparable, V any](m map[K]V) []V {
 	return slices.Collect(maps.Values(m))
 }

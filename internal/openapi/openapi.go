@@ -96,7 +96,7 @@ func booleanSchema(d string) *highbase.Schema {
 	return &base.Schema{Type: []string{"boolean"}, Description: d}
 }
 
-func parameterize(p model.Param, in string, requiredByDefault bool, m map[string]model.Param,
+func (s OpenApiSink) parameterize(p model.Param, in string, requiredByDefault bool, m map[string]model.Param,
 	typeMap map[string]model.Type,
 	schemaComponentTypes map[string]model.Type) (*v3.Parameter, error) {
 	if g, ok := m[p.Name]; ok {
@@ -114,7 +114,7 @@ func parameterize(p model.Param, in string, requiredByDefault bool, m map[string
 		var schema *highbase.SchemaProxy
 		var ext *orderedmap.Map[string, *yaml.Node]
 		if p.Type != nil {
-			if s, e, err := schematize(fmt.Sprintf("parameterize(%v, %s)", p, in), p.Type, []string{p.Name}, typeMap, schemaComponentTypes, desc); err != nil {
+			if s, e, err := s.schematize(fmt.Sprintf("parameterize(%v, %s)", p, in), p.Type, []string{p.Name}, typeMap, schemaComponentTypes, desc); err != nil {
 				return nil, err
 			} else {
 				schema = s
@@ -186,7 +186,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 					// path parameters
 					for _, p := range im.PathParams {
-						if param, err := parameterize(p, "path", true, m.PathParams, typeMap, schemaComponentTypes); err != nil {
+						if param, err := s.parameterize(p, "path", true, m.PathParams, typeMap, schemaComponentTypes); err != nil {
 							return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
 						} else {
 							op.Parameters = append(op.Parameters, param)
@@ -195,7 +195,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 					// query parameters
 					for _, p := range im.QueryParams {
-						if param, err := parameterize(p, "query", false, m.QueryParams, typeMap, schemaComponentTypes); err != nil {
+						if param, err := s.parameterize(p, "query", false, m.QueryParams, typeMap, schemaComponentTypes); err != nil {
 							return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
 						} else {
 							op.Parameters = append(op.Parameters, param)
@@ -204,7 +204,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 					// header parameters
 					for _, p := range im.HeaderParams {
-						if param, err := parameterize(p, "header", false, m.HeaderParams, typeMap, schemaComponentTypes); err != nil {
+						if param, err := s.parameterize(p, "header", false, m.HeaderParams, typeMap, schemaComponentTypes); err != nil {
 							return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
 						} else {
 							op.Parameters = append(op.Parameters, param)
@@ -228,14 +228,14 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 					}
 
 					// body parameters
-					if requestBody, err := bodyparams(im.BodyParams, im, typeMap, schemaComponentTypes); err != nil {
+					if requestBody, err := s.bodyparams(im.BodyParams, im, typeMap, schemaComponentTypes); err != nil {
 						return err
 					} else if requestBody != nil {
 						op.RequestBody = requestBody
 					}
 
 					// responses
-					if responses, err := responses(im, m, typeMap, schemaComponentTypes); err != nil {
+					if responses, err := s.responses(im, m, typeMap, schemaComponentTypes); err != nil {
 						return err
 					} else if responses != nil {
 						op.Responses = responses
@@ -283,7 +283,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 			}
 			key := fmt.Sprintf("%s.%d", t.Key(), code)
 			contentMap := orderedmap.New[string, *v3.MediaType]()
-			if schema, ext, err := schematize(fmt.Sprintf("default response '%s'", t.Name()), t, []string{t.Name()}, typeMap, schemaComponentTypes, ""); err != nil {
+			if schema, ext, err := s.schematize(fmt.Sprintf("default response '%s'", t.Name()), t, []string{t.Name()}, typeMap, schemaComponentTypes, ""); err != nil {
 				return fmt.Errorf("failed to reference default response type %s: %v", t, err)
 			} else {
 				contentMap.Set("application/json", &v3.MediaType{
@@ -327,7 +327,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 						continue
 					}
 					ctx := fmt.Sprintf("resolving schema component type '%s'", t.Key())
-					if schema, _, err := schematize(ctx, t, []string{}, typeMap, moreSchemaComponentTypes, ""); err == nil {
+					if schema, _, err := s.schematize(ctx, t, []string{}, typeMap, moreSchemaComponentTypes, t.Summary()); err == nil {
 						if schema != nil {
 							m[t.Key()] = schema
 						}
@@ -419,22 +419,87 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 	components.SecuritySchemes = securitySchemes
 
 	extensions := orderedmap.New[string, *yaml.Node]()
-	if len(m.Undocumented) > 0 {
-		parent := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
-		for id, pos := range m.Undocumented {
-			k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: id}
-
-			filename := pos.Filename
-			if relpath, err := filepath.Rel(s.BasePath, filename); err != nil {
-				return err
-			} else {
-				filename = relpath
+	if len(m.UndocumentedResults) > 0 || len(m.UndocumentedRequestBodies) > 0 {
+		container := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		if len(m.UndocumentedResults) > 0 {
+			parent := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			{
+				k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "results"}
+				container.Content = append(container.Content, k, parent)
 			}
 
-			v := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: fmt.Sprintf("%s:%d:%d", filename, pos.Line, pos.Column)}
-			parent.Content = append(parent.Content, k, v)
+			for id, u := range m.UndocumentedResults {
+				filename := u.Pos.Filename
+				if relpath, err := filepath.Rel(s.BasePath, filename); err != nil {
+					return err
+				} else {
+					filename = relpath
+				}
+
+				c := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+				{
+					k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: id}
+					parent.Content = append(parent.Content, k, c)
+				}
+
+				{
+					k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "pos"}
+					v := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: fmt.Sprintf("%s:%d:%d", filename, u.Pos.Line, u.Pos.Column)}
+					c.Content = append(c.Content, k, v)
+				}
+				{
+					k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "verb"}
+					v := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: u.Endpoint.Verb}
+					c.Content = append(c.Content, k, v)
+				}
+				{
+					k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "path"}
+					v := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: u.Endpoint.Path}
+					c.Content = append(c.Content, k, v)
+				}
+			}
 		}
-		extensions.Set("x-oc-undocumented", parent)
+
+		if len(m.UndocumentedRequestBodies) > 0 {
+			parent := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			{
+				k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "bodies"}
+				container.Content = append(container.Content, k, parent)
+			}
+
+			for id, u := range m.UndocumentedRequestBodies {
+				filename := u.Pos.Filename
+				if relpath, err := filepath.Rel(s.BasePath, filename); err != nil {
+					return err
+				} else {
+					filename = relpath
+				}
+
+				c := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+				{
+					k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: id}
+					parent.Content = append(parent.Content, k, c)
+				}
+
+				{
+					k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "pos"}
+					v := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: fmt.Sprintf("%s:%d:%d", filename, u.Pos.Line, u.Pos.Column)}
+					c.Content = append(c.Content, k, v)
+				}
+				{
+					k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "verb"}
+					v := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: u.Endpoint.Verb}
+					c.Content = append(c.Content, k, v)
+				}
+				{
+					k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "path"}
+					v := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: u.Endpoint.Path}
+					c.Content = append(c.Content, k, v)
+				}
+			}
+		}
+
+		extensions.Set("x-oc-undocumented", container)
 	}
 
 	doc := &v3.Document{
@@ -482,6 +547,32 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 					doc.Tags = append(doc.Tags, tag)
 				}
 			}
+		}
+	}
+
+	// logging output to stderr
+	if len(m.UndocumentedResults) > 0 {
+		log.Printf("%d undocumented results:", len(m.UndocumentedResults))
+		for name, u := range m.UndocumentedResults {
+			filename := u.Pos.Filename
+			if relpath, err := filepath.Rel(s.BasePath, filename); err != nil {
+				return err
+			} else {
+				filename = relpath
+			}
+			log.Printf("  - %s: %s %s @ %s:%d:%d", name, u.Endpoint.Verb, u.Endpoint.Path, filename, u.Pos.Line, u.Pos.Column)
+		}
+	}
+	if len(m.UndocumentedRequestBodies) > 0 {
+		log.Printf("%d undocumented request bodies:", len(m.UndocumentedRequestBodies))
+		for name, u := range m.UndocumentedRequestBodies {
+			filename := u.Pos.Filename
+			if relpath, err := filepath.Rel(s.BasePath, filename); err != nil {
+				return err
+			} else {
+				filename = relpath
+			}
+			log.Printf("  - %s: %s %s @ %s:%d:%d", name, u.Endpoint.Verb, u.Endpoint.Path, filename, u.Pos.Line, u.Pos.Column)
 		}
 	}
 
@@ -552,18 +643,13 @@ func merge[K comparable, V any](dst **orderedmap.Map[K, V], src *orderedmap.Map[
 	}
 }
 
-func schematize(ctx string, t model.Type, path []string, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type, desc string) (*highbase.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
+func (s OpenApiSink) schematize(ctx string, t model.Type, path []string, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type, desc string) (*highbase.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
 	if t == nil {
 		return nil, nil, fmt.Errorf("schematize: t is nil (path=%s)", strings.Join(path, " > "))
 	}
-	marked := false
-	if t.Name() == "AccountWithIdAndIdentities" {
-		marked = true
-	}
-	var _ = marked
 	if elt, ok := t.Element(); ok {
 		if t.IsMap() {
-			if deref, ext, err := schematize(ctx, elt, sappend(path, t.Name()), typeMap, schemaComponentTypes, ""); err != nil {
+			if deref, ext, err := s.schematize(ctx, elt, sappend(path, t.Name()), typeMap, schemaComponentTypes, desc); err != nil {
 				return nil, nil, err
 			} else {
 				schema := makeObjectSchema(deref)
@@ -572,7 +658,7 @@ func schematize(ctx string, t model.Type, path []string, typeMap map[string]mode
 				return highbase.CreateSchemaProxy(schema), nil, nil
 			}
 		} else if t.IsArray() {
-			if deref, ext, err := schematize(ctx, elt, sappend(path, t.Name()), typeMap, schemaComponentTypes, ""); err != nil {
+			if deref, ext, err := s.schematize(ctx, elt, sappend(path, t.Name()), typeMap, schemaComponentTypes, desc); err != nil {
 				return nil, nil, err
 			} else {
 				schema := arraySchema(deref)
@@ -620,7 +706,7 @@ func schematize(ctx string, t model.Type, path []string, typeMap map[string]mode
 		props := orderedmap.New[string, *highbase.SchemaProxy]()
 		for _, f := range d.Fields() {
 			ctx := fmt.Sprintf("%s.%s", ctx, f.Attr)
-			if fs, _, err := schematize(ctx, f.Type, sappend(path, t.Name()), typeMap, schemaComponentTypes, f.Summary); err != nil {
+			if fs, _, err := s.schematize(ctx, f.Type, sappend(path, t.Name()), typeMap, schemaComponentTypes, f.Summary); err != nil {
 				return nil, nil, err
 			} else if fs != nil {
 				if f.Attr == "" {
@@ -629,9 +715,29 @@ func schematize(ctx string, t model.Type, path []string, typeMap map[string]mode
 				props.Set(f.Attr, fs)
 			}
 		}
-		objdesc := t.Summary()
-		if t.Description() != "" {
-			objdesc = objdesc + "\n" + t.Description()
+		objdesc := desc
+		if objdesc == "" {
+			objdesc = t.Summary()
+			if t.Summary() != "" {
+				if t.Description() != "" {
+					objdesc = objdesc + "\n" + t.Description()
+				}
+			} else {
+				objdesc = t.Description()
+			}
+		}
+
+		var ext *orderedmap.Map[string, *yaml.Node]
+		if pos, ok := t.Pos(); ok {
+			filename := pos.Filename
+			if relpath, err := filepath.Rel(s.BasePath, filename); err != nil {
+				return nil, nil, err
+			} else {
+				filename = relpath
+			}
+			ext = ext2("x-oc-type-source-struct", t.Key(), "x-oc-type-source-pos", fmt.Sprintf("%s:%d:%d", filename, pos.Line, pos.Column))
+		} else {
+			ext = ext1("x-oc-type-source-struct", t.Key())
 		}
 
 		schema := &highbase.Schema{
@@ -639,8 +745,10 @@ func schematize(ctx string, t model.Type, path []string, typeMap map[string]mode
 			Properties:  props,
 			Title:       strings.Join(path, " > "), // for debugging
 			Description: objdesc,
+			Extensions:  ext,
 		}
-		return highbase.CreateSchemaProxy(schema), ext1("x-oc-type-source-struct", t.Key()), nil
+
+		return highbase.CreateSchemaProxy(schema), nil, nil
 	} else {
 		// use a reference to avoid circular references and endless loops
 		ref := d.Key()
@@ -649,13 +757,27 @@ func schematize(ctx string, t model.Type, path []string, typeMap map[string]mode
 		} else {
 			return nil, nil, fmt.Errorf("schematize: failed to find referenced type in typeMap: %s", ref)
 		}
-		return highbase.CreateSchemaProxyRef(SchemaComponentRefPrefix + ref), ext1("x-oc-type-source-ref", t.Key()), nil
+
+		var ext *orderedmap.Map[string, *yaml.Node]
+		if pos, ok := t.Pos(); ok {
+			filename := pos.Filename
+			if relpath, err := filepath.Rel(s.BasePath, filename); err != nil {
+				return nil, nil, err
+			} else {
+				filename = relpath
+			}
+			ext = ext2("x-oc-type-source-ref", t.Key(), "x-oc-type-source-pos", fmt.Sprintf("%s:%d:%d", filename, pos.Line, pos.Column))
+		} else {
+			ext = ext1("x-oc-type-source-ref", t.Key())
+		}
+
+		return highbase.CreateSchemaProxyRef(SchemaComponentRefPrefix + ref), ext, nil
 	}
 }
 
-func reqschema(param model.Param, im model.Impl, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type, desc string) (*base.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
+func (s OpenApiSink) reqschema(param model.Param, im model.Impl, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type, desc string) (*base.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
 	if t, ok := typeMap[param.Name]; ok {
-		return schematize("", t, []string{im.Name}, typeMap, schemaComponentTypes, "")
+		return s.schematize("reqschema", t, []string{im.Name}, typeMap, schemaComponentTypes, desc)
 	}
 
 	var schemaRef *base.SchemaProxy = nil
@@ -677,17 +799,19 @@ func reqschema(param model.Param, im model.Impl, typeMap map[string]model.Type, 
 	return schemaRef, ext, nil
 }
 
-func bodyparams(params []model.Param, im model.Impl, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type) (*v3.RequestBody, error) {
+func (s OpenApiSink) bodyparams(params []model.Param, im model.Impl, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type) (*v3.RequestBody, error) {
 	var schemaRef *highbase.SchemaProxy
 	var err error
+	desc := ""
 	switch len(params) {
 	case 0:
 		return nil, nil
 	case 1:
-		schemaRef, _, err = reqschema(params[0], im, typeMap, schemaComponentTypes, params[0].Description)
+		schemaRef, _, err = s.reqschema(params[0], im, typeMap, schemaComponentTypes, params[0].Description)
+		desc = params[0].Description
 	default:
 		schemaRef, err = mapReduce(params, func(ref model.Param) (*highbase.SchemaProxy, bool, error) {
-			schemaRef, _, err := reqschema(ref, im, typeMap, schemaComponentTypes, ref.Description)
+			schemaRef, _, err := s.reqschema(ref, im, typeMap, schemaComponentTypes, ref.Description)
 			return schemaRef, true, err
 		}, func(schemas []*highbase.SchemaProxy) (*highbase.SchemaProxy, error) {
 			return base.CreateSchemaProxy(&base.Schema{OneOf: schemas}), nil
@@ -695,20 +819,22 @@ func bodyparams(params []model.Param, im model.Impl, typeMap map[string]model.Ty
 		if err != nil {
 			return nil, err
 		}
+		// TODO multiple body parameters, what should we use for the description?
 	}
 	return &v3.RequestBody{
-		Required:   boolPtr(true),
-		Content:    omap1("application/json", &v3.MediaType{Schema: schemaRef}),
-		Extensions: ext1("x-oc-ref-source", "bodyparams of "+im.Name),
+		Required:    boolPtr(true),
+		Content:     omap1("application/json", &v3.MediaType{Schema: schemaRef}),
+		Description: desc,
+		Extensions:  ext1("x-oc-ref-source", "bodyparams of "+im.Name),
 	}, nil
 }
 
-func responses(im model.Impl, model model.Model, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type) (*v3.Responses, error) {
+func (s OpenApiSink) responses(im model.Impl, model model.Model, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type) (*v3.Responses, error) {
 	respMap := orderedmap.New[string, *v3.Response]()
 	for code, resp := range im.Resp {
 		contentMap := orderedmap.New[string, *v3.MediaType]()
 		if resp.Type != nil {
-			if schema, ext, err := schematize(
+			if schema, ext, err := s.schematize(
 				fmt.Sprintf("verb='%s' path='%s' fun='%s': response type '%s'", im.Endpoint.Verb, im.Endpoint.Path, im.Endpoint.Fun, resp.Type.Key()),
 				resp.Type, []string{resp.Type.Name()}, typeMap, schemaComponentTypes, ""); err != nil {
 				return nil, fmt.Errorf("failed to reference response type %s: %v", resp.Type, err)
@@ -806,6 +932,13 @@ func makeObjectSchema(itemSchema *highbase.SchemaProxy) *highbase.Schema {
 func ext1(k string, v string) *orderedmap.Map[string, *yaml.Node] {
 	ext := orderedmap.New[string, *yaml.Node]()
 	ext.Set(k, &yaml.Node{Kind: yaml.ScalarNode, Value: v})
+	return ext
+}
+
+func ext2(k1, v1, k2, v2 string) *orderedmap.Map[string, *yaml.Node] {
+	ext := orderedmap.New[string, *yaml.Node]()
+	ext.Set(k1, &yaml.Node{Kind: yaml.ScalarNode, Value: v1})
+	ext.Set(k2, &yaml.Node{Kind: yaml.ScalarNode, Value: v2})
 	return ext
 }
 
