@@ -1419,17 +1419,17 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 			e := model.Examples{
 				Key: k,
 			}
+			remaining := maps.Clone(qualified)
 			if x, ok := qualified["any"]; ok {
+				delete(remaining, "any")
 				e.DefaultExample = x
 			} else {
 				panic(fmt.Errorf("no default example for %s", k))
 			}
 			if x, ok := qualified["request"]; ok {
+				delete(remaining, "request")
 				e.RequestExample = &x
 			}
-			remaining := maps.Clone(qualified)
-			delete(remaining, "any")
-			delete(remaining, "request")
 			if len(remaining) > 0 {
 				panic(fmt.Errorf("unsupported qualifiers found for examples for '%s': %s", k, strings.Join(slices.Collect(maps.Keys(remaining)), ", ")))
 			}
@@ -1437,7 +1437,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 		}
 	}
 
-	enums := map[string][]string{} // TODO
+	enums := map[string][]string{} // TODO implement enums
 
 	defaultResponses := map[int]model.Type{}
 	{
@@ -1449,27 +1449,62 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 	}
 
 	// TODO extract default headers and their documentation from the source code (groupware_framework.go)
-	defaultResponseHeaders := map[string]model.ResponseHeaderDesc{} // TODO use a struct instead of string to indicate more information (required or not)
+	defaultResponseHeaders := map[string]model.ResponseHeaderDesc{}
 	{
 		// defaultHeaders["Content-Language"]
 		// defaultHeaders["ETag"]
-		defaultResponseHeaders["Session-State"] = model.ResponseHeaderDesc{Summary: "The opaque state identifier for the JMAP Session", Required: true}
-		defaultResponseHeaders["State"] = model.ResponseHeaderDesc{Summary: "The opaque state identifier for the type of objects in the response"}
-		defaultResponseHeaders["Object-Type"] = model.ResponseHeaderDesc{Summary: "The type of JMAP objects returned in the response"}
-		defaultResponseHeaders["Account-Id"] = model.ResponseHeaderDesc{Summary: "The identifier of the account the operation was performed against, when against a single account"}
-		defaultResponseHeaders["Account-Ids"] = model.ResponseHeaderDesc{Summary: "The identifier of the accounts the operation was performed against, when against multiple accounts", Explode: true}
-		defaultResponseHeaders["Trace-Id"] = model.ResponseHeaderDesc{Summary: "The value of the Trace-Id header that was specified in the request or, if not, a unique randomly generated identifier that is included in logging output", Required: true}
+		defaultResponseHeaders["Session-State"] = model.ResponseHeaderDesc{
+			Summary:  "The opaque state identifier for the JMAP Session",
+			Required: true,
+			Examples: map[string]string{"A JMAP Session identifier": "eish5Toh"},
+		}
+		defaultResponseHeaders["State"] = model.ResponseHeaderDesc{
+			Summary:  "The opaque state identifier for the type of objects in the response (see the `Object-Type` header)",
+			Examples: map[string]string{"A State identifier": "ra8eey5T"},
+		}
+		defaultResponseHeaders["Object-Type"] = model.ResponseHeaderDesc{
+			Summary: "The type of JMAP objects returned in the response",
+			Examples: map[string]string{
+				"The State pertains to Identities":         "identity",
+				"The State pertains to Emails":             "email",
+				"The State pertains to Contacts":           "contact",
+				"The State pertains to Addressbooks":       "addressbook",
+				"The State pertains to Quotas":             "quota",
+				"The State pertains to Vacation Responses": "vacationresponse",
+			},
+		}
+		defaultResponseHeaders["Account-Id"] = model.ResponseHeaderDesc{
+			Summary:  "The identifier of the account the operation was performed against, when against a single account",
+			Examples: map[string]string{"An Account identifier": "b"},
+		}
+		defaultResponseHeaders["Account-Ids"] = model.ResponseHeaderDesc{
+			Summary:  "The identifier of the accounts the operation was performed against, when against multiple accounts",
+			Explode:  true,
+			Examples: map[string]string{"A list of Account identifiers": "b,d,e"},
+		}
+		defaultResponseHeaders["Trace-Id"] = model.ResponseHeaderDesc{
+			Summary:  "The value of the Trace-Id header that was specified in the request or, if not, a unique randomly generated identifier that is included in logging output",
+			Required: true,
+			Examples: map[string]string{"A UUID as trace ID": "4ab74941-b178-4565-9e28-2bb35eb2ff0c"},
+		}
 	}
 
 	commonRequestHeaders := []model.RequestHeaderDesc{}
 	{
+		// TODO retrieve common request headers from the source code
 		commonRequestHeaders = append(commonRequestHeaders, model.RequestHeaderDesc{
 			Name:        "X-Request-ID",
 			Description: "When specified, its value is used in logs for correlation",
+			Examples: map[string]string{
+				"A UUID as request ID": "433bfe7b-032a-4ec3-8fb9-87ee5fb97af7",
+			},
 		})
 		commonRequestHeaders = append(commonRequestHeaders, model.RequestHeaderDesc{
 			Name:        "Trace-Id",
 			Description: "When specified, its value is used in logs for correlation and if not, a new random value is generated and sent in the response",
+			Examples: map[string]string{
+				"A UUID as trace ID": "4ab74941-b178-4565-9e28-2bb35eb2ff0c",
+			},
 		})
 	}
 

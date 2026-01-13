@@ -80,12 +80,14 @@ type ResponseHeaderDesc struct {
 	Summary  string
 	Required bool
 	Explode  bool
+	Examples map[string]string
 }
 
 type RequestHeaderDesc struct {
 	Name        string
 	Description string
 	Required    bool
+	Examples    map[string]string
 }
 
 type Endpoint struct {

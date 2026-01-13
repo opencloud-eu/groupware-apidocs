@@ -54,6 +54,7 @@ var (
 	SchemaComponentRefPrefix   = "#/components/schemas/"
 	ResponseComponentRefPrefix = "#/components/responses/"
 	ExampleComponentRefPrefix  = "#/components/examples/"
+	HeaderComponentRefPrefix   = "#/components/headers/"
 )
 
 var (
@@ -267,14 +268,25 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 						if h.Required {
 							req = true
 						}
-						schemaRef := highbase.CreateSchemaProxy(stringSchema(h.Description + " (x)"))
-						op.Parameters = append(op.Parameters, &v3.Parameter{
+						schemaRef := highbase.CreateSchemaProxy(stringSchema(h.Description))
+						param := &v3.Parameter{
 							Name:        h.Name,
 							In:          "header",
 							Schema:      schemaRef,
 							Description: h.Description,
 							Required:    &req,
-						})
+						}
+						if len(h.Examples) > 0 {
+							examples := orderedmap.New[string, *highbase.Example]()
+							for summary, e := range h.Examples {
+								examples.Set(summary, &highbase.Example{
+									Summary: summary,
+									Value:   &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: e},
+								})
+							}
+							param.Examples = examples
+						}
+						op.Parameters = append(op.Parameters, param)
 					}
 
 					// body parameters
@@ -436,12 +448,23 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 			if desc.Explode {
 				explode = true
 			}
-			componentHeaders.Set(name, &v3.Header{
+			header := &v3.Header{
 				Description: desc.Summary,
 				Schema:      highbase.CreateSchemaProxy(stringSchema(desc.Summary)),
 				Required:    req,
 				Explode:     explode,
-			})
+			}
+			if len(desc.Examples) > 0 {
+				examples := orderedmap.New[string, *highbase.Example]()
+				for k, e := range desc.Examples {
+					examples.Set(k, &highbase.Example{
+						Summary: k,
+						Value:   &yaml.Node{Kind: yaml.ScalarNode, Value: e},
+					})
+				}
+				header.Examples = examples
+			}
+			componentHeaders.Set(name, header)
 		}
 	}
 

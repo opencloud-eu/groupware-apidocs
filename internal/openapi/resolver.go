@@ -374,10 +374,18 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 			summary = http.StatusText(code)
 		}
 
+		// common response headers
+		headers := orderedmap.New[string, *v3.Header]()
+		for k := range m.DefaultResponseHeaders {
+			headers.Set(k, v3.CreateHeaderRef(HeaderComponentRefPrefix+k))
+		}
+
 		respMap.Set(strconv.Itoa(code), &v3.Response{
 			Description: summary,
 			Content:     contentMap,
 			Extensions:  ext1("x-of-source", fmt.Sprintf("responses of %s:%d", im.Name, im.Line)),
+			Headers:     headers,
+			// Summary: // not displayed
 		})
 	}
 	// also add the default responses in every operation
