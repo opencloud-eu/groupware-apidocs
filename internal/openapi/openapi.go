@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 
 	oapi "github.com/pb33f/libopenapi"
@@ -28,6 +27,7 @@ var (
 		Name:  "Pascal Bleser",
 		Email: "p.bleser@opencloud.eu",
 	}
+	schemaPropertiesExamples = false // can be toggled, but property examples in schemas are not rendered in redoc, so we should leave this on false
 )
 
 type OpenApiSink struct {
@@ -57,17 +57,11 @@ var (
 )
 
 var (
-	//anySchema    = &base.Schema{Type: []string{"object"}}
-	//objectSchema = &base.Schema{Type: []string{"object"}}
-	//stringSchema          = &base.Schema{Type: []string{"string"}}
-	//integerSchema         = &base.Schema{Type: []string{"integer"}}
-	//unsignedIntegerSchema = &base.Schema{Type: []string{"integer"}, Minimum: zerofPtr()}
-	//booleanSchema         = &base.Schema{Type: []string{"boolean"}}
-	//stringArraySchema     = makeArraySchema(base.CreateSchemaProxy(stringSchema))
-	//timeSchema            = &base.Schema{Type: []string{"string"}, Format: "date-time"}
+	TagUnified = "unified"
+)
+
+var (
 	patchObjectSchema = arraySchema(base.CreateSchemaProxy(anySchema("")))
-	// numberSchema = &base.Schema{Type: []string{"number"}}
-	// dateSchema = &base.Schema{Type: []string{"string"}, Format: "date"}
 )
 
 func timeSchema(d string) *highbase.Schema {
@@ -98,42 +92,78 @@ func booleanSchema(d string) *highbase.Schema {
 	return &base.Schema{Type: []string{"boolean"}, Description: d}
 }
 
-func (s OpenApiSink) parameterize(p model.Param, in string, requiredByDefault bool, m map[string]model.Param,
-	typeMap map[string]model.Type,
-	schemaComponentTypes map[string]model.Type) (*v3.Parameter, error) {
-	if g, ok := m[p.Name]; ok {
-		req := requiredByDefault
-		if p.Required {
-			req = true
+type renderedExample struct {
+	defaultExample *yaml.Node
+	requestExample *yaml.Node
+}
+
+func (r renderedExample) forRequest() *yaml.Node {
+	if r.requestExample != nil {
+		return r.requestExample
+	}
+	return r.defaultExample
+}
+
+func (r renderedExample) forResponse() *yaml.Node {
+	return r.defaultExample
+}
+
+func renderExample(text string) (*yaml.Node, error) {
+	var data yaml.Node
+	{
+		var m map[string]any
+		if err := json.Unmarshal([]byte(text), &m); err != nil {
+			return nil, err
 		}
-		if !req && g.Required {
-			req = true
-		}
-		desc := p.Description
-		if desc == "" {
-			desc = g.Description
-		}
-		var schema *highbase.SchemaProxy
-		var ext *orderedmap.Map[string, *yaml.Node]
-		if p.Type != nil {
-			if s, e, err := s.schematize(fmt.Sprintf("parameterize(%v, %s)", p, in), p.Type, []string{p.Name}, typeMap, schemaComponentTypes, desc); err != nil {
+		if b, err := yaml.Marshal(m); err != nil {
+			return nil, err
+		} else {
+			if err := yaml.Unmarshal(b, &data); err != nil {
 				return nil, err
-			} else {
-				schema = s
-				ext = e
 			}
 		}
-		return &v3.Parameter{
-			Name:        g.Name,
-			In:          in,
-			Required:    &req,
-			Description: desc,
-			Schema:      schema,
-			Extensions:  ext,
-		}, nil
-	} else {
-		return nil, fmt.Errorf("failed to resolve %s parameter '%s'", in, p.Name)
 	}
+	return &data, nil
+}
+
+func renderObj(value any) (*yaml.Node, error) {
+	ser := yaml.Node{}
+	if b, err := yaml.Marshal(value); err != nil {
+		return nil, err
+	} else {
+		if err := yaml.Unmarshal(b, &ser); err != nil {
+			return nil, err
+		}
+	}
+	if len(ser.Content) == 1 {
+		return ser.Content[0], nil
+	} else {
+		return &ser, nil
+	}
+}
+
+func patchExampleIntoSchema(name string, example model.Example, schema *highbase.Schema) error {
+	if !schemaPropertiesExamples {
+		return nil
+	}
+	t := map[string]any{}
+	if err := json.Unmarshal([]byte(example.Text), &t); err != nil {
+		return fmt.Errorf("bodyparams: failed to unmarshall example JSON payload: %w", err)
+	} else {
+		if value, ok := t[name]; ok {
+			examples := schema.Examples
+			if examples == nil {
+				examples = []*yaml.Node{}
+			}
+			if ser, err := renderObj(value); err != nil {
+				return fmt.Errorf("bodyparams: failed to marshall example JSON payload for attribute: %w", err)
+			} else {
+				examples = append(examples, ser)
+			}
+			schema.Examples = examples
+		}
+	}
+	return nil
 }
 
 func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
@@ -156,22 +186,40 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 		}
 	}
 
-	typeMap := index(m.Types, func(t model.Type) string { return t.Key() })
 	imMap := index(m.Impls, func(i model.Impl) string { return i.Name })
-	paths := indexMany(m.Routes, func(r model.Endpoint) string { return r.Path })
+	routesByPath := indexMany(m.Routes, func(r model.Endpoint) string { return r.Path })
+	renderedExampleMap := map[string]renderedExample{}
+	for name, qualified := range m.Examples {
+		rendered := renderedExample{}
+		if n, err := renderExample(qualified.DefaultExample.Text); err != nil {
+			panic(fmt.Errorf("failed to render default example for '%s': %w", name, err))
+		} else {
+			rendered.defaultExample = n
+		}
+		if qualified.RequestExample != nil {
+			if n, err := renderExample(qualified.RequestExample.Text); err != nil {
+				panic(fmt.Errorf("failed to render request example for '%s': %w", name, err))
+			} else {
+				rendered.requestExample = n
+			}
+		}
+		renderedExampleMap[name] = rendered
+	}
 
 	pathItemMap := orderedmap.New[string, *v3.PathItem]()
 	schemaComponentTypes := map[string]model.Type{} // collects items that need to be documented in /components/schemas
 
-	pathKeys := slices.Collect(maps.Keys(paths))
+	pathKeys := slices.Collect(maps.Keys(routesByPath))
 	slices.Sort(pathKeys)
+
+	res := newResolver(s.BasePath, m, renderedExampleMap)
 
 	for _, path := range pathKeys {
 		var pathItem *v3.PathItem = nil
 		{
 			opByVerb := map[string]*v3.Operation{}
 
-			for _, r := range paths[path] {
+			for _, r := range routesByPath[path] {
 				var op *v3.Operation = nil
 				{
 					im, ok := imMap[r.Fun]
@@ -180,15 +228,15 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 					}
 
 					if pathItem == nil {
-						pathItem = s.newPathItem(r.Verb, path, im)
+						pathItem = s.newPathItem(r.Verb, r.Path, im)
 					}
 
 					opid := r.Fun
-					op = s.newOperation(opid, r.Verb, path, im)
+					op = s.newOperation(opid, r.Verb, r.Path, im)
 
 					// path parameters
 					for _, p := range im.PathParams {
-						if param, err := s.parameterize(p, "path", true, m.PathParams, typeMap, schemaComponentTypes); err != nil {
+						if param, err := res.parameterize(p, "path", true, m.PathParams, schemaComponentTypes); err != nil {
 							return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
 						} else {
 							op.Parameters = append(op.Parameters, param)
@@ -197,7 +245,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 					// query parameters
 					for _, p := range im.QueryParams {
-						if param, err := s.parameterize(p, "query", false, m.QueryParams, typeMap, schemaComponentTypes); err != nil {
+						if param, err := res.parameterize(p, "query", false, m.QueryParams, schemaComponentTypes); err != nil {
 							return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
 						} else {
 							op.Parameters = append(op.Parameters, param)
@@ -206,7 +254,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 					// header parameters
 					for _, p := range im.HeaderParams {
-						if param, err := s.parameterize(p, "header", false, m.HeaderParams, typeMap, schemaComponentTypes); err != nil {
+						if param, err := res.parameterize(p, "header", false, m.HeaderParams, schemaComponentTypes); err != nil {
 							return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
 						} else {
 							op.Parameters = append(op.Parameters, param)
@@ -230,14 +278,14 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 					}
 
 					// body parameters
-					if requestBody, err := s.bodyparams(im.BodyParams, im, typeMap, schemaComponentTypes); err != nil {
+					if requestBody, err := res.bodyparams(im.BodyParams, im, schemaComponentTypes); err != nil {
 						return err
 					} else if requestBody != nil {
 						op.RequestBody = requestBody
 					}
 
 					// responses
-					if responses, err := s.responses(im, m, typeMap, schemaComponentTypes); err != nil {
+					if responses, err := res.responses(im, m, schemaComponentTypes); err != nil {
 						return err
 					} else if responses != nil {
 						op.Responses = responses
@@ -246,8 +294,8 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 					}
 
 					op.Tags = im.Tags
-					if strings.HasPrefix(path, "/accounts/all/") || path == "/accounts/all" {
-						op.Tags = append(op.Tags, "unified")
+					if strings.HasPrefix(r.Path, "/accounts/all/") || r.Path == "/accounts/all" {
+						op.Tags = append(op.Tags, TagUnified)
 					}
 
 					op.Extensions = ext1("x-oc-source", fmt.Sprintf("%s:%d", im.Source, im.Line))
@@ -285,7 +333,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 			}
 			key := fmt.Sprintf("%s.%d", t.Key(), code)
 			contentMap := orderedmap.New[string, *v3.MediaType]()
-			if schema, ext, err := s.schematize(fmt.Sprintf("default response '%s'", t.Name()), t, []string{t.Name()}, typeMap, schemaComponentTypes, ""); err != nil {
+			if schema, ext, err := res.schematize(schemaScopeResponse, fmt.Sprintf("default response '%s'", t.Name()), t, []string{t.Name()}, schemaComponentTypes, ""); err != nil {
 				return fmt.Errorf("failed to reference default response type %s: %v", t, err)
 			} else {
 				contentMap.Set("application/json", &v3.MediaType{
@@ -313,7 +361,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 	// add the schema of types that are referenced as body parameters or responses
 	componentSchemas := orderedmap.New[string, *highbase.SchemaProxy]()
 	{
-		m := map[string]*highbase.SchemaProxy{}
+		schemas := map[string]*highbase.SchemaProxy{}
 
 		// since each type may reference other types (typically struct fields), we have to loop
 		// indefinitely until we don't have any additional types to document that haven't been
@@ -329,9 +377,9 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 						continue
 					}
 					ctx := fmt.Sprintf("resolving schema component type '%s'", t.Key())
-					if schema, _, err := s.schematize(ctx, t, []string{}, typeMap, moreSchemaComponentTypes, t.Summary()); err == nil {
+					if schema, _, err := res.schematize(schemaScopeResponse, ctx, t, []string{}, moreSchemaComponentTypes, t.Summary()); err == nil {
 						if schema != nil {
-							m[t.Key()] = schema
+							schemas[t.Key()] = schema
 						}
 					} else {
 						return err
@@ -341,7 +389,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 				{
 					x := map[string]model.Type{}
 					for k, v := range moreSchemaComponentTypes {
-						if _, ok := m[k]; ok {
+						if _, ok := schemas[k]; ok {
 							// we've already processed this type
 						} else {
 							// haven't done that one yet, keep it in the to-do list
@@ -368,10 +416,10 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 		}
 
 		// sort them by keys to have a predictable output
-		mkeys := slices.Collect(maps.Keys(m))
+		mkeys := slices.Collect(maps.Keys(schemas))
 		slices.Sort(mkeys)
 		for _, k := range mkeys {
-			if v, ok := m[k]; ok {
+			if v, ok := schemas[k]; ok {
 				componentSchemas.Set(k, v)
 			}
 		}
@@ -399,26 +447,17 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 	componentExamples := orderedmap.New[string, *highbase.Example]()
 	{
-		for name, example := range m.Examples {
-			var data yaml.Node
-			{
-				var m map[string]any
-				if err := json.Unmarshal([]byte(example.Text), &m); err != nil {
-					panic(err)
-				}
-				if b, err := yaml.Marshal(m); err != nil {
-					panic(err)
-				} else {
-					if err := yaml.Unmarshal(b, &data); err != nil {
-						panic(err)
-					}
-				}
-			}
+		for name, examples := range m.Examples {
+			example, _ := examples.ForResponse()
+			rendered := renderedExampleMap[name].forResponse()
 			componentExamples.Set(name, &highbase.Example{
-				Summary:     "todo",
+				Summary:     name,
 				Description: example.Title,
-				Value:       &data,
-				Extensions:  ext1("oc-example-source-file", example.Origin),
+				Value:       rendered,
+				Extensions: ext2(
+					"oc-example-source-file", example.Origin,
+					"oc-example-scope", string(schemaScopeResponse),
+				),
 			})
 		}
 	}
@@ -670,254 +709,6 @@ func merge[K comparable, V any](dst **orderedmap.Map[K, V], src *orderedmap.Map[
 			}
 		}
 	}
-}
-
-func (s OpenApiSink) schematize(ctx string, t model.Type, path []string, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type, desc string) (*highbase.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
-	if t == nil {
-		return nil, nil, fmt.Errorf("schematize: t is nil (path=%s)", strings.Join(path, " > "))
-	}
-	if elt, ok := t.Element(); ok {
-		if t.IsMap() {
-			if deref, ext, err := s.schematize(ctx, elt, sappend(path, t.Name()), typeMap, schemaComponentTypes, desc); err != nil {
-				return nil, nil, err
-			} else {
-				schema := makeObjectSchema(deref)
-				schema.Extensions = ext
-				schema.Description = desc
-				return highbase.CreateSchemaProxy(schema), nil, nil
-			}
-		} else if t.IsArray() {
-			if deref, ext, err := s.schematize(ctx, elt, sappend(path, t.Name()), typeMap, schemaComponentTypes, desc); err != nil {
-				return nil, nil, err
-			} else {
-				schema := arraySchema(deref)
-				schema.Extensions = ext
-				schema.Description = desc
-				return highbase.CreateSchemaProxy(schema), nil, nil
-			}
-		} else {
-			return nil, nil, fmt.Errorf("failed to schematize type: has Element() but is neither map nor array: %#v", t)
-		}
-	}
-	d, ok := t.Deref()
-	if !ok {
-		d = t
-	}
-	if d.Name() == "PatchObject" {
-		ext := ext1("x-oc-type-source-basic", d.Key())
-		return highbase.CreateSchemaProxy(patchObjectSchema), ext, nil
-	}
-	if d.IsBasic() {
-		ext := ext1("x-oc-type-source-basic", d.Key())
-		switch d.Key() {
-		case "io.Closer":
-			return nil, ext, nil // TODO streaming
-		case "error":
-			return nil, ext, nil // TODO where is error even referenced?
-		case "time.Time":
-			return highbase.CreateSchemaProxy(timeSchema(desc)), ext, nil
-		case "string":
-			return highbase.CreateSchemaProxy(stringSchema(desc)), ext, nil
-		case "int":
-			return highbase.CreateSchemaProxy(integerSchema(desc)), ext, nil
-		case "uint":
-			return highbase.CreateSchemaProxy(unsignedIntegerSchema(desc)), ext, nil
-		case "bool":
-			return highbase.CreateSchemaProxy(booleanSchema(desc)), ext, nil
-		case "any":
-			return highbase.CreateSchemaProxy(anySchema(desc)), ext, nil
-		default:
-			return nil, ext, fmt.Errorf("failed to schematize built-in type '%s'/'%s' %#v", t.Key(), d.Key(), t)
-		}
-	}
-
-	if len(path) == 0 {
-		props := orderedmap.New[string, *highbase.SchemaProxy]()
-		for _, f := range d.Fields() {
-			ctx := fmt.Sprintf("%s.%s", ctx, f.Attr)
-			if fs, _, err := s.schematize(ctx, f.Type, sappend(path, t.Name()), typeMap, schemaComponentTypes, f.Summary); err != nil {
-				return nil, nil, err
-			} else if fs != nil {
-				if f.Attr == "" {
-					return nil, nil, fmt.Errorf("struct property in '%s' has no attr value: %#v", t.Key(), f)
-				}
-				props.Set(f.Attr, fs)
-			}
-		}
-		objdesc := desc
-		if objdesc == "" {
-			objdesc = t.Summary()
-			if t.Summary() != "" {
-				if t.Description() != "" {
-					objdesc = objdesc + "\n" + t.Description()
-				}
-			} else {
-				objdesc = t.Description()
-			}
-		}
-
-		var ext *orderedmap.Map[string, *yaml.Node]
-		if pos, ok := t.Pos(); ok {
-			filename := pos.Filename
-			if relpath, err := filepath.Rel(s.BasePath, filename); err != nil {
-				return nil, nil, err
-			} else {
-				filename = relpath
-			}
-			ext = ext2("x-oc-type-source-struct", t.Key(), "x-oc-type-source-pos", fmt.Sprintf("%s:%d:%d", filename, pos.Line, pos.Column))
-		} else {
-			ext = ext1("x-oc-type-source-struct", t.Key())
-		}
-
-		schema := &highbase.Schema{
-			Type:        []string{"object"},
-			Properties:  props,
-			Title:       strings.Join(path, " > "), // for debugging
-			Description: objdesc,
-			Extensions:  ext,
-		}
-
-		return highbase.CreateSchemaProxy(schema), nil, nil
-	} else {
-		// use a reference to avoid circular references and endless loops
-		ref := d.Key()
-		if t, ok := typeMap[ref]; ok {
-			schemaComponentTypes[ref] = t
-		} else {
-			return nil, nil, fmt.Errorf("schematize: failed to find referenced type in typeMap: %s", ref)
-		}
-
-		var ext *orderedmap.Map[string, *yaml.Node]
-		if pos, ok := t.Pos(); ok {
-			filename := pos.Filename
-			if relpath, err := filepath.Rel(s.BasePath, filename); err != nil {
-				return nil, nil, err
-			} else {
-				filename = relpath
-			}
-			ext = ext2("x-oc-type-source-ref", t.Key(), "x-oc-type-source-pos", fmt.Sprintf("%s:%d:%d", filename, pos.Line, pos.Column))
-		} else {
-			ext = ext1("x-oc-type-source-ref", t.Key())
-		}
-
-		return highbase.CreateSchemaProxyRef(SchemaComponentRefPrefix + ref), ext, nil
-	}
-}
-
-func (s OpenApiSink) reqschema(param model.Param, im model.Impl, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type, desc string) (*base.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
-	if t, ok := typeMap[param.Name]; ok {
-		return s.schematize("reqschema", t, []string{im.Name}, typeMap, schemaComponentTypes, desc)
-	}
-
-	var schemaRef *base.SchemaProxy = nil
-	var ext *orderedmap.Map[string, *yaml.Node] = nil
-	switch param.Name {
-	case "map[string]any":
-		schemaRef = base.CreateSchemaProxy(objectSchema(desc))
-	case "string":
-		schemaRef = base.CreateSchemaProxy(stringSchema(desc))
-	case "[]string":
-		schemaRef = base.CreateSchemaProxy(arraySchema(base.CreateSchemaProxy(stringSchema(desc))))
-	case "any":
-		schemaRef = base.CreateSchemaProxy(anySchema(desc))
-	default:
-		return nil, nil, fmt.Errorf("reqschema: failed to schematize unsupported response type '%s' for endpoint '%s %s' in function '%s'", param.Name, im.Endpoint.Verb, im.Endpoint.Path, im.Name)
-		//schemaRef = base.CreateSchemaProxyRef(SchemaComponentRefPrefix + ref)
-		//ext = ext1("x-oc-ref-source", "bodyparam of "+im.Name)
-	}
-	return schemaRef, ext, nil
-}
-
-func (s OpenApiSink) bodyparams(params []model.Param, im model.Impl, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type) (*v3.RequestBody, error) {
-	var schemaRef *highbase.SchemaProxy
-	var err error
-	desc := ""
-	switch len(params) {
-	case 0:
-		return nil, nil
-	case 1:
-		schemaRef, _, err = s.reqschema(params[0], im, typeMap, schemaComponentTypes, params[0].Description)
-		desc = params[0].Description
-	default:
-		schemaRef, err = mapReduce(params, func(ref model.Param) (*highbase.SchemaProxy, bool, error) {
-			schemaRef, _, err := s.reqschema(ref, im, typeMap, schemaComponentTypes, ref.Description)
-			return schemaRef, true, err
-		}, func(schemas []*highbase.SchemaProxy) (*highbase.SchemaProxy, error) {
-			return base.CreateSchemaProxy(&base.Schema{OneOf: schemas}), nil
-		})
-		if err != nil {
-			return nil, err
-		}
-		// TODO multiple body parameters, what should we use for the description?
-	}
-	return &v3.RequestBody{
-		Required:    boolPtr(true),
-		Content:     omap1("application/json", &v3.MediaType{Schema: schemaRef}),
-		Description: desc,
-		Extensions:  ext1("x-oc-ref-source", "bodyparams of "+im.Name),
-	}, nil
-}
-
-func (s OpenApiSink) responses(im model.Impl, m model.Model, typeMap map[string]model.Type, schemaComponentTypes map[string]model.Type) (*v3.Responses, error) {
-	respMap := orderedmap.New[string, *v3.Response]()
-	for code, resp := range im.Resp {
-		contentMap := orderedmap.New[string, *v3.MediaType]()
-		if resp.Type != nil {
-			if schema, ext, err := s.schematize(
-				fmt.Sprintf("verb='%s' path='%s' fun='%s': response type '%s'", im.Endpoint.Verb, im.Endpoint.Path, im.Endpoint.Fun, resp.Type.Key()),
-				resp.Type, []string{resp.Type.Name()}, typeMap, schemaComponentTypes, ""); err != nil {
-				return nil, fmt.Errorf("failed to reference response type %s: %v", resp.Type, err)
-			} else {
-				var examples *orderedmap.Map[string, *highbase.Example]
-				if _, ok := m.Examples[resp.Type.Key()]; ok {
-					examples = omap1("ok", highbase.CreateExampleRef(ExampleComponentRefPrefix+resp.Type.Key()))
-				}
-				contentMap.Set("application/json", &v3.MediaType{
-					Schema:     schema,
-					Extensions: ext,
-					Examples:   examples,
-				})
-			}
-		} else {
-			// when Type is nil, it means that there is no response object, used with 204 No Content,
-			// but we still have to add the Response object for that code below
-		}
-
-		// TODO extract response summary from apidoc annotation
-		summary := ""
-		if resp.Type != nil {
-			summary = resp.Type.Summary()
-		}
-		if summary == "" {
-			summary = http.StatusText(code)
-		}
-
-		respMap.Set(strconv.Itoa(code), &v3.Response{
-			Description: summary,
-			Content:     contentMap,
-			Extensions:  ext1("x-of-source", fmt.Sprintf("responses of %s:%d", im.Name, im.Line)),
-		})
-	}
-	// also add the default responses in every operation
-	for code, respType := range m.DefaultResponses {
-		codeKey := strconv.Itoa(code)
-		if _, ok := respMap.Get(codeKey); ok {
-			// that code is already defined for that function, which overrides the generic default
-			// response for that code, so don't do anything here
-		} else {
-			if respType != nil {
-				ref := fmt.Sprintf("%s.%d", respType.Key(), code)
-				respMap.Set(codeKey, &v3.Response{
-					Reference: ResponseComponentRefPrefix + ref,
-				})
-			} else {
-				respMap.Set(codeKey, &v3.Response{
-					Summary: http.StatusText(code),
-				})
-			}
-		}
-	}
-	return &v3.Responses{Codes: respMap}, nil
 }
 
 func assign(op *v3.Operation, verb string, pathItem *v3.PathItem) error {

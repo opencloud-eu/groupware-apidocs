@@ -1103,6 +1103,8 @@ func lines(s []*ast.Comment) []string {
 	return collect(s, func(c *ast.Comment) string { return decomment(c.Text) })
 }
 
+var exampleFilenameWithPackageRegex = regexp.MustCompile(`^example\.(.+?)\.(.+?)\.(.+?)\.json$`)
+
 func Parse(chdir string, basepath string) (model.Model, error) {
 	routeFuncs := map[string]*types.Func{}
 	typeMap := map[string]model.Type{}
@@ -1326,8 +1328,10 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 		}
 	}
 
-	exampleMap := map[string]model.Example{}
+	exampleMap := map[string]model.Examples{}
 	{
+		m := map[string]map[string]model.Example{}
+
 		for _, d := range config.SourceDirectories {
 			p := filepath.Join(chdir, d)
 			root := os.DirFS(p)
@@ -1335,16 +1339,19 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 				panic(err)
 			} else {
 				for _, f := range files {
-					k := strings.TrimSuffix(strings.TrimPrefix(f, "example."), ".json")
-					n := k
-					{
-						i := strings.Index(k, ".")
-						if i >= 0 {
-							n = n[i+1:]
-						}
+					k := ""
+					q := ""
+					n := ""
+					if x := exampleFilenameWithPackageRegex.FindAllStringSubmatch(f, 3); x != nil {
+						q = x[0][1]                 // qualifier
+						k = x[0][2] + "." + x[0][3] // fully qualified type name (package . name)
+						n = x[0][3]                 // just the type name without the package
+					} else {
+						panic(fmt.Errorf("%s: example filename does not match the required pattern '%s': '%s'", p, exampleFilenameWithPackageRegex, f))
 					}
-					q := filepath.Join(chdir, d, f)
-					if b, err := os.ReadFile(q); err != nil {
+
+					qf := filepath.Join(chdir, d, f)
+					if b, err := os.ReadFile(qf); err != nil {
 						panic(err)
 					} else {
 						title := ""
@@ -1367,8 +1374,11 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 							title = fmt.Sprintf("A%s %s", v, n)
 						}
 
-						exampleMap[k] = model.Example{
-							Key:    k,
+						if _, ok := m[k]; !ok {
+							m[k] = map[string]model.Example{}
+						}
+						m[k][q] = model.Example{
+							Key:    k + ":" + q,
 							Title:  title,
 							Text:   text,
 							Origin: filepath.Join(d, f),
@@ -1376,6 +1386,27 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 					}
 				}
 			}
+		}
+
+		for k, qualified := range m {
+			e := model.Examples{
+				Key: k,
+			}
+			if x, ok := qualified["any"]; ok {
+				e.DefaultExample = x
+			} else {
+				panic(fmt.Errorf("no default example for %s", k))
+			}
+			if x, ok := qualified["request"]; ok {
+				e.RequestExample = &x
+			}
+			remaining := maps.Clone(qualified)
+			delete(remaining, "any")
+			delete(remaining, "request")
+			if len(remaining) > 0 {
+				panic(fmt.Errorf("unsupported qualifiers found for examples for '%s': %s", k, strings.Join(slices.Collect(maps.Keys(remaining)), ", ")))
+			}
+			exampleMap[k] = e
 		}
 	}
 

@@ -110,6 +110,27 @@ type Example struct {
 	Origin string
 }
 
+type Examples struct {
+	Key            string
+	DefaultExample Example
+	RequestExample *Example
+}
+
+func (r Examples) ForRequest() (Example, bool) {
+	if r.RequestExample != nil {
+		return *r.RequestExample, true
+	}
+	return r.DefaultExample, false
+}
+
+func (r Examples) ForParameter() (Example, bool) {
+	return r.DefaultExample, false
+}
+
+func (r Examples) ForResponse() (Example, bool) {
+	return r.DefaultExample, false
+}
+
 type Model struct {
 	Routes                    []Endpoint
 	PathParams                map[string]Param
@@ -117,7 +138,7 @@ type Model struct {
 	HeaderParams              map[string]Param
 	Impls                     []Impl
 	Types                     []Type
-	Examples                  map[string]Example
+	Examples                  map[string]Examples
 	Enums                     map[string][]string
 	DefaultResponses          map[int]Type
 	DefaultResponseHeaders    map[string]ResponseHeaderDesc
