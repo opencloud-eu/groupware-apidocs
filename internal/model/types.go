@@ -310,11 +310,11 @@ func (t ArrayType) Element() (Type, bool) {
 }
 
 func (t ArrayType) Summary() string {
-	return t.elt.Summary()
+	return ""
 }
 
 func (t ArrayType) Description() string {
-	return t.elt.Description()
+	return ""
 }
 
 func (t ArrayType) Pos() (token.Position, bool) {
@@ -395,22 +395,20 @@ func (t StructType) Required() *bool {
 
 var _ Type = StructType{}
 
-func NewMapType(key Type, value Type, required *bool, summary string, description string) MapType {
+func NewMapType(key Type, value Type, required *bool) MapType {
 	if key == nil {
 		panic("key is nil")
 	}
 	if value == nil {
 		panic("value is nil")
 	}
-	return MapType{key: key, value: value, required: required, summary: summary, description: description}
+	return MapType{key: key, value: value, required: required}
 }
 
 type MapType struct {
-	key         Type
-	value       Type
-	required    *bool
-	summary     string
-	description string
+	key      Type
+	value    Type
+	required *bool
 }
 
 func (t MapType) Key() string {
@@ -443,7 +441,7 @@ func (t MapType) Deref() (Type, bool) {
 		if !vok {
 			v = t.value
 		}
-		return NewMapType(k, v, t.Required(), t.summary, t.description), true
+		return NewMapType(k, v, t.Required()), true
 	} else {
 		return nil, false
 	}
@@ -462,11 +460,11 @@ func (t MapType) Element() (Type, bool) {
 }
 
 func (t MapType) Summary() string {
-	return t.summary
+	return ""
 }
 
 func (t MapType) Description() string {
-	return t.description
+	return ""
 }
 
 func (t MapType) Pos() (token.Position, bool) {

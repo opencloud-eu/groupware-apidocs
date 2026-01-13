@@ -422,8 +422,6 @@ func (v returnVisitor) resolveIdent(x *ast.Ident) (model.Type, error) {
 func (v returnVisitor) resolveType(t types.Type) (model.Type, error) {
 	name := ""
 	var pos token.Pos
-	summary := ""
-	description := ""
 	var req *bool = nil // TODO annotations to determine whether a type is required or not
 	switch n := t.(type) {
 	case *types.Named:
@@ -436,9 +434,8 @@ func (v returnVisitor) resolveType(t types.Type) (model.Type, error) {
 			}
 		}
 		pos = n.Obj().Pos()
-		summary, description = summarizeType(findComments(name, pos, token.TYPE, v.pkg))
 	}
-	r, err := typeOf(t, summary, description, req, v.typeMap, v.pkg)
+	r, err := typeOf(t, req, v.typeMap, v.pkg)
 	if err != nil {
 		return nil, err
 	}
@@ -820,7 +817,6 @@ func (v paramsVisitor) isParseQueryParamCall(call *ast.CallExpr) (string, string
 			if m := parseParamCallRegex.FindAllStringSubmatch(s.Sel.Name, 2); m != nil {
 				var req *bool = NotRequired // TODO query parameters are not required by default, but parse annotations to determine which ones are
 				summary := ""               // TODO parse summary and description for query parameter
-				description := ""
 				var typ model.Type = nil
 				{
 					switch m[0][1] {
@@ -833,7 +829,7 @@ func (v paramsVisitor) isParseQueryParamCall(call *ast.CallExpr) (string, string
 					case "Bool":
 						typ = model.NewBoolType(req)
 					case "Map":
-						typ = model.NewMapType(model.NewStringType(Required), model.NewStringType(Required), req, summary, description)
+						typ = model.NewMapType(model.NewStringType(Required), model.NewStringType(Required), req)
 					default:
 						return "", "", nil, true, fmt.Errorf("unsupported type '%s' for query parameter through call to '%s'", m[0][1], s.Sel.Name)
 					}
@@ -924,7 +920,7 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 			} else {
 				switch t {
 				case "map[string]any":
-					typ = model.NewMapType(model.NewStringType(Required), model.NewAnyType(NotRequired), Required, desc, "")
+					typ = model.NewMapType(model.NewStringType(Required), model.NewAnyType(NotRequired), Required)
 				case "string":
 					typ = model.NewStringType(Required)
 				case "[]string":
@@ -1184,9 +1180,8 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 							name = p.Name() + "." + name
 						}
 					}
-					summary, description := summarizeType(findComments(name, t.Obj().Pos(), token.TYPE, p))
 					var req *bool = nil // there is probably no way to determine whether the type is required or not on the top-level definition of it
-					if r, err := typeOf(t, summary, description, req, typeMap, p); err != nil {
+					if r, err := typeOf(t, req, typeMap, p); err != nil {
 						log.Panicf("failed to determine type of named %#v: %v", t, err)
 					} else if r != nil {
 						typeMap[r.Key()] = r
@@ -1497,7 +1492,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 	}, nil
 }
 
-func typeOf(t types.Type, summary string, description string, req *bool, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
+func typeOf(t types.Type, req *bool, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
 	switch t := t.(type) {
 	case *types.Named:
 		name := t.Obj().Name()
@@ -1513,38 +1508,44 @@ func typeOf(t types.Type, summary string, description string, req *bool, mem map
 			}
 		}
 
-		pos := token.Position{}
+		position := token.Position{}
+		pos := token.NoPos
 		{
-			tp := token.NoPos
 			if t.Obj() != nil {
-				tp = t.Obj().Pos()
+				pos = t.Obj().Pos()
 			}
-			if tp != token.NoPos {
-				pos = p.Fset.Position(tp)
+			if pos != token.NoPos {
+				position = p.Fset.Position(pos)
 			}
 		}
 
 		switch u := t.Underlying().(type) {
 		case *types.Basic:
-			return model.NewAliasType(pkg, name, model.NewBuiltinType("", u.Name(), orPtr(req, Required)), pos), nil
+			return model.NewAliasType(pkg, name, model.NewBuiltinType("", u.Name(), orPtr(req, Required)), position), nil
 		case *types.Interface:
-			return model.NewInterfaceType(pkg, name, pos, orPtr(req, Required)), nil
+			return model.NewInterfaceType(pkg, name, position, orPtr(req, Required)), nil
 		case *types.Map:
-			r, err := mapOf(u, orPtr(req, NotRequired), summary, description, mem, p)
+			r, err := mapOf(u, orPtr(req, NotRequired), mem, p)
 			return r, err
 		case *types.Array:
-			r, err := arrayOf(u.Elem(), orPtr(req, NotRequired), summary, description, mem, p)
+			r, err := arrayOf(u.Elem(), orPtr(req, NotRequired), mem, p)
 			return r, err
 		case *types.Slice:
-			r, err := arrayOf(u.Elem(), orPtr(req, NotRequired), summary, description, mem, p)
+			r, err := arrayOf(u.Elem(), orPtr(req, NotRequired), mem, p)
 			return r, err
 		case *types.Pointer:
 			// pointer denotes that it's optional, unless it's explicitly marked as required or not required through annotations or other conventions
-			return typeOf(u.Elem(), summary, description, orPtr(req, NotRequired), mem, p)
+			return typeOf(u.Elem(), orPtr(req, NotRequired), mem, p)
 		case *types.Struct:
 			id := fmt.Sprintf("%s.%s", pkg, name)
 			if ex, ok := mem[id]; ok {
 				return ex, nil
+			}
+
+			summary := ""
+			description := ""
+			if pos != token.NoPos {
+				summary, description = summarizeType(findComments(name, pos, token.TYPE, p))
 			}
 
 			structFields, err := decompose(name, u, 0, p)
@@ -1556,7 +1557,7 @@ func typeOf(t types.Type, summary string, description string, req *bool, mem map
 			// add the struct with an empty list of fields into the memory (mem) to avoid
 			// endless looping when attempting to resolve the type using typeOf(), in case
 			// of circular references
-			r := model.NewStructType(pkg, name, fields, summary, description, pos, orPtr(req, Required))
+			r := model.NewStructType(pkg, name, fields, summary, description, position, orPtr(req, Required))
 			mem[id] = r
 			{
 				name := t.Obj().Name()
@@ -1568,18 +1569,18 @@ func typeOf(t types.Type, summary string, description string, req *bool, mem map
 				}
 				for _, f := range structFields {
 					fieldReq := model.FieldRequirement(f.tag)
-					fieldSummary, fieldDescription := summarizeType(findComments(name+"."+f.name, f.pos, token.VAR, p))
-					if typ, err := typeOf(f.typ, fieldSummary, fieldDescription, fieldReq, mem, p); err != nil {
+					fieldSummary := strings.Join(findComments(name+"."+f.name, f.pos, token.VAR, p), "\n") // TODO process comments for fields
+					if typ, err := typeOf(f.typ, fieldReq, mem, p); err != nil {
 						return nil, err
 					} else {
-						if field, ok := model.NewField(f.name, typ, f.tag, fieldSummary); ok { // TODO what about fieldDescription?
+						if field, ok := model.NewField(f.name, typ, f.tag, fieldSummary); ok {
 							fields = append(fields, field)
 						}
 					}
 				}
 			}
 			// and now overwrite the struct type with a definition that contains the fields
-			r = model.NewStructType(pkg, name, fields, summary, description, pos, orPtr(req, Required))
+			r = model.NewStructType(pkg, name, fields, summary, description, position, orPtr(req, Required))
 			mem[id] = r
 			return r, nil
 		default:
@@ -1588,13 +1589,13 @@ func typeOf(t types.Type, summary string, description string, req *bool, mem map
 	case *types.Basic:
 		return model.NewBuiltinType("", t.Name(), orPtr(req, Required)), nil
 	case *types.Map:
-		return mapOf(t, orPtr(req, NotRequired), summary, description, mem, p)
+		return mapOf(t, orPtr(req, NotRequired), mem, p)
 	case *types.Array:
-		return arrayOf(t.Elem(), orPtr(req, NotRequired), summary, description, mem, p)
+		return arrayOf(t.Elem(), orPtr(req, NotRequired), mem, p)
 	case *types.Slice:
-		return arrayOf(t.Elem(), orPtr(req, NotRequired), summary, description, mem, p)
+		return arrayOf(t.Elem(), orPtr(req, NotRequired), mem, p)
 	case *types.Pointer:
-		return typeOf(t.Elem(), summary, description, orPtr(req, NotRequired), mem, p)
+		return typeOf(t.Elem(), orPtr(req, NotRequired), mem, p)
 	case *types.Alias:
 		return aliasOf(t, req, mem, p)
 	case *types.Interface:
@@ -1677,29 +1678,29 @@ func decompose(name string, u *types.Struct, level int, p *packages.Package) ([]
 	return structFields, nil
 }
 
-func arrayOf(t types.Type, req *bool, summary string, description string, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
-	if e, err := typeOf(t, summary, description, req, mem, p); err != nil {
+func arrayOf(t types.Type, req *bool, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
+	if e, err := typeOf(t, req, mem, p); err != nil {
 		return nil, err
 	} else {
 		return model.NewArrayType(e, req), nil
 	}
 }
 
-func mapOf(t *types.Map, req *bool, summary string, description string, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
-	if k, err := typeOf(t.Key(), summary, description, req, mem, p); err != nil {
+func mapOf(t *types.Map, req *bool, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
+	if k, err := typeOf(t.Key(), req, mem, p); err != nil {
 		return nil, err
 	} else {
-		if v, err := typeOf(t.Elem(), summary, description, req, mem, p); err != nil {
+		if v, err := typeOf(t.Elem(), req, mem, p); err != nil {
 			return nil, err
 		} else {
-			return model.NewMapType(k, v, req, summary, description), nil
+			return model.NewMapType(k, v, req), nil
 		}
 	}
 }
 
 func aliasOf(t *types.Alias, req *bool, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
 	// TODO extract documentation and annotations
-	if e, err := typeOf(t.Underlying(), "", "", req, mem, p); err != nil {
+	if e, err := typeOf(t.Underlying(), req, mem, p); err != nil {
 		return nil, err
 	} else {
 		pkg := ""
