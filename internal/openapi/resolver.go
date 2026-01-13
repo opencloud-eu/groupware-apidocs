@@ -42,11 +42,12 @@ func newResolver(basePath string, m model.Model, renderedExampleMap map[string]r
 func (s resolver) parameterize(p model.Param, in string, requiredByDefault bool, m map[string]model.Param, schemaComponentTypes map[string]model.Type) (*v3.Parameter, error) {
 	if g, ok := m[p.Name]; ok {
 		req := requiredByDefault
-		if p.Required {
-			req = true
+		if p.Type != nil && p.Type.Required() != nil {
+			req = *p.Type.Required()
 		}
-		if !req && g.Required {
-			req = true
+		if !req && g.Type != nil && g.Type.Required() != nil {
+			// this is probably never the case
+			req = *g.Type.Required()
 		}
 		desc := p.Description
 		if desc == "" {
@@ -164,6 +165,7 @@ func (s resolver) schematize(scope schemaScope, ctx string, t model.Type, path [
 		}
 
 		props := orderedmap.New[string, *highbase.SchemaProxy]()
+		requiredFields := []string{}
 		for _, f := range d.Fields() {
 			ctx := fmt.Sprintf("%s.%s", ctx, f.Attr)
 			if fs, _, err := s.schematize(scope, ctx, f.Type, sappend(path, t.Name()), schemaComponentTypes, f.Summary); err != nil {
@@ -181,6 +183,9 @@ func (s resolver) schematize(scope schemaScope, ctx string, t model.Type, path [
 				}
 
 				props.Set(f.Attr, fs)
+				if f.Required != nil && *f.Required == true {
+					requiredFields = append(requiredFields, f.Attr)
+				}
 			}
 		}
 		objdesc := desc
@@ -209,12 +214,13 @@ func (s resolver) schematize(scope schemaScope, ctx string, t model.Type, path [
 		schema := &highbase.Schema{
 			Type:        []string{"object"},
 			Properties:  props,
-			Title:       strings.Join(path, " > "), // for debugging
 			Description: objdesc,
 			Extensions:  ext,
 			Examples:    examples,
 		}
-
+		if len(requiredFields) > 0 {
+			schema.Required = requiredFields
+		}
 		return highbase.CreateSchemaProxy(schema), nil, nil
 	} else {
 		// use a reference to avoid circular references and endless loops

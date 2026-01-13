@@ -8,18 +8,39 @@ import (
 )
 
 type Field struct {
-	Name    string
-	Attr    string
-	Type    Type
-	Tag     string
-	Summary string
+	Name     string
+	Attr     string
+	Type     Type
+	Tag      string
+	Summary  string
+	Required *bool
 }
 
-var tagRegex = regexp.MustCompile(`json:"(.+?)(?:,(omitempty|omitzero))?"`)
+var (
+	Required    = boolPtr(true)
+	NotRequired = boolPtr(false)
+)
+
+var tagAttrNameRegex = regexp.MustCompile(`json:"(.+?)(?:,(omitempty|omitzero))?"`)
+var tagDocRegex = regexp.MustCompile(`doc:"(req|opt|)"`)
+
+func FieldRequirement(tag string) *bool {
+	if m := tagDocRegex.FindAllStringSubmatch(tag, 1); m != nil {
+		switch m[0][1] {
+		case "req":
+			return Required
+		case "opt":
+			return NotRequired
+		case "":
+			// noop
+		}
+	}
+	return nil
+}
 
 func NewField(name string, t Type, tag string, summary string) (Field, bool) {
 	attr := ""
-	if m := tagRegex.FindAllStringSubmatch(tag, 2); m != nil {
+	if m := tagAttrNameRegex.FindAllStringSubmatch(tag, 2); m != nil {
 		attr = m[0][1]
 	}
 	if attr == "-" {
@@ -28,12 +49,14 @@ func NewField(name string, t Type, tag string, summary string) (Field, bool) {
 	if attr == "" {
 		attr = name
 	}
+	req := FieldRequirement(tag)
 	return Field{
-		Name:    name,
-		Attr:    attr,
-		Type:    t,
-		Tag:     tag,
-		Summary: summary,
+		Name:     name,
+		Attr:     attr,
+		Type:     t,
+		Tag:      tag,
+		Summary:  summary,
+		Required: req,
 	}, true
 }
 
@@ -50,6 +73,7 @@ type Type interface {
 	Summary() string
 	Description() string
 	Pos() (token.Position, bool)
+	Required() *bool
 }
 
 type ResponseHeaderDesc struct {
@@ -77,7 +101,6 @@ type Resp struct {
 type Param struct {
 	Name        string
 	Description string
-	Required    bool
 	Type        Type
 }
 
@@ -158,4 +181,8 @@ func (m Model) ResolveType(k string) (Type, bool) {
 
 type Sink interface {
 	Output(model Model, w io.Writer) error
+}
+
+func boolPtr(b bool) *bool {
+	return &b
 }

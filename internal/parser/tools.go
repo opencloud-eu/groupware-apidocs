@@ -378,3 +378,14 @@ func collect[A, B any](s []A, mapper func(A) B) []B {
 	}
 	return r
 }
+
+func boolPtr(b bool) *bool {
+	return &b
+}
+
+func orPtr(b *bool, def *bool) *bool {
+	if b != nil {
+		return b
+	}
+	return def
+}
