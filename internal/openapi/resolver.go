@@ -2,6 +2,7 @@ package openapi
 
 import (
 	"fmt"
+	"maps"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -167,6 +168,13 @@ func (s resolver) schematize(scope schemaScope, ctx string, t model.Type, path [
 		props := orderedmap.New[string, *highbase.SchemaProxy]()
 		requiredFields := []string{}
 		for _, f := range d.Fields() {
+			if scope == schemaScopeRequest && !f.InRequest {
+				continue // skip this field
+			}
+			if scope == schemaScopeResponse && !f.InResponse {
+				continue // skip this field
+			}
+
 			ctx := fmt.Sprintf("%s.%s", ctx, f.Attr)
 			if fs, _, err := s.schematize(scope, ctx, f.Type, sappend(path, t.Name()), schemaComponentTypes, f.Summary); err != nil {
 				return nil, nil, err
@@ -224,9 +232,13 @@ func (s resolver) schematize(scope schemaScope, ctx string, t model.Type, path [
 		return highbase.CreateSchemaProxy(schema), nil, nil
 	} else {
 		// use a reference to avoid circular references and endless loops
-		ref := d.Key()
-		if t, ok := s.typeMap[ref]; ok {
-			schemaComponentTypes[ref] = t
+		typeId := d.Key()
+		ref := typeId
+		if scope == schemaScopeRequest && (model.HasRequestExceptions(t) || model.HasResponseExceptions(t)) {
+			ref = ref + RequestExceptionTypeKeySuffix
+		}
+		if t, ok := s.typeMap[typeId]; ok {
+			schemaComponentTypes[typeId] = t
 		} else {
 			return nil, nil, fmt.Errorf("schematize: %s: failed to find referenced type in typeMap: %s", ctx, ref)
 		}
@@ -240,11 +252,11 @@ func (s resolver) schematize(scope schemaScope, ctx string, t model.Type, path [
 				filename = relpath
 			}
 			ext = ext2(
-				"x-oc-type-source-ref", t.Key(),
+				"x-oc-type-source-type", t.Key(),
 				"x-oc-type-source-pos", fmt.Sprintf("%s:%d:%d", filename, pos.Line, pos.Column),
 			)
 		} else {
-			ext = ext1("x-oc-type-source-ref", t.Key())
+			ext = ext1("x-oc-type-source-type", t.Key())
 		}
 
 		return highbase.CreateSchemaProxyRef(SchemaComponentRefPrefix + ref), ext, nil
@@ -339,9 +351,53 @@ func (s resolver) bodyparams(params []model.Param, im model.Impl, schemaComponen
 	}, nil
 }
 
+func specificResponseSummary(code int, s model.InferredSummary) string {
+	switch code {
+	case 404:
+		if s.Child != "" && s.SpecificChild {
+			// the specified {child} does not exist within that {obj}
+			if s.ForAccount {
+				return fmt.Sprintf("the account or the specified %s does not exist within that %s", s.Child, s.Object)
+			} else {
+				return fmt.Sprintf("the specified %s does not exist within that %s", s.Child, s.Object)
+			}
+		} else if s.Object != "" {
+			// the specified {obj} does not exist
+			if s.ForAccount {
+				return fmt.Sprintf("the account or the specified %s does not exist", s.Object)
+			} else {
+				return fmt.Sprintf("the specified %s does not exist", s.Object)
+			}
+		}
+	}
+	return ""
+}
+
 func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes map[string]model.Type) (*v3.Responses, error) {
 	respMap := orderedmap.New[string, *v3.Response]()
-	for code, resp := range im.Resp {
+
+	resps := map[int]model.Resp{}
+	maps.Copy(resps, im.Resp)
+	for _, code := range []int{404} {
+		if _, ok := resps[code]; !ok {
+			// there is no specific 404, but we might be able to generate a summary that is more specific than
+			// the generic default 404 one and, if so, we should inject that response into resps to process it below,
+			// as a function specific response, and not as a generic error response reference (with the generic
+			// description)
+			if summary := specificResponseSummary(code, im.InferredSummary); summary != "" {
+				var respType model.Type = nil
+				if t, ok := s.typeMap["groupware.ErrorResponse"]; ok {
+					respType = t
+				}
+				resps[code] = model.Resp{
+					Type:    respType,
+					Summary: summary,
+				}
+			}
+		}
+	}
+
+	for code, resp := range resps {
 		contentMap := orderedmap.New[string, *v3.MediaType]()
 		if resp.Type != nil {
 			if schema, ext, err := s.schematize(
@@ -365,27 +421,75 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 			// but we still have to add the Response object for that code below
 		}
 
-		// TODO extract response summary from apidoc annotation
-		summary := ""
-		if resp.Type != nil {
-			summary = resp.Type.Summary()
+		summary := resp.Summary
+		if summary == "" {
+			obj := im.InferredSummary.Object
+			spec := im.InferredSummary.SpecificObject
+			if im.InferredSummary.Child != "" {
+				obj = im.InferredSummary.Child
+				spec = im.InferredSummary.SpecificChild
+			}
+			if obj != "" && im.InferredSummary.Action != "" && code >= 200 && code < 300 {
+				switch im.InferredSummary.Action {
+				case "retrieve":
+					if (im.InferredSummary.ForAllAccounts || im.InferredSummary.ForAccount) && im.InferredSummary.Child == "" {
+						if spec {
+							if im.InferredSummary.ForAllAccounts {
+								// the email corresponding to the specified identifier, across all accounts
+								summary = fmt.Sprintf("the %s corresponding to the specified identifier, across all accounts", obj)
+							} else {
+								// the email corresponding to the specified identifier, for that account
+								summary = fmt.Sprintf("the %s corresponding to the specified identifier, for that account", obj)
+							}
+						} else {
+							if im.InferredSummary.ForAllAccounts {
+								// the email for all accounts
+								summary = fmt.Sprintf("the %s for all accounts", obj)
+							} else {
+								// the email for the specified account
+								summary = fmt.Sprintf("the %s for the specified account", obj)
+							}
+						}
+					} else {
+						// retrieve => the successfully retrieved obj
+						summary = fmt.Sprintf("the successfully %s %s", im.InferredSummary.Adjective, obj)
+					}
+				case "create", "replace", "modify":
+					// create => the successfully created obj
+					// replace => the successfully replaced obj
+					// modify => the successfully modified obj
+					summary = fmt.Sprintf("the successfully %s %s", im.InferredSummary.Adjective, obj)
+				case "delete":
+					// delete => the obj was deleted successfully
+					summary = fmt.Sprintf("the %s was %s successfully", obj, im.InferredSummary.Adjective)
+				default:
+					return nil, fmt.Errorf("unsupported inferred summary action '%s'", im.InferredSummary.Action)
+				}
+			}
 		}
 		if summary == "" {
+			summary = specificResponseSummary(code, im.InferredSummary)
+		}
+		if summary == "" {
+			// as a very last resort
 			summary = http.StatusText(code)
 		}
 
 		// common response headers
 		headers := orderedmap.New[string, *v3.Header]()
-		for k := range m.DefaultResponseHeaders {
+		for k, h := range m.DefaultResponseHeaders {
+			if !h.IsApplicable(code) {
+				continue
+			}
 			headers.Set(k, v3.CreateHeaderRef(HeaderComponentRefPrefix+k))
 		}
 
 		respMap.Set(strconv.Itoa(code), &v3.Response{
+			// Summary: // not displayed, use Description
 			Description: summary,
 			Content:     contentMap,
-			Extensions:  ext1("x-of-source", fmt.Sprintf("responses of %s:%d", im.Name, im.Line)),
+			Extensions:  ext1("x-of-source", fmt.Sprintf("responses of %s at %s:%d%d", im.Name, im.Filename, im.Line, im.Column)),
 			Headers:     headers,
-			// Summary: // not displayed
 		})
 	}
 	// also add the default responses in every operation
@@ -394,17 +498,17 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 		if _, ok := respMap.Get(codeKey); ok {
 			// that code is already defined for that function, which overrides the generic default
 			// response for that code, so don't do anything here
+		} else if respType != nil {
+			ref := fmt.Sprintf("%s.%d", respType.Key(), code)
+			respMap.Set(codeKey, &v3.Response{
+				Reference: ResponseComponentRefPrefix + ref,
+				Summary:   http.StatusText(code),
+			})
 		} else {
-			if respType != nil {
-				ref := fmt.Sprintf("%s.%d", respType.Key(), code)
-				respMap.Set(codeKey, &v3.Response{
-					Reference: ResponseComponentRefPrefix + ref,
-				})
-			} else {
-				respMap.Set(codeKey, &v3.Response{
-					Summary: http.StatusText(code),
-				})
-			}
+			// no type means that there is no response, e.g. for 204 No Content
+			respMap.Set(codeKey, &v3.Response{
+				Summary: http.StatusText(code),
+			})
 		}
 	}
 	return &v3.Responses{Codes: respMap}, nil

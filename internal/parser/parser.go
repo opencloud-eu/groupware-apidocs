@@ -24,10 +24,12 @@ import (
 )
 
 var (
-	objs          = regexp.MustCompile(`^([^/]+?s)/?$`)
-	objById       = regexp.MustCompile(`^([^/]+?s)/{[^/]*?id}$`)
-	objsInObjById = regexp.MustCompile(`^([^/]+?s)/{[^/]*?id}/([^/]+?s)$`)
-	apiTag        = regexp.MustCompile(`^\s*@api:tags?\s+(.+)\s*$`)
+	apiTag = regexp.MustCompile(`^\s*@api:tags?\s+(.+)\s*$`)
+
+	tagAttrNameRegex      = regexp.MustCompile(`json:"(.+?)(?:,(omitempty|omitzero))?"`)
+	tagDocRegex           = regexp.MustCompile(`doc:"(req|opt|)"`)
+	tagNotInRequestRegex  = regexp.MustCompile(`doc:"(!request)"`)
+	tagNotInResponseRegex = regexp.MustCompile(`doc:"(!response)"`)
 )
 
 var (
@@ -242,7 +244,114 @@ func summarizeType(comments []string) (string, string) {
 	return summary, description
 }
 
-func summarizeEndpoint(verb string, path string, comments []string) (string, string) {
+var (
+	objs              = regexp.MustCompile(`^([^/]+?s)/?$`)                                // e.g. 'emails' in /accounts/{accountid}/emails
+	objById           = regexp.MustCompile(`^([^/]+?s)/{[^/]*?id}$`)                       // e.g. 'emails/{emailid}' in /accounts/all/emails/{emailid}
+	objsInObjById     = regexp.MustCompile(`^([^/]+?s)/{[^/]*?id}/([^/]+?s)$`)             // e.g. 'mailboxes/{mailboxid}/roles' in /accounts/{accountid}/mailboxes/{mailboxid}/roles
+	objsByIdInObjById = regexp.MustCompile(`^([^/]+?s)/{[^/]*?id}/([^/]+?s)//{[^/]*?id}$`) // e.g. 'mailboxes/{mailboxid}/roles/{roleid}' in /accounts/{accountid}/mailboxes/{mailboxid}/roles/{roleid}
+)
+
+func inferEndpointSummary(verb string, path string) (string, model.InferredSummary, error) {
+	summary := ""
+
+	forAccount := false
+	forAllAccounts := false
+	obj := path
+	if strings.HasPrefix(path, "/accounts/{accountid}/") {
+		forAccount = true
+		obj = path[len("/accounts/{accountid}/"):]
+	} else if strings.HasPrefix(path, "/accounts/all/") {
+		forAccount = true
+		forAllAccounts = true
+		obj = path[len("/accounts/all/"):]
+	} else {
+		obj = path[1:] // remove the leading /
+	}
+
+	action := ""
+	adjective := ""
+	switch verb {
+	case "GET":
+		action = "retrieve"
+		adjective = "retrieved"
+	case "POST":
+		action = "create"
+		adjective = "created"
+	case "PUT":
+		action = "replace"
+		adjective = "replaced"
+	case "PATCH":
+		action = "modify"
+		adjective = "modified"
+	case "DELETE":
+		action = "delete"
+		adjective = "deleted"
+	default:
+		return "", model.InferredSummary{}, fmt.Errorf("unsupported verb for endpoint summarization: '%s'", verb)
+	}
+
+	child := ""
+	specificObj := false
+	specificChild := false
+
+	if m := objsByIdInObjById.FindAllStringSubmatch(obj, 2); m != nil {
+		// e.g. 'mailboxes/{mailboxid}/roles/{roleid}' in /accounts/{accountid}/mailboxes/{mailboxid}/roles/{roleid}
+		obj = singularize(m[0][1])
+		child := singularize(m[0][2])
+		specificObj = true
+		specificChild = true
+		// retrieve a {role} by its identifier of a {mailbox} by its own identifier
+		summary = fmt.Sprintf("%s %s %s by its identifier of %s %s by its own identifier", action, article(child), child, article(obj), obj)
+	} else if m := objsInObjById.FindAllStringSubmatch(obj, 2); m != nil {
+		// e.g. 'mailboxes/{mailboxid}/roles' in /accounts/{accountid}/mailboxes/{mailboxid}/roles
+		obj = singularize(m[0][1])
+		child = m[0][2]
+		specificObj = true
+		// retrieve the {roles} of a {mailbox} by its identifier
+		summary = fmt.Sprintf("%s the %s of %s %s by its identifier", action, child, article(obj), obj)
+	} else if m := objById.FindAllStringSubmatch(obj, 1); m != nil {
+		// e.g. 'emails/{emailid}' in /accounts/all/emails/{emailid}
+		obj = singularize(m[0][1])
+		specificObj = true
+		// retrieve an {email} by its identifier
+		summary = fmt.Sprintf("%s %s %s by its identifier", action, article(obj), obj)
+	} else if m := objs.FindAllStringSubmatch(obj, 1); m != nil {
+		// e.g. 'emails' in /accounts/{accountid}/emails
+		obj = m[0][1]
+		switch action {
+		case "create":
+			// create an {email}
+			obj = singularize(obj)
+			summary = fmt.Sprintf("%s %s %s", action, article(obj), obj)
+		default:
+			// retrieve all {emails}
+			// delete all {emails}
+			summary = fmt.Sprintf("%s all %s", action, obj)
+		}
+	} else {
+		obj = ""
+	}
+	if summary != "" {
+		if forAllAccounts {
+			summary = summary + " for all accounts"
+		} else if forAccount {
+			summary = summary + " for a given account"
+		}
+	}
+
+	return summary, model.InferredSummary{
+		ForAccount:     forAccount,
+		ForAllAccounts: forAllAccounts,
+		Object:         obj,
+		Child:          child,
+		Action:         action,
+		Adjective:      adjective,
+		SpecificObject: specificObj,
+		SpecificChild:  specificChild,
+	}, nil
+}
+
+func summarizeEndpoint(verb string, path string, comments []string) (string, string, model.InferredSummary, error) {
 	summary := ""
 	description := ""
 	if len(comments) > 0 {
@@ -284,73 +393,13 @@ func summarizeEndpoint(verb string, path string, comments []string) (string, str
 		description = strings.Join(keep, "\n")
 	}
 
+	inferredSummary, is, err := inferEndpointSummary(verb, path)
+	if err != nil {
+		return "", "", is, err
+	}
+
 	if summary == "" {
-		forAccount := false
-		forAllAccounts := false
-		obj := path
-		if strings.HasPrefix(path, "/accounts/{accountid}/") {
-			forAccount = true
-			obj = path[len("/accounts/{accountid}/"):]
-		} else if strings.HasPrefix(path, "/accounts/all/") {
-			forAccount = true
-			forAllAccounts = true
-			obj = path[len("/accounts/all/"):]
-		}
-
-		action := ""
-		switch verb {
-		case "GET":
-			action = "retrieve"
-		case "POST":
-			action = "create"
-		case "PUT":
-			action = "replace"
-		case "PATCH":
-			action = "modify"
-		case "DELETE":
-			action = "delete"
-		default:
-			log.Panicf("unsupported verb for summarization: '%s'", verb)
-			//return summary, description
-		}
-
-		if m := objById.FindAllStringSubmatch(obj, -1); m != nil {
-			n := ""
-			obj = m[0][1]
-			if voweled(obj) {
-				n = "n"
-			}
-			obj = singularize(obj)
-			summary = fmt.Sprintf("%s a%s %s by its identifier", action, n, obj)
-		} else if m := objs.FindAllStringSubmatch(obj, -1); m != nil {
-			qual := "a"
-			obj := m[0][1]
-			switch verb {
-			case "GET":
-				qual = "all"
-			default:
-				obj = singularize(obj)
-				if voweled(obj) {
-					qual = "an"
-				}
-			}
-			summary = fmt.Sprintf("%s %s %s", action, qual, obj)
-		} else if m := objsInObjById.FindAllStringSubmatch(obj, -1); m != nil {
-			n := ""
-			if voweled(m[0][1]) {
-				n = "n"
-			}
-			parent := m[0][1]
-			child := singularize(m[0][2])
-			summary = fmt.Sprintf("%s a %s of a %s%s by its identifier", action, child, parent, n)
-		}
-		if summary != "" {
-			if forAllAccounts {
-				summary = summary + " for all accounts"
-			} else if forAccount {
-				summary = summary + " for a given account"
-			}
-		}
+		summary = inferredSummary
 	}
 
 	summary = title(summary)
@@ -358,7 +407,7 @@ func summarizeEndpoint(verb string, path string, comments []string) (string, str
 
 	summary = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(summary), "."))
 
-	return summary, description
+	return summary, description, is, nil
 }
 
 type responseFunc struct {
@@ -371,7 +420,7 @@ type returnVisitor struct {
 	fset          *token.FileSet
 	typeMap       map[string]model.Type
 	pkg           *packages.Package
-	responseTypes map[int]model.Type
+	responses     map[int]model.Resp
 	responseFuncs map[string]responseFunc
 	undocumented  map[string]token.Position
 }
@@ -381,7 +430,7 @@ func newReturnVisitor(fset *token.FileSet, pkg *packages.Package, typeMap map[st
 		fset:          fset,
 		pkg:           pkg,
 		typeMap:       typeMap,
-		responseTypes: map[int]model.Type{},
+		responses:     map[int]model.Resp{},
 		responseFuncs: responseFuncs,
 		undocumented:  map[string]token.Position{},
 	}
@@ -465,7 +514,7 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 	}
 	if arg == nil {
 		// if a is nil, it means that there is no body
-		v.responseTypes[code] = nil
+		v.responses[code] = model.Resp{Type: nil}
 		return v
 	}
 
@@ -473,7 +522,7 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 	case *ast.SelectorExpr:
 		key := arg.X.(*ast.Ident).Name + "." + arg.Sel.Name
 		if m, ok := v.typeMap[key]; ok {
-			v.responseTypes[code] = m
+			v.responses[code] = model.Resp{Type: m} // TODO parse response summary
 		} else {
 			fmt.Fprintf(os.Stderr, "failed to find the type '%s' in the typeMap, has the following types:\n", key)
 			for _, k := range keysort(v.typeMap) {
@@ -499,7 +548,7 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 					}
 				}
 				if m, ok := v.typeMap[key]; ok {
-					v.responseTypes[code] = m
+					v.responses[code] = model.Resp{Type: m} // TODO parse response summary
 				} else {
 					fmt.Fprintf(os.Stderr, "failed to find the type '%s' in the typeMap, has the following types:\n", key)
 					for _, k := range keysort(v.typeMap) {
@@ -537,7 +586,7 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 					if t, err := v.resolveIdent(a); err != nil {
 						panic(err) // TODO collect and abort instead
 					} else {
-						v.responseTypes[code] = t
+						v.responses[code] = model.Resp{Type: t} // TODO parse response summary
 					}
 				}
 			case *ast.ValueSpec:
@@ -557,7 +606,7 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 						if t, err := v.resolveIdent(arg); err != nil {
 							panic(err) // TODO collect and abort instead
 						} else {
-							v.responseTypes[code] = t
+							v.responses[code] = model.Resp{Type: t} // TODO parse response summary
 						}
 					} else {
 						log.Panicf("body result return variable is not an ident: %#v", d)
@@ -586,7 +635,7 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 						} else if t == nil {
 							panic("failed to resolve tv")
 						} else {
-							v.responseTypes[code] = t
+							v.responses[code] = model.Resp{Type: t} // TODO parse response summary
 						}
 					} else {
 						panic("failed to find return type expr in TypesInfo")
@@ -613,7 +662,7 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 						if t, err := v.resolveType(n); err != nil {
 							panic(err)
 						} else {
-							v.responseTypes[code] = t
+							v.responses[code] = model.Resp{Type: t} // TODO parse response summary
 						}
 					default:
 						panic("slice elem is not named")
@@ -653,7 +702,7 @@ type paramsVisitor struct {
 	queryParams               map[string]model.Param
 	pathParams                map[string]model.Param
 	bodyParams                map[string]model.Param
-	responseTypes             map[int]model.Type
+	responses                 map[int]model.Resp
 	responseFuncs             map[string]responseFunc
 	undocumentedResults       map[string]token.Position
 	undocumentedRequestBodies map[string]token.Position
@@ -670,7 +719,7 @@ func newParamsVisitor(fset *token.FileSet, pkg *packages.Package, fun string, ty
 		queryParams:               map[string]model.Param{},
 		pathParams:                map[string]model.Param{},
 		bodyParams:                map[string]model.Param{},
-		responseTypes:             map[int]model.Type{},
+		responses:                 map[int]model.Resp{},
 		responseFuncs:             responseFuncs,
 		undocumentedResults:       map[string]token.Position{},
 		undocumentedRequestBodies: map[string]token.Position{},
@@ -759,7 +808,7 @@ func isClosure(expr ast.Expr) (*ast.FuncLit, bool) {
 	return nil, false
 }
 
-func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Type, map[string]token.Position, bool) {
+func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Resp, map[string]token.Position, bool) {
 	if s, ok := isSelector(call.Fun); ok {
 		if x, ok := isIdent(s.X); ok && s.Sel.Name == "respond" && len(call.Args) == 3 && x.Obj != nil {
 			if f, ok := isField(x.Obj.Decl); ok {
@@ -768,8 +817,8 @@ func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Type, ma
 					if c, ok := isClosure(arg); ok {
 						rv := newReturnVisitor(v.fset, v.pkg, v.typeMap, v.responseFuncs)
 						ast.Walk(rv, c)
-						if len(rv.responseTypes) > 0 {
-							return rv.responseTypes, rv.undocumented, true
+						if len(rv.responses) > 0 {
+							return rv.responses, rv.undocumented, true
 						}
 					}
 				}
@@ -943,7 +992,7 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 			return v
 		}
 		if r, undocumented, ok := v.isRespondCall(d); ok {
-			maps.Copy(v.responseTypes, r)
+			maps.Copy(v.responses, r)
 			maps.Copy(v.undocumentedResults, undocumented)
 			return v
 		}
@@ -1063,7 +1112,7 @@ func findFun(n string, p *packages.Package, _ *types.Func) (*ast.FuncDecl, strin
 	return nil, "", false
 }
 
-func findTopDecl(name string, t token.Pos, p *packages.Package) ast.Decl {
+func findTopDecl(_ string, t token.Pos, p *packages.Package) ast.Decl {
 	pos := p.Fset.Position(t)
 	for _, s := range p.Syntax {
 		fp := p.Fset.Position(s.FileStart)
@@ -1080,7 +1129,7 @@ func findTopDecl(name string, t token.Pos, p *packages.Package) ast.Decl {
 	return nil
 }
 
-func findCommentGroup(name string, t token.Pos, p *packages.Package) *ast.CommentGroup {
+func findCommentGroup(_ string, t token.Pos, p *packages.Package) *ast.CommentGroup {
 	pos := p.Fset.Position(t)
 	for _, s := range p.Syntax {
 		fp := p.Fset.Position(s.FileStart)
@@ -1294,15 +1343,22 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 					if err := errors.Join(*v.errs...); err != nil {
 						panic(err)
 					}
-					for code, typename := range v.responseTypes {
-						resp[code] = model.Resp{Type: typename}
+					for code, response := range v.responses {
+						resp[code] = response
 					}
 				}
 				source, err := filepath.Rel(basepath, source)
 				if err != nil {
 					panic(err)
 				}
-				line := groupware.Fset.Position(fun.Pos()).Line
+
+				position := groupware.Fset.Position(fun.Pos())
+				filename := position.Filename
+				if relpath, err := filepath.Rel(basepath, filename); err != nil {
+					panic(err)
+				} else {
+					filename = relpath
+				}
 
 				var route model.Endpoint
 				{
@@ -1320,23 +1376,29 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 				}
 
 				tags := tags(route.Verb, route.Path, comments)
-				summary, description := summarizeEndpoint(route.Verb, route.Path, comments)
+				summary, description, inferredSummary, err := summarizeEndpoint(route.Verb, route.Path, comments)
+				if err != nil {
+					log.Panicf("%s %s: failed to summarize the endpoint for route function '%s' in package '%s'", route.Verb, route.Path, n, groupware.Name)
+				}
 
 				ims = append(ims, model.Impl{
-					Endpoint:     route,
-					Name:         n,
-					Fun:          fun,
-					Source:       source,
-					Line:         line,
-					Comments:     comments,
-					Resp:         resp,
-					QueryParams:  valuesOf(v.queryParams),
-					PathParams:   valuesOf(v.pathParams),
-					HeaderParams: valuesOf(v.headerParams),
-					BodyParams:   valuesOf(v.bodyParams),
-					Tags:         tags,
-					Summary:      summary,
-					Description:  description,
+					Endpoint:        route,
+					Name:            n,
+					Fun:             fun,
+					Source:          source,
+					Filename:        filename,
+					Line:            position.Line,
+					Column:          position.Column,
+					Comments:        comments,
+					Resp:            resp,
+					QueryParams:     valuesOf(v.queryParams),
+					PathParams:      valuesOf(v.pathParams),
+					HeaderParams:    valuesOf(v.headerParams),
+					BodyParams:      valuesOf(v.bodyParams),
+					Tags:            tags,
+					Summary:         summary,
+					Description:     description,
+					InferredSummary: inferredSummary,
 				})
 
 				for k, pos := range v.undocumentedResults {
@@ -1449,43 +1511,69 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 	}
 
 	// TODO extract default headers and their documentation from the source code (groupware_framework.go)
-	defaultResponseHeaders := map[string]model.ResponseHeaderDesc{}
+	defaultResponseHeaders := map[string]model.DefaultResponseHeaderDesc{}
 	{
 		// defaultHeaders["Content-Language"]
 		// defaultHeaders["ETag"]
-		defaultResponseHeaders["Session-State"] = model.ResponseHeaderDesc{
+		defaultResponseHeaders["Session-State"] = model.DefaultResponseHeaderDesc{
 			Summary:  "The opaque state identifier for the JMAP Session",
 			Required: true,
-			Examples: map[string]string{"A JMAP Session identifier": "eish5Toh"},
+			Examples: map[string]string{"a JMAP Session identifier": "eish5Toh"},
 		}
-		defaultResponseHeaders["State"] = model.ResponseHeaderDesc{
-			Summary:  "The opaque state identifier for the type of objects in the response (see the `Object-Type` header)",
-			Examples: map[string]string{"A State identifier": "ra8eey5T"},
+		defaultResponseHeaders["State"] = model.DefaultResponseHeaderDesc{
+			Summary:   "The opaque state identifier for the type of objects in the response (see the `Object-Type` header)",
+			OnError:   false,
+			OnSuccess: true,
+			Examples:  map[string]string{"a State identifier": "ra8eey5T"},
 		}
-		defaultResponseHeaders["Object-Type"] = model.ResponseHeaderDesc{
-			Summary: "The type of JMAP objects returned in the response",
+		defaultResponseHeaders["Object-Type"] = model.DefaultResponseHeaderDesc{
+			Summary:   "The type of JMAP objects returned in the response",
+			OnError:   true,
+			OnSuccess: true,
 			Examples: map[string]string{
-				"The State pertains to Identities":         "identity",
-				"The State pertains to Emails":             "email",
-				"The State pertains to Contacts":           "contact",
-				"The State pertains to Addressbooks":       "addressbook",
-				"The State pertains to Quotas":             "quota",
-				"The State pertains to Vacation Responses": "vacationresponse",
+				"the State pertains to Identities":         "identity",
+				"the State pertains to Emails":             "email",
+				"the State pertains to Contacts":           "contact",
+				"the State pertains to Addressbooks":       "addressbook",
+				"the State pertains to Quotas":             "quota",
+				"the State pertains to Vacation Responses": "vacationresponse",
 			},
 		}
-		defaultResponseHeaders["Account-Id"] = model.ResponseHeaderDesc{
-			Summary:  "The identifier of the account the operation was performed against, when against a single account",
-			Examples: map[string]string{"An Account identifier": "b"},
+		defaultResponseHeaders["Account-Id"] = model.DefaultResponseHeaderDesc{
+			Summary:   "The identifier of the account the operation was performed against, when against a single account",
+			OnError:   true,
+			OnSuccess: true,
+			Examples:  map[string]string{"an Account identifier": "b"},
 		}
-		defaultResponseHeaders["Account-Ids"] = model.ResponseHeaderDesc{
-			Summary:  "The identifier of the accounts the operation was performed against, when against multiple accounts",
-			Explode:  true,
-			Examples: map[string]string{"A list of Account identifiers": "b,d,e"},
+		defaultResponseHeaders["Account-Ids"] = model.DefaultResponseHeaderDesc{
+			Summary:   "The identifier of the accounts the operation was performed against, when against multiple accounts",
+			Explode:   true,
+			OnError:   true,
+			OnSuccess: true,
+			Examples:  map[string]string{"a list of Account identifiers": "b,d,e"},
 		}
-		defaultResponseHeaders["Trace-Id"] = model.ResponseHeaderDesc{
-			Summary:  "The value of the Trace-Id header that was specified in the request or, if not, a unique randomly generated identifier that is included in logging output",
-			Required: true,
-			Examples: map[string]string{"A UUID as trace ID": "4ab74941-b178-4565-9e28-2bb35eb2ff0c"},
+		defaultResponseHeaders["Trace-Id"] = model.DefaultResponseHeaderDesc{
+			Summary:   "The value of the Trace-Id header that was specified in the request or, if not, a unique randomly generated identifier that is included in logging output",
+			Required:  true,
+			OnError:   true,
+			OnSuccess: true,
+			Examples:  map[string]string{"a UUID as trace ID": "4ab74941-b178-4565-9e28-2bb35eb2ff0c"},
+		}
+		defaultResponseHeaders["Unmatched-Path"] = model.DefaultResponseHeaderDesc{
+			Summary:   "When the requested path does not pertain to any existing API, this header is set to differentiate from cases where a referenced object could not be found",
+			Required:  false,
+			OnError:   true,
+			OnSuccess: false,
+			OnlyCodes: []int{404},
+			Examples:  map[string]string{"an API path that does not exist": "/accounts/{accountid}/cars"},
+		}
+		defaultResponseHeaders["Unsupported-Method"] = model.DefaultResponseHeaderDesc{
+			Summary:   "When the requested path exists but the method is not supported for that path, this header is set to differentiate from cases where a referenced object could not be found",
+			Required:  false,
+			OnError:   true,
+			OnSuccess: false,
+			OnlyCodes: []int{404},
+			Examples:  map[string]string{"a method that does not exist for an API path that does exist": "OPTIONS"},
 		}
 	}
 
@@ -1603,14 +1691,21 @@ func typeOf(t types.Type, req *bool, mem map[string]model.Type, p *packages.Pack
 					}
 				}
 				for _, f := range structFields {
-					fieldReq := model.FieldRequirement(f.tag)
+					attr := fieldAttr(f.tag)
+					if attr == "-" {
+						continue // skip this field
+					}
+					if attr == "" {
+						attr = f.name
+					}
+					fieldReq := fieldRequirement(f.tag)
+					fieldInRequest := fieldInRequest(f.tag)
+					fieldInResponse := fieldInResponse(f.tag)
 					fieldSummary := strings.Join(findComments(name+"."+f.name, f.pos, token.VAR, p), "\n") // TODO process comments for fields
 					if typ, err := typeOf(f.typ, fieldReq, mem, p); err != nil {
 						return nil, err
 					} else {
-						if field, ok := model.NewField(f.name, typ, f.tag, fieldSummary); ok {
-							fields = append(fields, field)
-						}
+						fields = append(fields, model.NewField(f.name, attr, typ, f.tag, fieldSummary, fieldReq, fieldInRequest, fieldInResponse))
 					}
 				}
 			}
@@ -1658,6 +1753,42 @@ type field struct {
 	tag  string
 	typ  types.Type
 	pos  token.Pos
+}
+
+func fieldAttr(tag string) string {
+	if m := tagAttrNameRegex.FindAllStringSubmatch(tag, 2); m != nil {
+		return m[0][1]
+	} else {
+		return ""
+	}
+}
+
+func fieldRequirement(tag string) *bool {
+	if m := tagDocRegex.FindAllStringSubmatch(tag, 1); m != nil {
+		switch m[0][1] {
+		case "req":
+			return Required
+		case "opt":
+			return NotRequired
+		case "":
+			// noop
+		}
+	}
+	return nil
+}
+
+func fieldInRequest(tag string) bool {
+	if m := tagNotInRequestRegex.FindAllStringSubmatch(tag, 1); m != nil {
+		return false
+	}
+	return true
+}
+
+func fieldInResponse(tag string) bool {
+	if m := tagNotInResponseRegex.FindAllStringSubmatch(tag, 1); m != nil {
+		return false
+	}
+	return true
 }
 
 func decompose(name string, u *types.Struct, level int, p *packages.Package) ([]field, error) {

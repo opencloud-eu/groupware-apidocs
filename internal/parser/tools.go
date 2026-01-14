@@ -337,6 +337,14 @@ func title(str string) string {
 	return cases.Title(language.English, cases.Compact).String(f) + str[1:]
 }
 
+func article(str string) string {
+	if voweled(str) {
+		return "an"
+	} else {
+		return "a"
+	}
+}
+
 func voweled(str string) bool {
 	if len(str) < 1 {
 		return false

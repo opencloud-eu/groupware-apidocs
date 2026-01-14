@@ -36,6 +36,14 @@ type OpenApiSink struct {
 	IncludeBasicAuth bool
 }
 
+func NewOpenApiSink(basepath string, templateFile string, includeBasicAuth bool) OpenApiSink {
+	return OpenApiSink{
+		BasePath:         basepath,
+		TemplateFile:     templateFile,
+		IncludeBasicAuth: includeBasicAuth,
+	}
+}
+
 var _ model.Sink = OpenApiSink{}
 
 func (s OpenApiSink) newPathItem(_ string, _ string, _ model.Impl) *v3.PathItem {
@@ -55,6 +63,8 @@ var (
 	ResponseComponentRefPrefix = "#/components/responses/"
 	ExampleComponentRefPrefix  = "#/components/examples/"
 	HeaderComponentRefPrefix   = "#/components/headers/"
+
+	RequestExceptionTypeKeySuffix = ".forRequests"
 )
 
 var (
@@ -356,15 +366,23 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 			// TODO extract default response summary and description from comments
 			summary := ""
-			description := ""
 
 			if summary == "" {
 				summary = http.StatusText(code)
 			}
+
+			headers := orderedmap.New[string, *v3.Header]()
+			for k, h := range m.DefaultResponseHeaders {
+				if !h.IsApplicable(code) {
+					continue
+				}
+				headers.Set(k, v3.CreateHeaderRef(HeaderComponentRefPrefix+k))
+			}
 			response := &v3.Response{
-				Summary:     summary,
-				Description: description,
+				// Summary:     summary, // is ignored
+				Description: summary,
 				Content:     contentMap,
+				Headers:     headers,
 			}
 			componentResponses.Set(key, response)
 		}
@@ -388,13 +406,29 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 					if strings.HasPrefix(t.Name(), "Swagger") {
 						continue
 					}
-					ctx := fmt.Sprintf("resolving schema component type '%s'", t.Key())
-					if schema, _, err := res.schematize(schemaScopeResponse, ctx, t, []string{}, moreSchemaComponentTypes, t.Summary()); err == nil {
-						if schema != nil {
-							schemas[t.Key()] = schema
+
+					{
+						ref := t.Key()
+						ctx := fmt.Sprintf("resolving schema component type '%s'", t.Key())
+						if schema, _, err := res.schematize(schemaScopeResponse, ctx, t, []string{}, moreSchemaComponentTypes, t.Summary()); err == nil {
+							if schema != nil {
+								schemas[ref] = schema
+							}
+						} else {
+							return err
 						}
-					} else {
-						return err
+					}
+
+					if model.HasRequestExceptions(t) || model.HasResponseExceptions(t) {
+						ref := t.Key() + RequestExceptionTypeKeySuffix
+						ctx := fmt.Sprintf("resolving schema component type '%s' for use in requests", t.Key())
+						if schema, _, err := res.schematize(schemaScopeRequest, ctx, t, []string{}, moreSchemaComponentTypes, t.Summary()); err == nil {
+							if schema != nil {
+								schemas[ref] = schema
+							}
+						} else {
+							return err
+						}
 					}
 				}
 
@@ -804,6 +838,18 @@ func sappend[E any](s []E, elem E) []E {
 	copy(c, s)
 	c[len(s)] = elem
 	return c
+}
+
+func all[E any](s []E, predicate func(E) bool) bool {
+	if s == nil {
+		return true
+	}
+	for _, e := range s {
+		if !predicate(e) {
+			return false
+		}
+	}
+	return true
 }
 
 func index[K comparable, V any](s []V, indexer func(V) K) map[K]V {

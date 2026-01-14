@@ -4,16 +4,18 @@ import (
 	"go/ast"
 	"go/token"
 	"io"
-	"regexp"
+	"slices"
 )
 
 type Field struct {
-	Name     string
-	Attr     string
-	Type     Type
-	Tag      string
-	Summary  string
-	Required *bool
+	Name       string
+	Attr       string
+	Type       Type
+	Tag        string
+	Summary    string
+	Required   *bool
+	InRequest  bool
+	InResponse bool
 }
 
 var (
@@ -21,43 +23,35 @@ var (
 	NotRequired = boolPtr(false)
 )
 
-var tagAttrNameRegex = regexp.MustCompile(`json:"(.+?)(?:,(omitempty|omitzero))?"`)
-var tagDocRegex = regexp.MustCompile(`doc:"(req|opt|)"`)
-
-func FieldRequirement(tag string) *bool {
-	if m := tagDocRegex.FindAllStringSubmatch(tag, 1); m != nil {
-		switch m[0][1] {
-		case "req":
-			return Required
-		case "opt":
-			return NotRequired
-		case "":
-			// noop
-		}
+func NewField(name string, attr string, t Type, tag string, summary string, req *bool, inRequest bool, inResponse bool) Field {
+	return Field{
+		Name:       name,
+		Attr:       attr,
+		Type:       t,
+		Tag:        tag,
+		Summary:    summary,
+		Required:   req,
+		InRequest:  inRequest,
+		InResponse: inResponse,
 	}
-	return nil
 }
 
-func NewField(name string, t Type, tag string, summary string) (Field, bool) {
-	attr := ""
-	if m := tagAttrNameRegex.FindAllStringSubmatch(tag, 2); m != nil {
-		attr = m[0][1]
+func HasRequestExceptions(t Type) bool {
+	for _, f := range t.Fields() {
+		if !f.InRequest {
+			return true
+		}
 	}
-	if attr == "-" {
-		return Field{}, false
+	return false
+}
+
+func HasResponseExceptions(t Type) bool {
+	for _, f := range t.Fields() {
+		if !f.InResponse {
+			return true
+		}
 	}
-	if attr == "" {
-		attr = name
-	}
-	req := FieldRequirement(tag)
-	return Field{
-		Name:     name,
-		Attr:     attr,
-		Type:     t,
-		Tag:      tag,
-		Summary:  summary,
-		Required: req,
-	}, true
+	return false
 }
 
 type Type interface {
@@ -83,6 +77,29 @@ type ResponseHeaderDesc struct {
 	Examples map[string]string
 }
 
+type DefaultResponseHeaderDesc struct {
+	Summary   string
+	Required  bool
+	Explode   bool
+	Examples  map[string]string
+	OnlyCodes []int
+	OnError   bool
+	OnSuccess bool
+}
+
+func (h DefaultResponseHeaderDesc) IsApplicable(code int) bool {
+	if h.OnlyCodes != nil && !slices.Contains(h.OnlyCodes, code) {
+		return false
+	}
+	if code < 300 && !h.OnSuccess {
+		return false
+	}
+	if code >= 400 && !h.OnError {
+		return false
+	}
+	return true
+}
+
 type RequestHeaderDesc struct {
 	Name        string
 	Description string
@@ -97,7 +114,8 @@ type Endpoint struct {
 }
 
 type Resp struct {
-	Type Type
+	Summary string
+	Type    Type
 }
 
 type Param struct {
@@ -106,21 +124,35 @@ type Param struct {
 	Type        Type
 }
 
+type InferredSummary struct {
+	Object         string
+	Child          string
+	Action         string
+	Adjective      string
+	ForAccount     bool
+	ForAllAccounts bool
+	SpecificObject bool
+	SpecificChild  bool
+}
+
 type Impl struct {
-	Endpoint     Endpoint
-	Source       string
-	Line         int
-	Fun          *ast.FuncDecl
-	Name         string
-	Comments     []string
-	Resp         map[int]Resp
-	QueryParams  []Param
-	PathParams   []Param
-	HeaderParams []Param
-	BodyParams   []Param
-	Tags         []string
-	Summary      string
-	Description  string
+	Endpoint        Endpoint
+	Source          string
+	Filename        string
+	Line            int
+	Column          int
+	Fun             *ast.FuncDecl
+	Name            string
+	Comments        []string
+	Resp            map[int]Resp
+	QueryParams     []Param
+	PathParams      []Param
+	HeaderParams    []Param
+	BodyParams      []Param
+	Tags            []string
+	Summary         string
+	Description     string
+	InferredSummary InferredSummary
 }
 
 type Undocumented struct {
@@ -166,7 +198,7 @@ type Model struct {
 	Examples                  map[string]Examples
 	Enums                     map[string][]string
 	DefaultResponses          map[int]Type
-	DefaultResponseHeaders    map[string]ResponseHeaderDesc
+	DefaultResponseHeaders    map[string]DefaultResponseHeaderDesc
 	CommonRequestHeaders      []RequestHeaderDesc
 	UndocumentedResults       map[string]Undocumented
 	UndocumentedRequestBodies map[string]Undocumented
