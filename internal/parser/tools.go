@@ -5,37 +5,56 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
-	"log"
 	"maps"
+	"regexp"
 	"slices"
 	"strings"
 	"unicode/utf8"
 
-	"golang.org/x/text/cases"
-	"golang.org/x/text/language"
 	"opencloud.eu/groupware-apidocs/internal/model"
+	"opencloud.eu/groupware-apidocs/internal/tools"
 )
 
-func isMemberFunc(call *ast.CallExpr, pkg string, name string) bool {
-	s, ok := isSelector(call.Fun)
-	if !ok {
-		return false
-	}
-	if m, ok := isIdent(s.Sel); !(ok && m.Name == name) {
-		return false
-	}
-	if x, ok := isIdent(s.X); ok {
-		switch d := x.Obj.Decl.(type) {
-		case *ast.Field:
-			if t, ok := isIdent(d.Type); ok {
-				return t.Name == pkg
+func isMethodCall(call *ast.CallExpr, pkg string, method string) bool {
+	if s, ok := isSelector(call.Fun); ok {
+		if x, ok := isIdent(s.X); ok && s.Sel.Name == method && x.Obj != nil {
+			if f, ok := isField(x.Obj.Decl); ok {
+				if p, ok := isIdent(f.Type); ok && p.Name == pkg {
+					return true
+				}
 			}
-		default:
-			log.Panicf("isMemberFunc: unsupported x ident decl: %#v", d)
 		}
-		return false
 	}
-	return true
+	return false
+}
+
+func isMethodCallPrefix(call *ast.CallExpr, pkg string, methodPrefixes []string) bool {
+	if s, ok := isSelector(call.Fun); ok {
+		if x, ok := isIdent(s.X); ok && tools.HasAnyPrefix(s.Sel.Name, methodPrefixes) && x.Obj != nil {
+			if f, ok := isField(x.Obj.Decl); ok {
+				if p, ok := isIdent(f.Type); ok && p.Name == pkg {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func isMethodCallRegex(call *ast.CallExpr, pkg string, re *regexp.Regexp, n int) [][]string {
+	if s, ok := isSelector(call.Fun); ok {
+		if x, ok := isIdent(s.X); ok && x.Obj != nil {
+			m := re.FindAllStringSubmatch(s.Sel.Name, n)
+			if m != nil {
+				if f, ok := isField(x.Obj.Decl); ok {
+					if t, ok := isIdent(f.Type); ok && t.Name == pkg {
+						return m
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func isStaticFunc(call *ast.CallExpr, pkg string, name string) bool {
@@ -245,18 +264,17 @@ type Const struct {
 	Comments []string
 }
 
-func consts(decl ast.Decl) []Const {
+func consts(decl ast.Decl) ([]Const, error) {
 	results := []Const{}
 	switch v := decl.(type) {
 	case *ast.GenDecl:
 		for _, s := range v.Specs {
-			switch a := s.(type) {
-			case *ast.ValueSpec:
+			if a, ok := isValueSpec(s); ok {
 				name := ""
 				if len(a.Names) == 1 {
 					name = a.Names[0].Name
 				} else {
-					log.Fatalf("const: more than 1 name: %v", a.Names)
+					return nil, fmt.Errorf("const: %T has more than 1 names: %v", a, a.Names)
 				}
 				value := ""
 				if len(a.Values) == 1 {
@@ -265,11 +283,11 @@ func consts(decl ast.Decl) []Const {
 						if b.Kind == token.STRING {
 							value = strings.Trim(b.Value, "\"")
 						} else {
-							log.Fatalf("const '%s': unsupported kind: %s", name, b.Kind)
+							return nil, fmt.Errorf("const: %T '%s' has an unsupported kind: %v", a, name, b.Kind)
 						}
 					}
 				} else {
-					log.Fatalf("const '%s': more than 1 value: %d", name, len(a.Values))
+					return nil, fmt.Errorf("const: %T '%s', has more than 1 values: %v", a, name, a.Values)
 				}
 				comments := []string{}
 				if a.Comment != nil {
@@ -283,7 +301,7 @@ func consts(decl ast.Decl) []Const {
 			}
 		}
 	}
-	return results
+	return results, nil
 }
 
 func isString(expr ast.Expr) (string, bool) {
@@ -329,14 +347,6 @@ func keysort[K cmp.Ordered, V any](m map[K]V) []K {
 	return c
 }
 
-func title(str string) string {
-	if len(str) < 1 {
-		return str
-	}
-	f := str[0:1]
-	return cases.Title(language.English, cases.Compact).String(f) + str[1:]
-}
-
 func article(str string) string {
 	if voweled(str) {
 		return "an"
@@ -370,30 +380,18 @@ func singularize(str string) string {
 	return str
 }
 
-func hasAnyPrefix(s string, options []string) bool {
-	for _, o := range options {
-		if strings.HasPrefix(s, o) {
-			return true
-		}
+func isClosure(expr ast.Expr) (*ast.FuncLit, bool) {
+	switch e := expr.(type) {
+	case *ast.FuncLit:
+		return e, true
 	}
-	return false
+	return nil, false
 }
 
-func collect[A, B any](s []A, mapper func(A) B) []B {
-	r := make([]B, len(s))
-	for i, a := range s {
-		r[i] = mapper(a)
+func isValueSpec(expr any) (*ast.ValueSpec, bool) {
+	switch e := expr.(type) {
+	case *ast.ValueSpec:
+		return e, true
 	}
-	return r
-}
-
-func boolPtr(b bool) *bool {
-	return &b
-}
-
-func orPtr(b *bool, def *bool) *bool {
-	if b != nil {
-		return b
-	}
-	return def
+	return nil, false
 }

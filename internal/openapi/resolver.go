@@ -14,6 +14,7 @@ import (
 	"github.com/pb33f/libopenapi/orderedmap"
 	"go.yaml.in/yaml/v4"
 	"opencloud.eu/groupware-apidocs/internal/model"
+	"opencloud.eu/groupware-apidocs/internal/tools"
 )
 
 type schemaScope string
@@ -31,7 +32,7 @@ type resolver struct {
 }
 
 func newResolver(basePath string, m model.Model, renderedExampleMap map[string]renderedExample) resolver {
-	typeMap := index(m.Types, func(t model.Type) string { return t.Key() })
+	typeMap := tools.Index(m.Types, func(t model.Type) string { return t.Key() })
 	return resolver{
 		basePath:           basePath,
 		typeMap:            typeMap,
@@ -83,7 +84,7 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 	}
 	if elt, ok := t.Element(); ok {
 		if t.IsMap() {
-			if deref, ext, err := s.schema(scope, ctx, elt, sappend(path, t.Name()), schemaComponentTypes, desc); err != nil {
+			if deref, ext, err := s.schema(scope, ctx, elt, tools.Append(path, t.Name()), schemaComponentTypes, desc); err != nil {
 				return nil, nil, err
 			} else {
 				schema := makeObjectSchema(deref)
@@ -92,7 +93,7 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 				return highbase.CreateSchemaProxy(schema), nil, nil
 			}
 		} else if t.IsArray() {
-			if deref, ext, err := s.schema(scope, ctx, elt, sappend(path, t.Name()), schemaComponentTypes, desc); err != nil {
+			if deref, ext, err := s.schema(scope, ctx, elt, tools.Append(path, t.Name()), schemaComponentTypes, desc); err != nil {
 				return nil, nil, err
 			} else {
 				schema := arraySchema(deref)
@@ -176,7 +177,7 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 			}
 
 			ctx := fmt.Sprintf("%s.%s", ctx, f.Attr)
-			if fs, _, err := s.schema(scope, ctx, f.Type, sappend(path, t.Name()), schemaComponentTypes, f.Summary); err != nil {
+			if fs, _, err := s.schema(scope, ctx, f.Type, tools.Append(path, t.Name()), schemaComponentTypes, f.Summary); err != nil {
 				return nil, nil, err
 			} else if fs != nil {
 				if f.Attr == "" {
@@ -331,7 +332,7 @@ func (s resolver) bodyparams(params []model.Param, im model.Impl, schemaComponen
 
 		}
 	default:
-		schemaRef, err = mapReduce(params, func(ref model.Param) (*highbase.SchemaProxy, bool, error) {
+		schemaRef, err = tools.MapReduce(params, func(ref model.Param) (*highbase.SchemaProxy, bool, error) {
 			schemaRef, _, err := s.reqschema(ref, im, schemaComponentTypes, ref.Description)
 			return schemaRef, true, err
 		}, func(schemas []*highbase.SchemaProxy) (*highbase.SchemaProxy, error) {
@@ -344,7 +345,7 @@ func (s resolver) bodyparams(params []model.Param, im model.Impl, schemaComponen
 	}
 
 	return &v3.RequestBody{
-		Required:    boolPtr(true),
+		Required:    tools.BoolPtr(true),
 		Content:     omap1("application/json", &v3.MediaType{Schema: schemaRef, Examples: examples}),
 		Description: desc,
 		Extensions:  ext1("x-oc-ref-source", "bodyparams of "+im.Name),
@@ -483,6 +484,8 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 			}
 			headers.Set(k, v3.CreateHeaderRef(HeaderComponentRefPrefix+k))
 		}
+
+		summary = tools.Title(summary)
 
 		respMap.Set(strconv.Itoa(code), &v3.Response{
 			// Summary: // not displayed, use Description

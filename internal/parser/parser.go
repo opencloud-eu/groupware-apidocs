@@ -21,6 +21,7 @@ import (
 	"golang.org/x/tools/go/packages"
 	"opencloud.eu/groupware-apidocs/internal/config"
 	"opencloud.eu/groupware-apidocs/internal/model"
+	"opencloud.eu/groupware-apidocs/internal/tools"
 )
 
 var (
@@ -33,8 +34,8 @@ var (
 )
 
 var (
-	Required    = boolPtr(true)
-	NotRequired = boolPtr(false)
+	Required    = tools.BoolPtr(true)
+	NotRequired = tools.BoolPtr(false)
 )
 
 func findRouteDefinition(a *ast.File) *ast.FuncDecl {
@@ -105,27 +106,31 @@ func scrapeGlobalParamDecls(decls []ast.Decl) (GlobalParamDecls, error) {
 	queryParams := map[string]model.Param{}
 	headerParams := map[string]model.Param{}
 	for _, decl := range decls {
-		for _, c := range consts(decl) {
-			if hasAnyPrefix(c.Name, config.PathParamPrefixes) {
-				desc := describeParam(c.Comments)
-				pathParams[c.Name] = model.Param{
-					Name:        c.Value,
-					Description: desc,
-					Type:        model.NewStringType(Required),
-				}
-			} else if hasAnyPrefix(c.Name, config.QueryParamPrefixes) {
-				desc := describeParam(c.Comments)
-				queryParams[c.Name] = model.Param{
-					Name:        c.Value,
-					Description: desc,
-					Type:        model.NewStringType(NotRequired), // TOO parse query param definition to determine its type and whether it's required; query parameters are not required by default
-				}
-			} else if hasAnyPrefix(c.Name, config.HeaderParamPrefixes) {
-				desc := describeParam(c.Comments)
-				headerParams[c.Name] = model.Param{
-					Name:        c.Value,
-					Description: desc,
-					Type:        model.NewStringType(NotRequired), // TOO parse header param definition to determine its type and whether it's required; query parameters are not required by default
+		if list, err := consts(decl); err != nil {
+			return GlobalParamDecls{}, err
+		} else {
+			for _, c := range list {
+				if tools.HasAnyPrefix(c.Name, config.PathParamPrefixes) {
+					desc := describeParam(c.Comments)
+					pathParams[c.Name] = model.Param{
+						Name:        c.Value,
+						Description: desc,
+						Type:        model.NewStringType(Required),
+					}
+				} else if tools.HasAnyPrefix(c.Name, config.QueryParamPrefixes) {
+					desc := describeParam(c.Comments)
+					queryParams[c.Name] = model.Param{
+						Name:        c.Value,
+						Description: desc,
+						Type:        model.NewStringType(NotRequired), // TOO parse query param definition to determine its type and whether it's required; query parameters are not required by default
+					}
+				} else if tools.HasAnyPrefix(c.Name, config.HeaderParamPrefixes) {
+					desc := describeParam(c.Comments)
+					headerParams[c.Name] = model.Param{
+						Name:        c.Value,
+						Description: desc,
+						Type:        model.NewStringType(NotRequired), // TOO parse header param definition to determine its type and whether it's required; query parameters are not required by default
+					}
 				}
 			}
 		}
@@ -238,8 +243,8 @@ func summarizeType(comments []string) (string, string) {
 		}
 	}
 
-	summary = title(summary)
-	description = title(description)
+	summary = tools.Title(summary)
+	description = tools.Title(description)
 
 	return summary, description
 }
@@ -402,8 +407,8 @@ func summarizeEndpoint(verb string, path string, comments []string) (string, str
 		summary = inferredSummary
 	}
 
-	summary = title(summary)
-	description = title(description)
+	summary = tools.Title(summary)
+	description = tools.Title(description)
 
 	summary = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(summary), "."))
 
@@ -423,6 +428,7 @@ type returnVisitor struct {
 	responses     map[int]model.Resp
 	responseFuncs map[string]responseFunc
 	undocumented  map[string]token.Position
+	errs          *[]error
 }
 
 func newReturnVisitor(fset *token.FileSet, pkg *packages.Package, typeMap map[string]model.Type, responseFuncs map[string]responseFunc) returnVisitor {
@@ -433,27 +439,32 @@ func newReturnVisitor(fset *token.FileSet, pkg *packages.Package, typeMap map[st
 		responses:     map[int]model.Resp{},
 		responseFuncs: responseFuncs,
 		undocumented:  map[string]token.Position{},
+		errs:          &[]error{},
 	}
 }
 
-func (v returnVisitor) isResponseFunc(r *ast.ReturnStmt) (ast.Expr, int, bool) {
+func (v returnVisitor) isResponseFunc(r *ast.ReturnStmt) (ast.Expr, string, int, bool) {
 	if r == nil {
-		return nil, 0, false
+		return nil, "", 0, false
 	}
 	if c, ok := isCallExpr(r.Results[0]); ok {
 		if i, ok := isIdent(c.Fun); ok {
 			for f, spec := range v.responseFuncs {
 				if i.Name == f {
+					summary := ""
+					if cg := findInlineComment(c.Pos(), v.pkg); cg != nil && len(cg.List) > 0 {
+						summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
+					}
 					if spec.hasBody {
-						return c.Args[spec.bodyArgPos], spec.statusCode, true
+						return c.Args[spec.bodyArgPos], summary, spec.statusCode, true
 					} else {
-						return nil, spec.statusCode, true
+						return nil, summary, spec.statusCode, true
 					}
 				}
 			}
 		}
 	}
-	return nil, 0, false
+	return nil, "", 0, false
 }
 
 func (v returnVisitor) resolveIdent(x *ast.Ident) (model.Type, error) {
@@ -474,14 +485,7 @@ func (v returnVisitor) resolveType(t types.Type) (model.Type, error) {
 	var req *bool = nil // TODO annotations to determine whether a type is required or not
 	switch n := t.(type) {
 	case *types.Named:
-		{
-			p := n.Obj().Pkg()
-			if p != nil {
-				name = p.Name() + "." + n.Obj().Name()
-			} else {
-				name = n.Obj().Name()
-			}
-		}
+		name = nameType(n.Obj())
 		pos = n.Obj().Pos()
 	}
 	r, err := typeOf(t, req, v.typeMap, v.pkg)
@@ -508,13 +512,13 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 	if !ok {
 		return v
 	}
-	arg, code, ok := v.isResponseFunc(r)
+	arg, summary, code, ok := v.isResponseFunc(r)
 	if !ok {
 		return v
 	}
 	if arg == nil {
 		// if a is nil, it means that there is no body
-		v.responses[code] = model.Resp{Type: nil}
+		v.responses[code] = model.Resp{Type: nil, Summary: summary}
 		return v
 	}
 
@@ -522,7 +526,7 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 	case *ast.SelectorExpr:
 		key := arg.X.(*ast.Ident).Name + "." + arg.Sel.Name
 		if m, ok := v.typeMap[key]; ok {
-			v.responses[code] = model.Resp{Type: m} // TODO parse response summary
+			v.responses[code] = model.Resp{Type: m, Summary: summary}
 		} else {
 			fmt.Fprintf(os.Stderr, "failed to find the type '%s' in the typeMap, has the following types:\n", key)
 			for _, k := range keysort(v.typeMap) {
@@ -530,16 +534,19 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 			}
 			buf := new(bytes.Buffer)
 			if err := ast.Fprint(buf, v.fset, arg, nil); err == nil {
-				log.Panicf("failed to find the type '%s' in the typeMap, used as the response type for %#v in %s", key, arg, buf.String())
+				*v.errs = append(*v.errs, fmt.Errorf("failed to find the type '%s' in the typeMap, used as the response type for %#v in %s", key, arg, buf.String()))
+				return nil
 			} else {
-				log.Panicf("failed to find the type '%s' in the typeMap, used as the response type for %#v", key, arg)
+				*v.errs = append(*v.errs, fmt.Errorf("failed to find the type '%s' in the typeMap, used as the response type for %#v", key, arg))
+				return nil
 			}
 		}
 	case *ast.CompositeLit:
 		switch t := arg.Type.(type) {
 		case *ast.Ident:
 			if t.Obj.Kind != ast.Typ {
-				log.Panicf("unsupported compositelit type is an ident but not of kind Typ: %T: %#v", t, t)
+				*v.errs = append(*v.errs, fmt.Errorf("unsupported compositelit type is an ident but not of kind Typ: %T: %#v", t, t))
+				return nil
 			} else {
 				key := t.Obj.Name
 				if !strings.Contains(key, ".") {
@@ -548,7 +555,7 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 					}
 				}
 				if m, ok := v.typeMap[key]; ok {
-					v.responses[code] = model.Resp{Type: m} // TODO parse response summary
+					v.responses[code] = model.Resp{Type: m, Summary: summary}
 				} else {
 					fmt.Fprintf(os.Stderr, "failed to find the type '%s' in the typeMap, has the following types:\n", key)
 					for _, k := range keysort(v.typeMap) {
@@ -556,18 +563,22 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 					}
 					buf := new(bytes.Buffer)
 					if err := ast.Fprint(buf, v.fset, arg, nil); err == nil {
-						log.Panicf("failed to find the type '%s' in the typeMap, used as the response type for %#v in %s", key, arg, buf.String())
+						*v.errs = append(*v.errs, fmt.Errorf("failed to find the type '%s' in the typeMap, used as the response type for %#v in %s", key, arg, buf.String()))
+						return nil
 					} else {
-						log.Panicf("failed to find the type '%s' in the typeMap, used as the response type for %#v", key, arg)
+						*v.errs = append(*v.errs, fmt.Errorf("failed to find the type '%s' in the typeMap, used as the response type for %#v", key, arg))
+						return nil
 					}
 				}
 			}
 		default:
-			log.Panicf("unsupported compositelit type: %T: %#v", arg.Type, arg.Type)
+			*v.errs = append(*v.errs, fmt.Errorf("unsupported compositelit type: %T: %#v", arg.Type, arg.Type))
+			return nil
 		}
 	case *ast.Ident:
 		if arg.Obj == nil {
-			log.Panicf("response body argument is an ident that has a nil Obj: %v", arg)
+			*v.errs = append(*v.errs, fmt.Errorf("response body argument is an ident that has a nil Obj: %v", arg))
+			return nil
 		} else {
 			switch d := arg.Obj.Decl.(type) {
 			case *ast.AssignStmt:
@@ -581,12 +592,14 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 					}
 				}
 				if a == nil {
-					log.Panicf("failed to find matching variable on LHS of assign statement") // TODO return proper err
+					*v.errs = append(*v.errs, fmt.Errorf("failed to find matching variable on LHS of assign statement"))
+					return nil
 				} else {
 					if t, err := v.resolveIdent(a); err != nil {
-						panic(err) // TODO collect and abort instead
+						*v.errs = append(*v.errs, err)
+						return nil
 					} else {
-						v.responses[code] = model.Resp{Type: t} // TODO parse response summary
+						v.responses[code] = model.Resp{Type: t, Summary: summary}
 					}
 				}
 			case *ast.ValueSpec:
@@ -598,28 +611,34 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 								var err error
 								code, err = strconv.Atoi(suffix)
 								if err != nil {
-									log.Panicf("failed to parse integer status code in variable name '%v': %s", t.Name, err)
+									*v.errs = append(*v.errs, fmt.Errorf("failed to parse integer status code in variable name '%v': %w", t.Name, err))
+									return nil
 								}
 							}
 						}
 
 						if t, err := v.resolveIdent(arg); err != nil {
-							panic(err) // TODO collect and abort instead
+							*v.errs = append(*v.errs, err)
+							return nil
 						} else {
-							v.responses[code] = model.Resp{Type: t} // TODO parse response summary
+							v.responses[code] = model.Resp{Type: t, Summary: summary}
 						}
 					} else {
-						log.Panicf("body result return variable is not an ident: %#v", d)
+						*v.errs = append(*v.errs, fmt.Errorf("body result return variable is not an ident: %#v", d))
+						return nil
 					}
 				} else {
-					log.Panicf("d.Names len is not == 1 but %d", len(d.Names))
+					*v.errs = append(*v.errs, fmt.Errorf("d.Names len is not == 1 but %d", len(d.Names)))
+					return nil
 				}
 			default:
 				buf := new(bytes.Buffer)
 				if err := ast.Fprint(buf, v.fset, arg, nil); err == nil {
-					log.Panicf("unsupported return decl: %T %v: %s", d, d, buf.String())
+					*v.errs = append(*v.errs, fmt.Errorf("unsupported return decl: %T %v: %s", d, d, buf.String()))
+					return nil
 				} else {
-					log.Panicf("unsupported return decl: %T %v", d, d)
+					*v.errs = append(*v.errs, fmt.Errorf("unsupported return decl: %T %v", d, d))
+					return nil
 				}
 			}
 		}
@@ -631,24 +650,30 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 					ret := d.Type.Results.List[0].Type
 					if tv, ok := v.pkg.TypesInfo.Types[ret]; ok {
 						if t, err := v.resolveType(tv.Type); err != nil {
-							panic(err)
+							*v.errs = append(*v.errs, err)
+							return nil
 						} else if t == nil {
-							panic("failed to resolve tv")
+							*v.errs = append(*v.errs, fmt.Errorf("failed to resolve tv"))
+							return nil
 						} else {
-							v.responses[code] = model.Resp{Type: t} // TODO parse response summary
+							v.responses[code] = model.Resp{Type: t, Summary: summary}
 						}
 					} else {
-						panic("failed to find return type expr in TypesInfo")
+						*v.errs = append(*v.errs, fmt.Errorf("failed to find return type expr in TypesInfo"))
+						return nil
 					}
 				} else {
-					panic("callexpr fun has no results")
+					*v.errs = append(*v.errs, fmt.Errorf("callexpr fun has no results"))
+					return nil
 				}
 			default:
-				panic("callexpr fun is not a funcdecl")
+				*v.errs = append(*v.errs, fmt.Errorf("callexpr fun is not a funcdecl"))
+				return nil
 			}
 
 		} else {
-			panic("callexpr fun is not an ident")
+			*v.errs = append(*v.errs, fmt.Errorf("callexpr fun is not an ident"))
+			return nil
 		}
 	case *ast.IndexExpr:
 		switch x := arg.X.(type) {
@@ -662,13 +687,15 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 						if t, err := v.resolveType(n); err != nil {
 							panic(err)
 						} else {
-							v.responses[code] = model.Resp{Type: t} // TODO parse response summary
+							v.responses[code] = model.Resp{Type: t, Summary: summary}
 						}
 					default:
-						panic("slice elem is not named")
+						*v.errs = append(*v.errs, fmt.Errorf("slice elem is not named"))
+						return nil
 					}
 				default:
-					panic("sel is not a slice")
+					*v.errs = append(*v.errs, fmt.Errorf("sel is not a slice"))
+					return nil
 				}
 			} else {
 				def, ok := v.pkg.TypesInfo.Defs[x.Sel]
@@ -679,7 +706,8 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 				} else {
 					tv, ok := v.pkg.TypesInfo.Types[x.Sel]
 					if !ok {
-						panic("failed to find something")
+						*v.errs = append(*v.errs, fmt.Errorf("failed to find something"))
+						return nil
 					}
 					log.Printf("found type: %v", tv)
 				}
@@ -725,14 +753,6 @@ func newParamsVisitor(fset *token.FileSet, pkg *packages.Package, fun string, ty
 		undocumentedRequestBodies: map[string]token.Position{},
 		errs:                      &[]error{},
 	}
-}
-
-func isValueSpec(expr any) (*ast.ValueSpec, bool) {
-	switch e := expr.(type) {
-	case *ast.ValueSpec:
-		return e, true
-	}
-	return nil, false
 }
 
 func (v paramsVisitor) isBodyCall(call *ast.CallExpr) (string, string, bool, error) {
@@ -800,45 +820,25 @@ func (v paramsVisitor) isBodyCall(call *ast.CallExpr) (string, string, bool, err
 	return "", "", false, nil
 }
 
-func isClosure(expr ast.Expr) (*ast.FuncLit, bool) {
-	switch e := expr.(type) {
-	case *ast.FuncLit:
-		return e, true
-	}
-	return nil, false
-}
-
-func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Resp, map[string]token.Position, bool) {
-	if s, ok := isSelector(call.Fun); ok {
-		if x, ok := isIdent(s.X); ok && s.Sel.Name == "respond" && len(call.Args) == 3 && x.Obj != nil {
-			if f, ok := isField(x.Obj.Decl); ok {
-				if pkg, ok := isIdent(f.Type); ok && pkg.Name == "Groupware" {
-					arg := call.Args[2]
-					if c, ok := isClosure(arg); ok {
-						rv := newReturnVisitor(v.fset, v.pkg, v.typeMap, v.responseFuncs)
-						ast.Walk(rv, c)
-						if len(rv.responses) > 0 {
-							return rv.responses, rv.undocumented, true
-						}
-					}
-				}
+func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Resp, map[string]token.Position, bool, error) {
+	if len(call.Args) == 3 && isMethodCall(call, "Groupware", "respond") {
+		arg := call.Args[2]
+		if c, ok := isClosure(arg); ok {
+			rv := newReturnVisitor(v.fset, v.pkg, v.typeMap, v.responseFuncs)
+			ast.Walk(rv, c)
+			if err := errors.Join(*rv.errs...); err != nil {
+				return nil, nil, false, err
+			}
+			if len(rv.responses) > 0 {
+				return rv.responses, rv.undocumented, true, nil
 			}
 		}
 	}
-	return nil, nil, false
+	return nil, nil, false, nil
 }
 
 func (v paramsVisitor) isAccountCall(call *ast.CallExpr) bool {
-	if s, ok := isSelector(call.Fun); ok {
-		if x, ok := isIdent(s.X); ok && (strings.HasPrefix(s.Sel.Name, "GetAccountFor") || strings.HasPrefix(s.Sel.Name, "GetAccountIdFor")) && len(call.Args) == 0 && x.Obj != nil {
-			if f, ok := isField(x.Obj.Decl); ok {
-				if t, ok := isIdent(f.Type); ok && t.Name == "Request" {
-					return true
-				}
-			}
-		}
-	}
-	return false
+	return len(call.Args) == 0 && isMethodCallPrefix(call, "Request", []string{"GetAccountFor", "GetAccountIdFor"})
 }
 
 var needObjectWithAccountCallRegex = regexp.MustCompile(`^need(Contact|Calendar|Task)WithAccount$`)
@@ -858,43 +858,60 @@ func (v paramsVisitor) isNeedAccountCall(call *ast.CallExpr) (string, string, bo
 	return "", "", false
 }
 
-var parseParamCallRegex = regexp.MustCompile(`^parse([A-Z].*?)Param$`)
+var (
+	parseOptionalParamCallRegex  = regexp.MustCompile(`^(?:parse|get)([A-Z].*?)Param$`)
+	parseMandatoryParamCallRegex = regexp.MustCompile(`^(?:parse|get)Mandatory([A-Z].*?)Param$`)
+)
 
 func (v paramsVisitor) isParseQueryParamCall(call *ast.CallExpr) (string, string, model.Type, bool, error) {
-	if s, ok := isSelector(call.Fun); ok {
-		if x, ok := isIdent(s.X); ok && len(call.Args) == 2 && x.Obj != nil {
-			if m := parseParamCallRegex.FindAllStringSubmatch(s.Sel.Name, 2); m != nil {
-				var req *bool = NotRequired // TODO query parameters are not required by default, but parse annotations to determine which ones are
-				summary := ""               // TODO parse summary and description for query parameter
-				var typ model.Type = nil
-				{
-					switch m[0][1] {
-					case "Int":
-						typ = model.NewIntType(req)
-					case "UInt":
-						typ = model.NewUIntType(req)
-					case "Date":
-						typ = model.NewStringType(req)
-					case "Bool":
-						typ = model.NewBoolType(req)
-					case "Map":
-						typ = model.NewMapType(model.NewStringType(Required), model.NewStringType(Required), req)
-					default:
-						return "", "", nil, true, fmt.Errorf("unsupported type '%s' for query parameter through call to '%s'", m[0][1], s.Sel.Name)
-					}
-				}
+	var re *regexp.Regexp = nil
+	var req *bool = NotRequired
+	switch len(call.Args) {
+	case 1:
+		re = parseMandatoryParamCallRegex
+		req = Required
+	case 2:
+		re = parseOptionalParamCallRegex
+	default:
+		return "", "", nil, false, nil
+	}
 
-				if f, ok := isField(x.Obj.Decl); ok {
-					if t, ok := isIdent(f.Type); ok && t.Name == "Request" {
-						if a, ok := isIdent(call.Args[0]); ok {
-							return a.Name, summary, typ, true, nil
-						}
-					}
-				}
+	name := ""
+	if a, ok := isIdent(call.Args[0]); ok {
+		name = a.Name
+	} else {
+		return "", "", nil, false, nil
+	}
+
+	if m := isMethodCallRegex(call, "Request", re, 1); m != nil {
+		typeDef := m[0][1]
+		summary := ""
+		if cg := findInlineComment(call.Pos(), v.pkg); cg != nil && len(cg.List) > 0 {
+			summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
+		}
+		var typ model.Type = nil
+		{
+			switch typeDef {
+			case "String":
+				typ = model.NewStringType(req)
+			case "Int":
+				typ = model.NewIntType(req)
+			case "UInt":
+				typ = model.NewUIntType(req)
+			case "Date":
+				typ = model.NewStringType(req)
+			case "Bool":
+				typ = model.NewBoolType(req)
+			case "Map":
+				typ = model.NewMapType(model.NewStringType(Required), model.NewStringType(Required), req)
+			default:
+				return "", "", nil, true, fmt.Errorf("unsupported type '%s' for query parameter through call to 'Request'", typeDef)
 			}
 		}
+		return name, summary, typ, true, nil
+	} else {
+		return "", "", nil, false, nil
 	}
-	return "", "", nil, false, nil
 }
 
 func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (string, string, model.Type, bool) {
@@ -902,13 +919,13 @@ func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (string, string, mode
 		if a, ok := isIdent(call.Args[1]); ok {
 			return a.Name, "", nil, true
 		}
-	} else if len(call.Args) == 2 && isMemberFunc(call, "Request", "PathParamDoc") {
+	} else if len(call.Args) == 2 && isMethodCall(call, "Request", "PathParamDoc") {
 		if a, ok := isIdent(call.Args[0]); ok {
 			if b, ok := isString(call.Args[1]); ok {
 				return a.Name, b, model.NewStringType(Required), true
 			}
 		}
-	} else if len(call.Args) == 1 && isMemberFunc(call, "Request", "PathParam") {
+	} else if len(call.Args) == 1 && isMethodCall(call, "Request", "PathParam") {
 		if a, ok := isIdent(call.Args[0]); ok {
 			return a.Name, "", model.NewStringType(Required), true
 		}
@@ -919,23 +936,23 @@ func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (string, string, mode
 }
 
 func (v paramsVisitor) isHeaderParamCall(call *ast.CallExpr) (string, string, bool, bool) {
-	if len(call.Args) == 2 && isMemberFunc(call, "Request", "HeaderParamDoc") {
+	if len(call.Args) == 2 && isMethodCall(call, "Request", "HeaderParamDoc") {
 		if a, ok := isIdent(call.Args[0]); ok {
 			if b, ok := isString(call.Args[1]); ok {
 				return a.Name, b, true, true
 			}
 		}
-	} else if len(call.Args) == 1 && isMemberFunc(call, "Request", "HeaderParam") {
+	} else if len(call.Args) == 1 && isMethodCall(call, "Request", "HeaderParam") {
 		if a, ok := isIdent(call.Args[0]); ok {
 			return a.Name, "", true, true
 		}
-	} else if len(call.Args) == 2 && isMemberFunc(call, "Request", "OptHeaderParamDoc") {
+	} else if len(call.Args) == 2 && isMethodCall(call, "Request", "OptHeaderParamDoc") {
 		if a, ok := isIdent(call.Args[0]); ok {
 			if b, ok := isString(call.Args[1]); ok {
 				return a.Name, b, false, true
 			}
 		}
-	} else if len(call.Args) == 1 && isMemberFunc(call, "Request", "OptHeaderParam") {
+	} else if len(call.Args) == 1 && isMethodCall(call, "Request", "OptHeaderParam") {
 		if a, ok := isIdent(call.Args[0]); ok {
 			return a.Name, "", false, true
 		}
@@ -974,10 +991,19 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 					typ = model.NewStringType(Required)
 				case "[]string":
 					typ = model.NewArrayType(model.NewStringType(Required), Required)
+				case "int":
+					typ = model.NewIntType(Required)
+				case "[]int":
+					typ = model.NewArrayType(model.NewIntType(Required), Required)
+				case "uint":
+					typ = model.NewUIntType(Required)
+				case "[]uint":
+					typ = model.NewArrayType(model.NewUIntType(Required), Required)
 				case "any":
 					typ = model.NewAnyType(Required)
 				default:
 					*v.errs = append(*v.errs, fmt.Errorf("failed to find type '%s' in typeMap for body parameter '%s'", typ, t))
+					return nil
 				}
 			}
 			if desc == "" {
@@ -991,7 +1017,10 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 			v.pathParams[config.AccountIdUriParamName] = model.Param{Name: config.AccountIdUriParamName, Description: "", Type: model.NewStringType(Required)}
 			return v
 		}
-		if r, undocumented, ok := v.isRespondCall(d); ok {
+		if r, undocumented, ok, err := v.isRespondCall(d); err != nil {
+			*v.errs = append(*v.errs, err)
+			return nil
+		} else if ok {
 			maps.Copy(v.responses, r)
 			maps.Copy(v.undocumentedResults, undocumented)
 			return v
@@ -1129,6 +1158,23 @@ func findTopDecl(_ string, t token.Pos, p *packages.Package) ast.Decl {
 	return nil
 }
 
+func findInlineComment(t token.Pos, p *packages.Package) *ast.CommentGroup {
+	pos := p.Fset.Position(t)
+	for _, s := range p.Syntax {
+		fp := p.Fset.Position(s.FileStart)
+		if fp.Filename != pos.Filename {
+			continue
+		}
+		for _, g := range s.Comments {
+			gp := p.Fset.Position(g.Pos())
+			if pos.Line == gp.Line {
+				return g
+			}
+		}
+	}
+	return nil
+}
+
 func findCommentGroup(_ string, t token.Pos, p *packages.Package) *ast.CommentGroup {
 	pos := p.Fset.Position(t)
 	for _, s := range p.Syntax {
@@ -1169,7 +1215,7 @@ func findComments(name string, pos token.Pos, tokenType token.Token, pkg *packag
 }
 
 func lines(s []*ast.Comment) []string {
-	return collect(s, func(c *ast.Comment) string { return decomment(c.Text) })
+	return tools.Collect(s, func(c *ast.Comment) string { return decomment(c.Text) })
 }
 
 var exampleFilenameWithPackageRegex = regexp.MustCompile(`^example\.(.+?)\.(.+?)\.(.+?)\.json$`)
@@ -1196,7 +1242,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 			log.Fatal(err)
 		}
 		if packages.PrintErrors(pkgs) > 0 {
-			panic("package errors")
+			return model.Model{}, fmt.Errorf("failed to compile Go source code of one of the following directories: %s", strings.Join(config.SourceDirectories, ", "))
 		}
 
 		// TODO extract the response funcs from the source code: look for functions in the groupware package that return a Response object, and look for the "body" parameter
@@ -1210,9 +1256,11 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 			"notImplementedResponse":    {false, -1, http.StatusNotImplemented},
 		}
 
+		// iterate over every package that we are interested in (defined in config.PackageIDs),
+		// and analyze types and constants in each of them
 		for _, p := range pkgs {
 			if !slices.Contains(config.PackageIDs, p.ID) {
-				continue
+				continue // we're not interested in that package
 			}
 
 			for _, name := range p.Types.Scope().Names() {
@@ -1221,14 +1269,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 				case *types.Signature:
 					// skip methods
 				case *types.Named:
-					// globally defined type
-					name := t.Obj().Name()
-					{
-						p := t.Obj().Pkg()
-						if p != nil {
-							name = p.Name() + "." + name
-						}
-					}
+					// this is a globally defined type
 					var req *bool = nil // there is probably no way to determine whether the type is required or not on the top-level definition of it
 					if r, err := typeOf(t, req, typeMap, p); err != nil {
 						log.Panicf("failed to determine type of named %#v: %v", t, err)
@@ -1343,9 +1384,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 					if err := errors.Join(*v.errs...); err != nil {
 						panic(err)
 					}
-					for code, response := range v.responses {
-						resp[code] = response
-					}
+					maps.Copy(resp, v.responses)
 				}
 				source, err := filepath.Rel(basepath, source)
 				if err != nil {
@@ -1615,19 +1654,39 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 	}, nil
 }
 
+func nameType(t *types.TypeName) string {
+	name := t.Name()
+	{
+		p := t.Pkg()
+		if p != nil {
+			name = p.Name() + "." + name
+		}
+	}
+	return name
+}
+
+func typeNames(t *types.TypeName) (string, string) {
+	name := t.Name()
+	{
+		p := t.Pkg()
+		if p != nil {
+			return p.Name(), name
+		}
+	}
+	return "", name
+}
+
 func typeOf(t types.Type, req *bool, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
 	switch t := t.(type) {
 	case *types.Named:
-		name := t.Obj().Name()
-		pkg := ""
-		if t.Obj().Pkg() != nil {
-			pkg = t.Obj().Pkg().Name()
+		pkg, name := typeNames(t.Obj())
+		if pkg != "" {
 			if model.IsBuiltinSelectorType(pkg, name) { // for things like time.Time
 				return model.NewBuiltinType(pkg, name, Required), nil
 			}
 		} else {
 			if model.IsBuiltinType(name) {
-				return model.NewBuiltinType("", name, Required), nil
+				return model.NewBuiltinType(pkg, name, Required), nil
 			}
 		}
 
@@ -1644,21 +1703,21 @@ func typeOf(t types.Type, req *bool, mem map[string]model.Type, p *packages.Pack
 
 		switch u := t.Underlying().(type) {
 		case *types.Basic:
-			return model.NewAliasType(pkg, name, model.NewBuiltinType("", u.Name(), orPtr(req, Required)), position), nil
+			return model.NewAliasType(pkg, name, model.NewBuiltinType("", u.Name(), tools.OrPtr(req, Required)), position), nil
 		case *types.Interface:
-			return model.NewInterfaceType(pkg, name, position, orPtr(req, Required)), nil
+			return model.NewInterfaceType(pkg, name, position, tools.OrPtr(req, Required)), nil
 		case *types.Map:
-			r, err := mapOf(u, orPtr(req, NotRequired), mem, p)
+			r, err := mapOf(u, tools.OrPtr(req, NotRequired), mem, p)
 			return r, err
 		case *types.Array:
-			r, err := arrayOf(u.Elem(), orPtr(req, NotRequired), mem, p)
+			r, err := arrayOf(u.Elem(), tools.OrPtr(req, NotRequired), mem, p)
 			return r, err
 		case *types.Slice:
-			r, err := arrayOf(u.Elem(), orPtr(req, NotRequired), mem, p)
+			r, err := arrayOf(u.Elem(), tools.OrPtr(req, NotRequired), mem, p)
 			return r, err
 		case *types.Pointer:
 			// pointer denotes that it's optional, unless it's explicitly marked as required or not required through annotations or other conventions
-			return typeOf(u.Elem(), orPtr(req, NotRequired), mem, p)
+			return typeOf(u.Elem(), tools.OrPtr(req, NotRequired), mem, p)
 		case *types.Struct:
 			id := fmt.Sprintf("%s.%s", pkg, name)
 			if ex, ok := mem[id]; ok {
@@ -1680,16 +1739,10 @@ func typeOf(t types.Type, req *bool, mem map[string]model.Type, p *packages.Pack
 			// add the struct with an empty list of fields into the memory (mem) to avoid
 			// endless looping when attempting to resolve the type using typeOf(), in case
 			// of circular references
-			r := model.NewStructType(pkg, name, fields, summary, description, position, orPtr(req, Required))
+			r := model.NewStructType(pkg, name, fields, summary, description, position, tools.OrPtr(req, Required))
 			mem[id] = r
 			{
-				name := t.Obj().Name()
-				{
-					p := t.Obj().Pkg()
-					if p != nil {
-						name = p.Name() + "." + name
-					}
-				}
+				name := nameType(t.Obj())
 				for _, f := range structFields {
 					attr := fieldAttr(f.tag)
 					if attr == "-" {
@@ -1710,27 +1763,27 @@ func typeOf(t types.Type, req *bool, mem map[string]model.Type, p *packages.Pack
 				}
 			}
 			// and now overwrite the struct type with a definition that contains the fields
-			r = model.NewStructType(pkg, name, fields, summary, description, position, orPtr(req, Required))
+			r = model.NewStructType(pkg, name, fields, summary, description, position, tools.OrPtr(req, Required))
 			mem[id] = r
 			return r, nil
 		default:
 			return nil, fmt.Errorf("typeOf: unsupported underlying type of named %s.%s is a %T: %#v", pkg, name, u, u)
 		}
 	case *types.Basic:
-		return model.NewBuiltinType("", t.Name(), orPtr(req, Required)), nil
+		return model.NewBuiltinType("", t.Name(), tools.OrPtr(req, Required)), nil
 	case *types.Map:
-		return mapOf(t, orPtr(req, NotRequired), mem, p)
+		return mapOf(t, tools.OrPtr(req, NotRequired), mem, p)
 	case *types.Array:
-		return arrayOf(t.Elem(), orPtr(req, NotRequired), mem, p)
+		return arrayOf(t.Elem(), tools.OrPtr(req, NotRequired), mem, p)
 	case *types.Slice:
-		return arrayOf(t.Elem(), orPtr(req, NotRequired), mem, p)
+		return arrayOf(t.Elem(), tools.OrPtr(req, NotRequired), mem, p)
 	case *types.Pointer:
-		return typeOf(t.Elem(), orPtr(req, NotRequired), mem, p)
+		return typeOf(t.Elem(), tools.OrPtr(req, NotRequired), mem, p)
 	case *types.Alias:
 		return aliasOf(t, req, mem, p)
 	case *types.Interface:
 		if t.String() == "any" {
-			return model.NewAnyType(orPtr(req, NotRequired)), nil
+			return model.NewAnyType(tools.OrPtr(req, NotRequired)), nil
 		} else {
 			return nil, fmt.Errorf("typeOf: unsupported: using an interface type that isn't any: %T: %#v", t, t)
 		}
@@ -1865,14 +1918,10 @@ func mapOf(t *types.Map, req *bool, mem map[string]model.Type, p *packages.Packa
 }
 
 func aliasOf(t *types.Alias, req *bool, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
-	// TODO extract documentation and annotations
 	if e, err := typeOf(t.Underlying(), req, mem, p); err != nil {
 		return nil, err
 	} else {
-		pkg := ""
-		if t.Obj().Pkg() != nil {
-			pkg = t.Obj().Pkg().Name()
-		}
-		return model.NewAliasType(pkg, t.Obj().Name(), e, p.Fset.Position(t.Obj().Pos())), nil
+		name, pkg := typeNames(t.Obj())
+		return model.NewAliasType(pkg, name, e, p.Fset.Position(t.Obj().Pos())), nil
 	}
 }

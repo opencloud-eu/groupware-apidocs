@@ -19,6 +19,7 @@ import (
 	"github.com/pb33f/libopenapi/orderedmap"
 	"go.yaml.in/yaml/v4"
 	"opencloud.eu/groupware-apidocs/internal/model"
+	"opencloud.eu/groupware-apidocs/internal/tools"
 )
 
 var (
@@ -96,7 +97,7 @@ func integerSchema(d string) *highbase.Schema {
 }
 
 func unsignedIntegerSchema(d string) *highbase.Schema {
-	return &base.Schema{Type: []string{"integer"}, Minimum: zerofPtr(), Description: d}
+	return &base.Schema{Type: []string{"integer"}, Minimum: tools.ZerofPtr(), Description: d}
 }
 
 func booleanSchema(d string) *highbase.Schema {
@@ -197,8 +198,8 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 		}
 	}
 
-	imMap := index(m.Impls, func(i model.Impl) string { return i.Name })
-	routesByPath := indexMany(m.Routes, func(r model.Endpoint) string { return r.Path })
+	imMap := tools.Index(m.Impls, func(i model.Impl) string { return i.Name })
+	routesByPath := tools.IndexMany(m.Routes, func(r model.Endpoint) string { return r.Path })
 	renderedExampleMap := map[string]renderedExample{}
 	for name, qualified := range m.Examples {
 		rendered := renderedExample{}
@@ -829,72 +830,8 @@ func ext2(k1, v1, k2, v2 string) *orderedmap.Map[string, *yaml.Node] {
 	return ext
 }
 
-func boolPtr(b bool) *bool {
-	return &b
-}
-
-func zerofPtr() *float64 {
-	var f float64 = 0
-	return &f
-}
-
-func sappend[E any](s []E, elem E) []E {
-	c := make([]E, len(s)+1)
-	copy(c, s)
-	c[len(s)] = elem
-	return c
-}
-
-func all[E any](s []E, predicate func(E) bool) bool {
-	if s == nil {
-		return true
-	}
-	for _, e := range s {
-		if !predicate(e) {
-			return false
-		}
-	}
-	return true
-}
-
-func index[K comparable, V any](s []V, indexer func(V) K) map[K]V {
-	m := map[K]V{}
-	for _, v := range s {
-		k := indexer(v)
-		m[k] = v
-	}
-	return m
-}
-
-func indexMany[K comparable, V any](s []V, indexer func(V) K) map[K][]V {
-	m := map[K][]V{}
-	for _, v := range s {
-		k := indexer(v)
-		a, ok := m[k]
-		if !ok {
-			a = []V{}
-		}
-		a = append(a, v)
-		m[k] = a
-	}
-	return m
-}
-
 func omap1[K comparable, V any](k K, v V) *orderedmap.Map[K, V] {
 	m := orderedmap.New[K, V]()
 	m.Set(k, v)
 	return m
-}
-
-func mapReduce[A any, B any, C any](s []A, mapper func(A) (B, bool, error), reducer func([]B) (C, error)) (C, error) {
-	mapped := []B{}
-	for _, a := range s {
-		if b, ok, err := mapper(a); err != nil {
-			var z C
-			return z, err
-		} else if ok {
-			mapped = append(mapped, b)
-		}
-	}
-	return reducer(mapped)
 }
