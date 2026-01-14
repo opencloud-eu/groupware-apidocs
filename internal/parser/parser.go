@@ -2,12 +2,12 @@ package parser
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
-	"io/fs"
 	"log"
 	"maps"
 	"net/http"
@@ -1218,8 +1218,6 @@ func lines(s []*ast.Comment) []string {
 	return tools.Collect(s, func(c *ast.Comment) string { return decomment(c.Text) })
 }
 
-var exampleFilenameWithPackageRegex = regexp.MustCompile(`^example\.(.+?)\.(.+?)\.(.+?)\.json$`)
-
 func Parse(chdir string, basepath string) (model.Model, error) {
 	routeFuncs := map[string]*types.Func{}
 	typeMap := map[string]model.Type{}
@@ -1460,56 +1458,63 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 	{
 		m := map[string]map[string]model.Example{}
 
+		type example struct {
+			Type    string          `json:"type"`
+			Title   string          `json:"title"`
+			Scope   string          `json:"scope"`
+			Origin  string          `json:"origin"`
+			Example json.RawMessage `json:"example"`
+		}
+
 		for _, d := range config.SourceDirectories {
 			p := filepath.Join(chdir, d)
-			root := os.DirFS(p)
-			if files, err := fs.Glob(root, "example.*.json"); err != nil {
-				panic(err)
-			} else {
-				for _, f := range files {
-					k := ""
-					q := ""
-					n := ""
-					if x := exampleFilenameWithPackageRegex.FindAllStringSubmatch(f, 3); x != nil {
-						q = x[0][1]                 // qualifier
-						k = x[0][2] + "." + x[0][3] // fully qualified type name (package . name)
-						n = x[0][3]                 // just the type name without the package
-					} else {
-						panic(fmt.Errorf("%s: example filename does not match the required pattern '%s': '%s'", p, exampleFilenameWithPackageRegex, f))
-					}
-
-					qf := filepath.Join(chdir, d, f)
-					if b, err := os.ReadFile(qf); err != nil {
+			f := "apidoc-examples.json"
+			{
+				qf := filepath.Join(p, f)
+				if _, err := os.Stat(qf); err != nil {
+					if !errors.Is(err, os.ErrNotExist) {
 						panic(err)
 					} else {
-						title := ""
-						text := ""
-						{
-							lines := strings.Split(string(b), "\n")
-							if len(lines) > 0 && strings.HasPrefix(lines[0], "#") {
-								title = strings.TrimSpace(strings.TrimPrefix(lines[0], "#"))
-								text = strings.Join(lines[1:], "\n")
+						continue
+					}
+				}
+
+				if b, err := os.ReadFile(qf); err != nil {
+					panic(err)
+				} else {
+					all := []example{}
+					if err := json.Unmarshal(b, &all); err != nil {
+						panic(err)
+					} else {
+						for _, v := range all {
+							k := v.Type
+							q := v.Scope
+							if q == "" {
+								q = "any"
+							}
+
+							title := v.Title
+							if title == "" {
+								n := v.Type
+								if i := strings.Index(n, "."); i >= 0 {
+									n = n[i+1:]
+								}
+								title = tools.Title(fmt.Sprintf("%s %s", article(n), n))
+							}
+
+							if b, err := v.Example.MarshalJSON(); err != nil {
+								panic(err)
 							} else {
-								text = string(b)
+								if _, ok := m[k]; !ok {
+									m[k] = map[string]model.Example{}
+								}
+								m[k][q] = model.Example{
+									Key:    k,
+									Title:  title,
+									Text:   string(b),
+									Origin: filepath.Join(d, f),
+								}
 							}
-						}
-
-						if title == "" {
-							v := ""
-							if voweled(n) {
-								v = "n"
-							}
-							title = fmt.Sprintf("A%s %s", v, n)
-						}
-
-						if _, ok := m[k]; !ok {
-							m[k] = map[string]model.Example{}
-						}
-						m[k][q] = model.Example{
-							Key:    k + ":" + q,
-							Title:  title,
-							Text:   text,
-							Origin: filepath.Join(d, f),
 						}
 					}
 				}
