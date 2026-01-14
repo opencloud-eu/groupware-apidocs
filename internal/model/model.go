@@ -36,6 +36,10 @@ func NewField(name string, attr string, t Type, tag string, summary string, req 
 	}
 }
 
+func HasExceptions(t Type) bool {
+	return HasRequestExceptions(t) || HasResponseExceptions(t)
+}
+
 func HasRequestExceptions(t Type) bool {
 	for _, f := range t.Fields() {
 		if !f.InRequest {

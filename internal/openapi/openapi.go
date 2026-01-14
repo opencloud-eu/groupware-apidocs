@@ -247,7 +247,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 					// path parameters
 					for _, p := range im.PathParams {
-						if param, err := res.parameterize(p, "path", true, m.PathParams, schemaComponentTypes); err != nil {
+						if param, err := res.parameter(p, "path", true, m.PathParams, schemaComponentTypes); err != nil {
 							return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
 						} else {
 							op.Parameters = append(op.Parameters, param)
@@ -256,7 +256,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 					// query parameters
 					for _, p := range im.QueryParams {
-						if param, err := res.parameterize(p, "query", false, m.QueryParams, schemaComponentTypes); err != nil {
+						if param, err := res.parameter(p, "query", false, m.QueryParams, schemaComponentTypes); err != nil {
 							return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
 						} else {
 							op.Parameters = append(op.Parameters, param)
@@ -265,7 +265,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 					// header parameters
 					for _, p := range im.HeaderParams {
-						if param, err := res.parameterize(p, "header", false, m.HeaderParams, schemaComponentTypes); err != nil {
+						if param, err := res.parameter(p, "header", false, m.HeaderParams, schemaComponentTypes); err != nil {
 							return fmt.Errorf("verb='%s' path='%s' fun='%s': %s", r.Verb, r.Path, r.Fun, err)
 						} else {
 							op.Parameters = append(op.Parameters, param)
@@ -355,7 +355,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 			}
 			key := fmt.Sprintf("%s.%d", t.Key(), code)
 			contentMap := orderedmap.New[string, *v3.MediaType]()
-			if schema, ext, err := res.schematize(schemaScopeResponse, fmt.Sprintf("default response '%s'", t.Name()), t, []string{t.Name()}, schemaComponentTypes, ""); err != nil {
+			if schema, ext, err := res.schema(schemaScopeResponse, fmt.Sprintf("default response '%s'", t.Name()), t, []string{t.Name()}, schemaComponentTypes, ""); err != nil {
 				return fmt.Errorf("failed to reference default response type %s: %v", t, err)
 			} else {
 				contentMap.Set("application/json", &v3.MediaType{
@@ -408,9 +408,11 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 					}
 
 					{
+						// we don't look into whether there are response exceptions here, since the regular reference
+						// (just the type name, e.g. "jmap.Identity") is assumed to be the one to reference in requests
 						ref := t.Key()
 						ctx := fmt.Sprintf("resolving schema component type '%s'", t.Key())
-						if schema, _, err := res.schematize(schemaScopeResponse, ctx, t, []string{}, moreSchemaComponentTypes, t.Summary()); err == nil {
+						if schema, _, err := res.schema(schemaScopeResponse, ctx, t, []string{}, moreSchemaComponentTypes, t.Summary()); err == nil {
 							if schema != nil {
 								schemas[ref] = schema
 							}
@@ -419,10 +421,13 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 						}
 					}
 
-					if model.HasRequestExceptions(t) || model.HasResponseExceptions(t) {
+					if model.HasExceptions(t) {
+						// for type schemas to reference in requests, we either use the one for responses that have been created above,
+						// or in case of request or response field exceptions, we reference another schema that is specifically for
+						// requests, with this suffix:
 						ref := t.Key() + RequestExceptionTypeKeySuffix
 						ctx := fmt.Sprintf("resolving schema component type '%s' for use in requests", t.Key())
-						if schema, _, err := res.schematize(schemaScopeRequest, ctx, t, []string{}, moreSchemaComponentTypes, t.Summary()); err == nil {
+						if schema, _, err := res.schema(schemaScopeRequest, ctx, t, []string{}, moreSchemaComponentTypes, t.Summary()); err == nil {
 							if schema != nil {
 								schemas[ref] = schema
 							}

@@ -40,7 +40,7 @@ func newResolver(basePath string, m model.Model, renderedExampleMap map[string]r
 	}
 }
 
-func (s resolver) parameterize(p model.Param, in string, requiredByDefault bool, m map[string]model.Param, schemaComponentTypes map[string]model.Type) (*v3.Parameter, error) {
+func (s resolver) parameter(p model.Param, in string, requiredByDefault bool, m map[string]model.Param, schemaComponentTypes map[string]model.Type) (*v3.Parameter, error) {
 	if g, ok := m[p.Name]; ok {
 		req := requiredByDefault
 		if p.Type != nil && p.Type.Required() != nil {
@@ -57,7 +57,7 @@ func (s resolver) parameterize(p model.Param, in string, requiredByDefault bool,
 		var schema *highbase.SchemaProxy
 		var ext *orderedmap.Map[string, *yaml.Node]
 		if p.Type != nil {
-			if s, e, err := s.schematize(schemaScopeRequest, fmt.Sprintf("parameterize(%v, %s)", p, in), p.Type, []string{p.Name}, schemaComponentTypes, desc); err != nil {
+			if s, e, err := s.schema(schemaScopeRequest, fmt.Sprintf("parameterize(%v, %s)", p, in), p.Type, []string{p.Name}, schemaComponentTypes, desc); err != nil {
 				return nil, err
 			} else {
 				schema = s
@@ -77,13 +77,13 @@ func (s resolver) parameterize(p model.Param, in string, requiredByDefault bool,
 	}
 }
 
-func (s resolver) schematize(scope schemaScope, ctx string, t model.Type, path []string, schemaComponentTypes map[string]model.Type, desc string) (*highbase.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
+func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []string, schemaComponentTypes map[string]model.Type, desc string) (*highbase.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
 	if t == nil {
 		return nil, nil, fmt.Errorf("schematize: t is nil (path=%s)", strings.Join(path, " > "))
 	}
 	if elt, ok := t.Element(); ok {
 		if t.IsMap() {
-			if deref, ext, err := s.schematize(scope, ctx, elt, sappend(path, t.Name()), schemaComponentTypes, desc); err != nil {
+			if deref, ext, err := s.schema(scope, ctx, elt, sappend(path, t.Name()), schemaComponentTypes, desc); err != nil {
 				return nil, nil, err
 			} else {
 				schema := makeObjectSchema(deref)
@@ -92,7 +92,7 @@ func (s resolver) schematize(scope schemaScope, ctx string, t model.Type, path [
 				return highbase.CreateSchemaProxy(schema), nil, nil
 			}
 		} else if t.IsArray() {
-			if deref, ext, err := s.schematize(scope, ctx, elt, sappend(path, t.Name()), schemaComponentTypes, desc); err != nil {
+			if deref, ext, err := s.schema(scope, ctx, elt, sappend(path, t.Name()), schemaComponentTypes, desc); err != nil {
 				return nil, nil, err
 			} else {
 				schema := arraySchema(deref)
@@ -176,7 +176,7 @@ func (s resolver) schematize(scope schemaScope, ctx string, t model.Type, path [
 			}
 
 			ctx := fmt.Sprintf("%s.%s", ctx, f.Attr)
-			if fs, _, err := s.schematize(scope, ctx, f.Type, sappend(path, t.Name()), schemaComponentTypes, f.Summary); err != nil {
+			if fs, _, err := s.schema(scope, ctx, f.Type, sappend(path, t.Name()), schemaComponentTypes, f.Summary); err != nil {
 				return nil, nil, err
 			} else if fs != nil {
 				if f.Attr == "" {
@@ -234,7 +234,7 @@ func (s resolver) schematize(scope schemaScope, ctx string, t model.Type, path [
 		// use a reference to avoid circular references and endless loops
 		typeId := d.Key()
 		ref := typeId
-		if scope == schemaScopeRequest && (model.HasRequestExceptions(t) || model.HasResponseExceptions(t)) {
+		if scope == schemaScopeRequest && model.HasExceptions(t) {
 			ref = ref + RequestExceptionTypeKeySuffix
 		}
 		if t, ok := s.typeMap[typeId]; ok {
@@ -265,7 +265,7 @@ func (s resolver) schematize(scope schemaScope, ctx string, t model.Type, path [
 
 func (s resolver) reqschema(param model.Param, im model.Impl, schemaComponentTypes map[string]model.Type, desc string) (*base.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
 	if t, ok := s.typeMap[param.Name]; ok {
-		return s.schematize(schemaScopeRequest, "reqschema", t, []string{im.Name}, schemaComponentTypes, desc)
+		return s.schema(schemaScopeRequest, "reqschema", t, []string{im.Name}, schemaComponentTypes, desc)
 	}
 
 	var schemaRef *base.SchemaProxy = nil
@@ -400,7 +400,7 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 	for code, resp := range resps {
 		contentMap := orderedmap.New[string, *v3.MediaType]()
 		if resp.Type != nil {
-			if schema, ext, err := s.schematize(
+			if schema, ext, err := s.schema(
 				schemaScopeResponse,
 				fmt.Sprintf("verb='%s' path='%s' fun='%s': response type '%s'", im.Endpoint.Verb, im.Endpoint.Path, im.Endpoint.Fun, resp.Type.Key()),
 				resp.Type, []string{resp.Type.Name()}, schemaComponentTypes, ""); err != nil {
