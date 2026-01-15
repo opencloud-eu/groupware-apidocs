@@ -123,7 +123,7 @@ func (r renderedExample) forResponse() *yaml.Node {
 func renderExample(text string) (*yaml.Node, error) {
 	var data yaml.Node
 	{
-		var m map[string]any
+		var m any
 		if err := json.Unmarshal([]byte(text), &m); err != nil {
 			return nil, err
 		}

@@ -357,17 +357,25 @@ func specificResponseSummary(code int, s model.InferredSummary) string {
 	case 404:
 		if s.Child != "" && s.SpecificChild {
 			// the specified {child} does not exist within that {obj}
+			verb := "does"
+			if tools.Singularize(s.Child) != s.Child {
+				verb = "do"
+			}
 			if s.ForAccount {
-				return fmt.Sprintf("the account or the specified %s does not exist within that %s", s.Child, s.Object)
+				return fmt.Sprintf("the account or the specified %s %s not exist within that %s", s.Child, verb, s.Object)
 			} else {
-				return fmt.Sprintf("the specified %s does not exist within that %s", s.Child, s.Object)
+				return fmt.Sprintf("the specified %s %s not exist within that %s", s.Child, verb, s.Object)
 			}
 		} else if s.Object != "" {
 			// the specified {obj} does not exist
+			verb := "does"
+			if tools.Singularize(s.Object) != s.Object {
+				verb = "do"
+			}
 			if s.ForAccount {
-				return fmt.Sprintf("the account or the specified %s does not exist", s.Object)
+				return fmt.Sprintf("the account or the specified %s %s not exist", s.Object, verb)
 			} else {
-				return fmt.Sprintf("the specified %s does not exist", s.Object)
+				return fmt.Sprintf("the specified %s %s not exist", s.Object, verb)
 			}
 		}
 	}
@@ -379,6 +387,17 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 
 	resps := map[int]model.Resp{}
 	maps.Copy(resps, im.Resp)
+
+	for _, pe := range im.PotentialErrors {
+		if _, ok := resps[pe.Payload.Status]; ok {
+			continue // there's already a response for that status code
+		}
+		resps[pe.Payload.Status] = model.Resp{
+			Summary: pe.Payload.Title,
+			Type:    pe.Type,
+		}
+	}
+
 	for _, code := range []int{404} {
 		if _, ok := resps[code]; !ok {
 			// there is no specific 404, but we might be able to generate a summary that is more specific than
@@ -407,9 +426,26 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 				resp.Type, []string{resp.Type.Name()}, schemaComponentTypes, ""); err != nil {
 				return nil, fmt.Errorf("failed to reference response type %s: %v", resp.Type, err)
 			} else {
-				var examples *orderedmap.Map[string, *highbase.Example]
+				examples := orderedmap.New[string, *highbase.Example]()
 				if _, ok := m.Examples[resp.Type.Key()]; ok {
-					examples = omap1("ok", highbase.CreateExampleRef(ExampleComponentRefPrefix+resp.Type.Key()))
+					examples.Set("ok", highbase.CreateExampleRef(ExampleComponentRefPrefix+resp.Type.Key()))
+				}
+				for n, pe := range im.PotentialErrors {
+					if pe.Payload.Status == code {
+						if node, err := renderObj(pe.Payload); err != nil {
+							return nil, fmt.Errorf("failed to render %T object to a yaml node: %w", pe.Payload, err)
+						} else {
+							examples.Set(pe.Payload.Detail, &highbase.Example{
+								Description: pe.Payload.Detail,
+								Extensions:  ext1("x-oc-gwe-id", n),
+								Value:       node,
+							})
+						}
+					}
+				}
+
+				if examples.Len() < 1 {
+					examples = nil
 				}
 				contentMap.Set("application/json", &v3.MediaType{
 					Schema:     schema,

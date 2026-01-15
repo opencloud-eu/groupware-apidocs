@@ -2,6 +2,7 @@ package tools
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -28,6 +29,26 @@ func Collect[A, B any](s []A, mapper func(A) B) []B {
 	r := make([]B, len(s))
 	for i, a := range s {
 		r[i] = mapper(a)
+	}
+	return r
+}
+
+func CollectValues[K comparable, A any, B any](m map[K]A, mapper func(A) B) []B {
+	r := make([]B, len(m))
+	i := 0
+	for _, a := range m {
+		r[i] = mapper(a)
+		i++
+	}
+	return r
+}
+
+func GrepValues[K comparable, V any](m map[K]V, predicate func(V) bool) []V {
+	r := []V{}
+	for _, a := range m {
+		if predicate(a) {
+			r = append(r, a)
+		}
 	}
 	return r
 }
@@ -89,4 +110,37 @@ func MapReduce[A any, B any, C any](s []A, mapper func(A) (B, bool, error), redu
 		}
 	}
 	return reducer(mapped)
+}
+
+func Article(str string) string {
+	if Voweled(str) {
+		return "an"
+	} else {
+		return "a"
+	}
+}
+
+func Voweled(str string) bool {
+	if len(str) < 1 {
+		return false
+	}
+	c, _ := utf8.DecodeRuneInString(str)
+	switch c {
+	case 'a', 'i', 'e', 'o', 'u', 'y', 'A', 'I', 'E', 'O', 'U', 'Y':
+		return true
+	}
+	return false
+}
+
+func Singularize(str string) string {
+	if strings.HasSuffix(str, "ies") {
+		return str[0:len(str)-3] + "y"
+	}
+	if strings.HasSuffix(str, "es") {
+		return str[0 : len(str)-2]
+	}
+	if strings.HasSuffix(str, "s") {
+		return str[0 : len(str)-1]
+	}
+	return str
 }

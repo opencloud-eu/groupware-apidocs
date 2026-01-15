@@ -139,6 +139,19 @@ type InferredSummary struct {
 	SpecificChild  bool
 }
 
+type GroupwareError struct {
+	Status int
+	Code   string
+	Title  string
+	Detail string
+}
+
+type PotentialError struct {
+	Name    string
+	Type    Type
+	Payload GroupwareError
+}
+
 type Impl struct {
 	Endpoint        Endpoint
 	Source          string
@@ -153,6 +166,7 @@ type Impl struct {
 	PathParams      []Param
 	HeaderParams    []Param
 	BodyParams      []Param
+	PotentialErrors map[string]PotentialError
 	Tags            []string
 	Summary         string
 	Description     string

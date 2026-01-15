@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"go/types"
 	"maps"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
-	"unicode/utf8"
 
+	"golang.org/x/tools/go/packages"
 	"opencloud.eu/groupware-apidocs/internal/model"
 	"opencloud.eu/groupware-apidocs/internal/tools"
 )
@@ -79,6 +81,25 @@ func ident(expr ast.Expr, name string) bool {
 		}
 	}
 	return false
+}
+
+func valueSpecNameFunc(v *ast.ValueSpec, predicate func(string) bool) (int, string) {
+	if v != nil {
+		for i, ident := range v.Names {
+			if ident != nil && predicate(ident.Name) {
+				return i, ident.Name
+			}
+		}
+	}
+	return -1, ""
+}
+
+func isComposite(expr ast.Expr) (*ast.CompositeLit, bool) {
+	switch c := expr.(type) {
+	case *ast.CompositeLit:
+		return c, true
+	}
+	return nil, false
 }
 
 func isParamType(field *ast.Field, pkg string, name string) bool {
@@ -314,6 +335,44 @@ func isString(expr ast.Expr) (string, bool) {
 	return "", false
 }
 
+func isInt(expr ast.Expr) (int, bool, error) {
+	switch b := expr.(type) {
+	case *ast.BasicLit:
+		if b.Kind == token.INT {
+			if i, err := strconv.Atoi(b.Value); err != nil {
+				return 0, true, err
+			} else {
+				return i, true, nil
+			}
+		}
+	}
+	return 0, false, nil
+}
+
+func isNamed(expr types.Type) (*types.Named, bool) {
+	switch n := expr.(type) {
+	case *types.Named:
+		return n, true
+	}
+	return nil, false
+}
+
+func isKeyValueExpr(expr ast.Expr) (*ast.KeyValueExpr, bool) {
+	switch k := expr.(type) {
+	case *ast.KeyValueExpr:
+		return k, true
+	}
+	return nil, false
+}
+
+func isGenDecl(decl ast.Decl) (*ast.GenDecl, bool) {
+	switch g := decl.(type) {
+	case *ast.GenDecl:
+		return g, true
+	}
+	return nil, false
+}
+
 func isIdent(expr ast.Expr) (*ast.Ident, bool) {
 	switch e := expr.(type) {
 	case *ast.Ident:
@@ -347,39 +406,6 @@ func keysort[K cmp.Ordered, V any](m map[K]V) []K {
 	return c
 }
 
-func article(str string) string {
-	if voweled(str) {
-		return "an"
-	} else {
-		return "a"
-	}
-}
-
-func voweled(str string) bool {
-	if len(str) < 1 {
-		return false
-	}
-	c, _ := utf8.DecodeRuneInString(str)
-	switch c {
-	case 'a', 'i', 'e', 'o', 'u', 'y', 'A', 'I', 'E', 'O', 'U', 'Y':
-		return true
-	}
-	return false
-}
-
-func singularize(str string) string {
-	if strings.HasSuffix(str, "ies") {
-		return str[0:len(str)-3] + "y"
-	}
-	if strings.HasSuffix(str, "es") {
-		return str[0 : len(str)-2]
-	}
-	if strings.HasSuffix(str, "s") {
-		return str[0 : len(str)-1]
-	}
-	return str
-}
-
 func isClosure(expr ast.Expr) (*ast.FuncLit, bool) {
 	switch e := expr.(type) {
 	case *ast.FuncLit:
@@ -394,4 +420,128 @@ func isValueSpec(expr any) (*ast.ValueSpec, bool) {
 		return e, true
 	}
 	return nil, false
+}
+
+func findGroupwareErrorCodeDefinitions(s ast.Spec) (map[string]string, error) {
+	m := map[string]string{}
+	if v, ok := isValueSpec(s); ok && v != nil {
+		for i, ident := range v.Names {
+			if ident != nil && strings.HasPrefix(ident.Name, "ErrorCode") {
+				value := v.Values[i]
+				if text, ok := isString(value); ok {
+					m[ident.Name] = text
+				}
+			}
+		}
+	}
+	return m, nil
+}
+
+func parseHttpStatuses(p *packages.Package) map[string]int {
+	m := map[string]int{}
+	for _, syn := range p.Syntax {
+		for _, decl := range syn.Decls {
+			if g, ok := isGenDecl(decl); ok {
+				for _, s := range g.Specs {
+					if v, ok := isValueSpec(s); ok && v != nil {
+						for i, ident := range v.Names {
+							if ident != nil && strings.HasPrefix(ident.Name, "Status") {
+								value := v.Values[i]
+								if text, ok, err := isInt(value); err != nil {
+									panic(err)
+								} else if ok {
+									m[ident.Name] = text
+								} else {
+									panic(fmt.Errorf("http constant '%s' is not an int but a %T", ident.Name, value))
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return m
+}
+
+func findGroupwareErrorDefinitions(s ast.Spec, groupwareErrorType model.Type, errorCodeDefinitions map[string]string, httpStatusMap map[string]int) (map[string]model.PotentialError, error) {
+	m := map[string]model.PotentialError{}
+	if v, ok := isValueSpec(s); ok {
+		i, name := valueSpecNameFunc(v, func(name string) bool { return strings.HasPrefix(name, "Error") })
+		if i < 0 {
+			return m, nil
+		}
+		value := v.Values[i]
+		if c, ok := isComposite(value); ok {
+			if ident, ok := isIdent(c.Type); !(ok && ident.Name == groupwareErrorType.Name()) {
+				return nil, nil
+			}
+			gwe := model.GroupwareError{}
+			for _, elt := range c.Elts {
+				if kve, ok := isKeyValueExpr(elt); ok {
+					field := ""
+					if ident, ok := isIdent(kve.Key); ok {
+						field = ident.Name
+					}
+					if field == "" {
+						panic(fmt.Errorf("elt kve Key is not an ident but a %T", kve.Key))
+						//continue
+					}
+					switch field {
+					case "Status":
+						if s, ok := isSelector(kve.Value); ok {
+							if pkgIdent, ok := isIdent(s.X); ok && pkgIdent.Name == "http" {
+								httpStatusName := s.Sel.Name
+								if code, ok := httpStatusMap[httpStatusName]; ok {
+									gwe.Status = code
+								} else {
+									panic(fmt.Errorf("failed to map http status name '%s' to a code in httpStatusMap", httpStatusName))
+								}
+							} else {
+								panic(fmt.Errorf("Status value is a selector but X is not an ident but a %T", s.X))
+							}
+						} else {
+							panic(fmt.Errorf("Status value is not a selector but a %T", kve.Value))
+						}
+					case "Code":
+						// expecting an ident to an error code constant
+						if ident, ok := isIdent(kve.Value); ok {
+							if text, ok := errorCodeDefinitions[ident.Name]; ok {
+								gwe.Code = text
+							} else {
+								panic(fmt.Errorf("failed to find entry in errorCodeDefinitions for '%s'", ident.Name))
+							}
+						} else {
+							panic(fmt.Errorf("elt kve Value for '%s' in '%s' is not an ident but a %T", field, name, kve.Value))
+						}
+					case "Title":
+						// expecting a basiclit string value
+						if text, ok := isString(kve.Value); ok {
+							gwe.Title = text
+						} else {
+							panic(fmt.Errorf("elt kve Value for '%s' in '%s' is not a basiclit string but a %T", field, name, kve.Value))
+						}
+					case "Detail":
+						// expecting a basiclit string value
+						if text, ok := isString(kve.Value); ok {
+							gwe.Detail = text
+						} else {
+							panic(fmt.Errorf("elt kve Value for '%s' in '%s' is not a basiclit string but a %T", field, name, kve.Value))
+						}
+					default:
+						panic(fmt.Errorf("unsupported GroupwareError field '%s' in '%s'", field, name))
+					}
+				} else {
+					panic(fmt.Errorf("elt is not a KeyValueExpr but a %T in '%s'", elt, name))
+				}
+			}
+			// TODO we could add a check here to make sure every field has been set
+			m[name] = model.PotentialError{
+				Name:    name,
+				Type:    groupwareErrorType,
+				Payload: gwe,
+			}
+		}
+	}
+	return m, nil
 }
