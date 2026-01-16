@@ -16,36 +16,39 @@ var builtins = []string{
 	"error",
 }
 
+var (
+	IntType    = NewBuiltinType("", "int")
+	UIntType   = NewBuiltinType("", "uint")
+	StringType = NewBuiltinType("", "string")
+	BoolType   = NewBuiltinType("", "bool")
+	AnyType    = NewBuiltinType("", "any")
+	TimeType   = NewBuiltinType("time", "Time")
+)
+
+func ToBasicType(key string) (Type, bool) {
+	switch key {
+	case "int":
+		return IntType, true
+	case "uint":
+		return UIntType, true
+	case "string":
+		return StringType, true
+	case "bool":
+		return BoolType, true
+	case "any":
+		return AnyType, true
+	case "time.Time":
+		return TimeType, true
+	}
+	return nil, false
+}
+
 func IsBuiltinType(t string) bool {
 	return slices.Contains(builtins, t)
 }
 
 func IsBuiltinSelectorType(pkg string, _ string) bool {
 	return !slices.Contains(config.PackagesOfInterest, pkg)
-}
-
-func NewIntType(required *bool) BuiltinType {
-	return NewBuiltinType("", "int", required)
-}
-
-func NewUIntType(required *bool) BuiltinType {
-	return NewBuiltinType("", "uint", required)
-}
-
-func NewStringType(required *bool) BuiltinType {
-	return NewBuiltinType("", "string", required)
-}
-
-func NewBoolType(required *bool) BuiltinType {
-	return NewBuiltinType("", "bool", required)
-}
-
-func NewTimeType(required *bool) BuiltinType {
-	return NewBuiltinType("time", "Time", required)
-}
-
-func NewAnyType(required *bool) BuiltinType {
-	return NewBuiltinType("", "any", required)
 }
 
 func NewAliasType(pkg string, name string, typeRef Type, pos token.Position) AliasType {
@@ -114,21 +117,16 @@ func (t AliasType) Pos() (token.Position, bool) {
 	return t.pos, true
 }
 
-func (t AliasType) Required() *bool {
-	return t.typeRef.Required()
-}
-
 var _ Type = AliasType{}
 
-func NewInterfaceType(pkg string, name string, pos token.Position, required *bool) InterfaceType {
-	return InterfaceType{pkg: pkg, name: name, pos: pos, required: required}
+func NewInterfaceType(pkg string, name string, pos token.Position) InterfaceType {
+	return InterfaceType{pkg: pkg, name: name, pos: pos}
 }
 
 type InterfaceType struct {
-	pkg      string
-	name     string
-	pos      token.Position
-	required *bool
+	pkg  string
+	name string
+	pos  token.Position
 }
 
 func (t InterfaceType) Key() string {
@@ -179,20 +177,15 @@ func (t InterfaceType) Pos() (token.Position, bool) {
 	return t.pos, true
 }
 
-func (t InterfaceType) Required() *bool {
-	return t.required
-}
-
 var _ Type = InterfaceType{}
 
-func NewBuiltinType(pkg string, name string, required *bool) BuiltinType {
-	return BuiltinType{pkg: pkg, name: name, required: required}
+func NewBuiltinType(pkg string, name string) BuiltinType {
+	return BuiltinType{pkg: pkg, name: name}
 }
 
 type BuiltinType struct {
-	pkg      string
-	name     string
-	required *bool
+	pkg  string
+	name string
 }
 
 func (t BuiltinType) Key() string {
@@ -251,22 +244,17 @@ func (t BuiltinType) Pos() (token.Position, bool) {
 	return token.Position{}, false
 }
 
-func (t BuiltinType) Required() *bool {
-	return t.required
-}
-
 var _ Type = BuiltinType{}
 
-func NewArrayType(elt Type, required *bool) ArrayType {
+func NewArrayType(elt Type) ArrayType {
 	if elt == nil {
 		panic("elt is nil")
 	}
-	return ArrayType{elt: elt, required: required}
+	return ArrayType{elt: elt}
 }
 
 type ArrayType struct {
-	elt      Type
-	required *bool
+	elt Type
 }
 
 func (t ArrayType) Key() string {
@@ -291,7 +279,7 @@ func (t ArrayType) IsBasic() bool {
 
 func (t ArrayType) Deref() (Type, bool) {
 	if d, ok := t.elt.Deref(); ok {
-		return NewArrayType(d, t.Required()), true
+		return NewArrayType(d), true
 	} else {
 		return nil, false
 	}
@@ -321,14 +309,10 @@ func (t ArrayType) Pos() (token.Position, bool) {
 	return t.elt.Pos()
 }
 
-func (t ArrayType) Required() *bool {
-	return t.required
-}
-
 var _ Type = ArrayType{}
 
-func NewStructType(pkg string, name string, fields []Field, summary string, description string, pos token.Position, required *bool) StructType {
-	return StructType{pkg: pkg, name: name, fields: fields, summary: summary, description: description, pos: pos, required: required}
+func NewStructType(pkg string, name string, fields []Field, summary string, description string, pos token.Position) StructType {
+	return StructType{pkg: pkg, name: name, fields: fields, summary: summary, description: description, pos: pos}
 }
 
 type StructType struct {
@@ -338,7 +322,6 @@ type StructType struct {
 	summary     string
 	description string
 	pos         token.Position
-	required    *bool
 }
 
 func (t StructType) Key() string {
@@ -389,26 +372,21 @@ func (t StructType) Pos() (token.Position, bool) {
 	return t.pos, true
 }
 
-func (t StructType) Required() *bool {
-	return t.required
-}
-
 var _ Type = StructType{}
 
-func NewMapType(key Type, value Type, required *bool) MapType {
+func NewMapType(key Type, value Type) MapType {
 	if key == nil {
 		panic("key is nil")
 	}
 	if value == nil {
 		panic("value is nil")
 	}
-	return MapType{key: key, value: value, required: required}
+	return MapType{key: key, value: value}
 }
 
 type MapType struct {
-	key      Type
-	value    Type
-	required *bool
+	key   Type
+	value Type
 }
 
 func (t MapType) Key() string {
@@ -441,7 +419,7 @@ func (t MapType) Deref() (Type, bool) {
 		if !vok {
 			v = t.value
 		}
-		return NewMapType(k, v, t.Required()), true
+		return NewMapType(k, v), true
 	} else {
 		return nil, false
 	}
@@ -469,10 +447,6 @@ func (t MapType) Description() string {
 
 func (t MapType) Pos() (token.Position, bool) {
 	return t.value.Pos()
-}
-
-func (t MapType) Required() *bool {
-	return t.required
 }
 
 var _ Type = MapType{}

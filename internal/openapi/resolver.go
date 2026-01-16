@@ -3,8 +3,8 @@ package openapi
 import (
 	"fmt"
 	"maps"
-	"net/http"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -13,6 +13,7 @@ import (
 	v3 "github.com/pb33f/libopenapi/datamodel/high/v3"
 	"github.com/pb33f/libopenapi/orderedmap"
 	"go.yaml.in/yaml/v4"
+	"opencloud.eu/groupware-apidocs/internal/config"
 	"opencloud.eu/groupware-apidocs/internal/model"
 	"opencloud.eu/groupware-apidocs/internal/tools"
 )
@@ -20,8 +21,8 @@ import (
 type schemaScope string
 
 var (
-	schemaScopeRequest  = schemaScope("request")
-	schemaScopeResponse = schemaScope("response")
+	RequestScope  = schemaScope("request")
+	ResponseScope = schemaScope("response")
 )
 
 type resolver struct {
@@ -44,13 +45,7 @@ func newResolver(basePath string, m model.Model, renderedExampleMap map[string]r
 func (s resolver) parameter(p model.Param, in string, requiredByDefault bool, m map[string]model.Param, schemaComponentTypes map[string]model.Type) (*v3.Parameter, error) {
 	if g, ok := m[p.Name]; ok {
 		req := requiredByDefault
-		if p.Type != nil && p.Type.Required() != nil {
-			req = *p.Type.Required()
-		}
-		if !req && g.Type != nil && g.Type.Required() != nil {
-			// this is probably never the case
-			req = *g.Type.Required()
-		}
+		req = p.Required
 		desc := p.Description
 		if desc == "" {
 			desc = g.Description
@@ -58,7 +53,7 @@ func (s resolver) parameter(p model.Param, in string, requiredByDefault bool, m 
 		var schema *highbase.SchemaProxy
 		var ext *orderedmap.Map[string, *yaml.Node]
 		if p.Type != nil {
-			if s, e, err := s.schema(schemaScopeRequest, fmt.Sprintf("parameterize(%v, %s)", p, in), p.Type, []string{p.Name}, schemaComponentTypes, desc); err != nil {
+			if s, e, err := s.schema(RequestScope, fmt.Sprintf("parameterize(%v, %s)", p, in), p.Type, []string{p.Name}, schemaComponentTypes, desc); err != nil {
 				return nil, err
 			} else {
 				schema = s
@@ -147,11 +142,11 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 				if rendered, ok := s.renderedExampleMap[t.Key()]; ok {
 					var data *yaml.Node
 					switch scope {
-					case schemaScopeRequest:
+					case RequestScope:
 						x, _ := e.ForRequest()
 						example = &x
 						data = rendered.forRequest()
-					case schemaScopeResponse:
+					case ResponseScope:
 						x, _ := e.ForResponse()
 						example = &x
 						data = rendered.forResponse()
@@ -169,10 +164,10 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 		props := orderedmap.New[string, *highbase.SchemaProxy]()
 		requiredFields := []string{}
 		for _, f := range d.Fields() {
-			if scope == schemaScopeRequest && !f.InRequest {
+			if scope == RequestScope && !f.InRequest {
 				continue // skip this field
 			}
-			if scope == schemaScopeResponse && !f.InResponse {
+			if scope == ResponseScope && !f.InResponse {
 				continue // skip this field
 			}
 
@@ -235,7 +230,7 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 		// use a reference to avoid circular references and endless loops
 		typeId := d.Key()
 		ref := typeId
-		if scope == schemaScopeRequest && model.HasExceptions(t) {
+		if scope == RequestScope && model.HasExceptions(t) {
 			ref = ref + RequestExceptionTypeKeySuffix
 		}
 		if t, ok := s.typeMap[typeId]; ok {
@@ -266,7 +261,7 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 
 func (s resolver) reqschema(param model.Param, im model.Impl, schemaComponentTypes map[string]model.Type, desc string) (*base.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
 	if t, ok := s.typeMap[param.Name]; ok {
-		return s.schema(schemaScopeRequest, "reqschema", t, []string{im.Name}, schemaComponentTypes, desc)
+		return s.schema(RequestScope, "reqschema", t, []string{im.Name}, schemaComponentTypes, desc)
 	}
 
 	var schemaRef *base.SchemaProxy = nil
@@ -310,7 +305,7 @@ func (s resolver) bodyparams(params []model.Param, im model.Impl, schemaComponen
 						Value:       rendered,
 						Extensions: ext2(
 							"oc-example-source-file", example.Origin,
-							"oc-example-scope", "bodyparam/"+string(schemaScopeRequest),
+							"oc-example-scope", "bodyparam/"+string(RequestScope),
 						),
 					})
 				}
@@ -388,13 +383,50 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 	resps := map[int]model.Resp{}
 	maps.Copy(resps, im.Resp)
 
+	usesAccount := slices.ContainsFunc(im.PathParams, func(p model.Param) bool { return p.Name == config.AccountIdUriParamName })
+	hasQueryParams := len(im.QueryParams) > 0
+	hasMandatoryQueryParams := slices.ContainsFunc(im.QueryParams, func(p model.Param) bool { return p.Required })
+	hasPathParams := len(im.PathParams) > 0
+	hasMandatoryPathParams := slices.ContainsFunc(im.PathParams, func(p model.Param) bool { return p.Required })
+	hasBodyParams := len(im.BodyParams) > 0
+	hasMandatoryBodyParams := slices.ContainsFunc(im.BodyParams, func(p model.Param) bool { return p.Required })
+
+	paramCases := []struct {
+		flag bool
+		list []model.PotentialError
+	}{
+		{flag: usesAccount, list: m.GlobalPotentialErrorsForAccount},
+		{flag: hasQueryParams, list: m.GlobalPotentialErrorsForQueryParams},
+		{flag: hasMandatoryQueryParams, list: m.GlobalPotentialErrorsForMandatoryQueryParams},
+		{flag: hasPathParams, list: m.GlobalPotentialErrorsForPathParams},
+		{flag: hasMandatoryPathParams, list: m.GlobalPotentialErrorsForMandatoryPathParams},
+		{flag: hasBodyParams, list: m.GlobalPotentialErrorsForBodyParams},
+		{flag: hasMandatoryBodyParams, list: m.GlobalPotentialErrorsForMandatoryBodyParams},
+	}
+
 	for _, pe := range im.PotentialErrors {
 		if _, ok := resps[pe.Payload.Status]; ok {
 			continue // there's already a response for that status code
 		}
+		summary := tools.MustHttpStatusText(pe.Payload.Status) // TODO have a more meaningful summary for this
 		resps[pe.Payload.Status] = model.Resp{
-			Summary: pe.Payload.Title,
+			Summary: summary,
 			Type:    pe.Type,
+		}
+	}
+
+	for _, scenario := range paramCases {
+		if scenario.flag {
+			for _, pe := range scenario.list {
+				if _, ok := resps[pe.Payload.Status]; ok {
+					continue // we're good, there is already a response for that status code
+				}
+				summary := tools.MustHttpStatusText(pe.Payload.Status) // TODO have a more meaningful summary for this
+				resps[pe.Payload.Status] = model.Resp{
+					Summary: summary,
+					Type:    pe.Type,
+				}
+			}
 		}
 	}
 
@@ -421,7 +453,7 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 		contentMap := orderedmap.New[string, *v3.MediaType]()
 		if resp.Type != nil {
 			if schema, ext, err := s.schema(
-				schemaScopeResponse,
+				ResponseScope,
 				fmt.Sprintf("verb='%s' path='%s' fun='%s': response type '%s'", im.Endpoint.Verb, im.Endpoint.Path, im.Endpoint.Fun, resp.Type.Key()),
 				resp.Type, []string{resp.Type.Name()}, schemaComponentTypes, ""); err != nil {
 				return nil, fmt.Errorf("failed to reference response type %s: %v", resp.Type, err)
@@ -430,16 +462,35 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 				if _, ok := m.Examples[resp.Type.Key()]; ok {
 					examples.Set("ok", highbase.CreateExampleRef(ExampleComponentRefPrefix+resp.Type.Key()))
 				}
-				for n, pe := range im.PotentialErrors {
+				for _, pe := range im.PotentialErrors {
 					if pe.Payload.Status == code {
 						if node, err := renderObj(pe.Payload); err != nil {
 							return nil, fmt.Errorf("failed to render %T object to a yaml node: %w", pe.Payload, err)
 						} else {
 							examples.Set(pe.Payload.Detail, &highbase.Example{
 								Description: pe.Payload.Detail,
-								Extensions:  ext1("x-oc-gwe-id", n),
+								Extensions:  ext1("x-oc-gwe-id", pe.Name),
 								Value:       node,
 							})
+						}
+					}
+				}
+
+				for _, c := range paramCases {
+					if !c.flag {
+						continue
+					}
+					for _, pe := range c.list {
+						if code == pe.Payload.Status {
+							if node, err := renderObj(pe.Payload); err != nil {
+								return nil, fmt.Errorf("failed to render %T object to a yaml node: %w", pe.Payload, err)
+							} else {
+								examples.Set(pe.Payload.Detail, &highbase.Example{
+									Description: pe.Payload.Detail,
+									Extensions:  ext1("x-oc-gwe-id", pe.Name),
+									Value:       node,
+								})
+							}
 						}
 					}
 				}
@@ -509,7 +560,7 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 		}
 		if summary == "" {
 			// as a very last resort
-			summary = http.StatusText(code)
+			summary = tools.MustHttpStatusText(code)
 		}
 
 		// common response headers
@@ -532,23 +583,29 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 		})
 	}
 	// also add the default responses in every operation
-	for code, respType := range m.DefaultResponses {
+	for code, resp := range m.DefaultResponses {
 		codeKey := strconv.Itoa(code)
+		summary := resp.Summary
+		if summary == "" {
+			summary = tools.MustHttpStatusText(code)
+		}
+
 		if _, ok := respMap.Get(codeKey); ok {
 			// that code is already defined for that function, which overrides the generic default
 			// response for that code, so don't do anything here
-		} else if respType != nil {
-			ref := fmt.Sprintf("%s.%d", respType.Key(), code)
+		} else if resp.Type != nil {
+			ref := fmt.Sprintf("%s.%d", resp.Type.Key(), code)
 			respMap.Set(codeKey, &v3.Response{
 				Reference: ResponseComponentRefPrefix + ref,
-				Summary:   http.StatusText(code),
+				Summary:   summary,
 			})
 		} else {
 			// no type means that there is no response, e.g. for 204 No Content
 			respMap.Set(codeKey, &v3.Response{
-				Summary: http.StatusText(code),
+				Summary: summary,
 			})
 		}
 	}
+
 	return &v3.Responses{Codes: respMap}, nil
 }

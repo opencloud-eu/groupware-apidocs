@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"maps"
-	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -351,12 +350,12 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 	componentResponses := orderedmap.New[string, *v3.Response]()
 	{
 		for code, t := range m.DefaultResponses {
-			if t == nil {
+			if t.Type == nil {
 				continue
 			}
-			key := fmt.Sprintf("%s.%d", t.Key(), code)
+			key := fmt.Sprintf("%s.%d", t.Type.Key(), code)
 			contentMap := orderedmap.New[string, *v3.MediaType]()
-			if schema, ext, err := res.schema(schemaScopeResponse, fmt.Sprintf("default response '%s'", t.Name()), t, []string{t.Name()}, schemaComponentTypes, ""); err != nil {
+			if schema, ext, err := res.schema(ResponseScope, fmt.Sprintf("default response '%s'", t.Type.Name()), t.Type, []string{t.Type.Name()}, schemaComponentTypes, ""); err != nil {
 				return fmt.Errorf("failed to reference default response type %s: %v", t, err)
 			} else {
 				contentMap.Set("application/json", &v3.MediaType{
@@ -365,11 +364,9 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 				})
 			}
 
-			// TODO extract default response summary and description from comments
-			summary := ""
-
+			summary := t.Summary
 			if summary == "" {
-				summary = http.StatusText(code)
+				summary = tools.MustHttpStatusText(code)
 			}
 
 			headers := orderedmap.New[string, *v3.Header]()
@@ -413,7 +410,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 						// (just the type name, e.g. "jmap.Identity") is assumed to be the one to reference in requests
 						ref := t.Key()
 						ctx := fmt.Sprintf("resolving schema component type '%s'", t.Key())
-						if schema, _, err := res.schema(schemaScopeResponse, ctx, t, []string{}, moreSchemaComponentTypes, t.Summary()); err == nil {
+						if schema, _, err := res.schema(ResponseScope, ctx, t, []string{}, moreSchemaComponentTypes, t.Summary()); err == nil {
 							if schema != nil {
 								schemas[ref] = schema
 							}
@@ -428,7 +425,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 						// requests, with this suffix:
 						ref := t.Key() + RequestExceptionTypeKeySuffix
 						ctx := fmt.Sprintf("resolving schema component type '%s' for use in requests", t.Key())
-						if schema, _, err := res.schema(schemaScopeRequest, ctx, t, []string{}, moreSchemaComponentTypes, t.Summary()); err == nil {
+						if schema, _, err := res.schema(RequestScope, ctx, t, []string{}, moreSchemaComponentTypes, t.Summary()); err == nil {
 							if schema != nil {
 								schemas[ref] = schema
 							}
@@ -519,7 +516,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 				Value:       rendered,
 				Extensions: ext2(
 					"oc-example-source-file", example.Origin,
-					"oc-example-scope", string(schemaScopeResponse),
+					"oc-example-scope", string(ResponseScope),
 				),
 			})
 		}

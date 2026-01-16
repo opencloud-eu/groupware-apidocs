@@ -1,6 +1,8 @@
 package tools
 
 import (
+	"fmt"
+	"net/http"
 	"strings"
 	"unicode/utf8"
 
@@ -55,13 +57,6 @@ func GrepValues[K comparable, V any](m map[K]V, predicate func(V) bool) []V {
 
 func BoolPtr(b bool) *bool {
 	return &b
-}
-
-func OrPtr(b *bool, def *bool) *bool {
-	if b != nil {
-		return b
-	}
-	return def
 }
 
 func ZerofPtr() *float64 {
@@ -143,4 +138,12 @@ func Singularize(str string) string {
 		return str[0 : len(str)-1]
 	}
 	return str
+}
+
+func MustHttpStatusText(code int) string {
+	if text := http.StatusText(code); text != "" {
+		return text
+	} else {
+		panic(fmt.Errorf("unsupported HTTP code %d", code))
+	}
 }

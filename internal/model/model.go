@@ -71,7 +71,6 @@ type Type interface {
 	Summary() string
 	Description() string
 	Pos() (token.Position, bool)
-	Required() *bool
 }
 
 type ResponseHeaderDesc struct {
@@ -79,6 +78,11 @@ type ResponseHeaderDesc struct {
 	Required bool
 	Explode  bool
 	Examples map[string]string
+}
+
+type DefaultResponseDesc struct {
+	Summary string
+	Type    Type
 }
 
 type DefaultResponseHeaderDesc struct {
@@ -126,6 +130,16 @@ type Param struct {
 	Name        string
 	Description string
 	Type        Type
+	Required    bool
+}
+
+func NewParam(name string, description string, t Type, required bool) Param {
+	return Param{
+		Name:        name,
+		Description: description,
+		Type:        t,
+		Required:    required,
+	}
 }
 
 type InferredSummary struct {
@@ -207,19 +221,27 @@ func (r Examples) ForResponse() (Example, bool) {
 }
 
 type Model struct {
-	Routes                    []Endpoint
-	PathParams                map[string]Param
-	QueryParams               map[string]Param
-	HeaderParams              map[string]Param
-	Impls                     []Impl
-	Types                     []Type
-	Examples                  map[string]Examples
-	Enums                     map[string][]string
-	DefaultResponses          map[int]Type
-	DefaultResponseHeaders    map[string]DefaultResponseHeaderDesc
-	CommonRequestHeaders      []RequestHeaderDesc
-	UndocumentedResults       map[string]Undocumented
-	UndocumentedRequestBodies map[string]Undocumented
+	Routes                                       []Endpoint
+	PathParams                                   map[string]Param
+	QueryParams                                  map[string]Param
+	HeaderParams                                 map[string]Param
+	Impls                                        []Impl
+	Types                                        []Type
+	Examples                                     map[string]Examples
+	Enums                                        map[string][]string
+	DefaultResponses                             map[int]DefaultResponseDesc
+	DefaultResponseHeaders                       map[string]DefaultResponseHeaderDesc
+	CommonRequestHeaders                         []RequestHeaderDesc
+	UndocumentedResults                          map[string]Undocumented
+	UndocumentedRequestBodies                    map[string]Undocumented
+	GlobalPotentialErrors                        []PotentialError
+	GlobalPotentialErrorsForQueryParams          []PotentialError
+	GlobalPotentialErrorsForMandatoryQueryParams []PotentialError
+	GlobalPotentialErrorsForPathParams           []PotentialError
+	GlobalPotentialErrorsForMandatoryPathParams  []PotentialError
+	GlobalPotentialErrorsForBodyParams           []PotentialError
+	GlobalPotentialErrorsForMandatoryBodyParams  []PotentialError
+	GlobalPotentialErrorsForAccount              []PotentialError
 }
 
 func (m Model) ResolveType(k string) (Type, bool) {

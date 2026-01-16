@@ -67,7 +67,7 @@ func (s AnsiSink) Output(m model.Model, w io.Writer) error {
 
 			resps := map[int]model.Resp{}
 			for statusCode, t := range m.DefaultResponses {
-				resps[statusCode] = model.Resp{Type: t}
+				resps[statusCode] = model.Resp{Type: t.Type, Summary: t.Summary}
 			}
 			maps.Copy(resps, im.Resp)
 

@@ -33,11 +33,6 @@ var (
 	tagNotInResponseRegex = regexp.MustCompile(`doc:"(!response)"`)
 )
 
-var (
-	Required    = tools.BoolPtr(true)
-	NotRequired = tools.BoolPtr(false)
-)
-
 func findRouteDefinition(a *ast.File) *ast.FuncDecl {
 	for _, decl := range a.Decls {
 		switch v := decl.(type) {
@@ -112,25 +107,28 @@ func scrapeGlobalParamDecls(decls []ast.Decl) (GlobalParamDecls, error) {
 			for _, c := range list {
 				if tools.HasAnyPrefix(c.Name, config.PathParamPrefixes) {
 					desc := describeParam(c.Comments)
-					pathParams[c.Name] = model.Param{
-						Name:        c.Value,
-						Description: desc,
-						Type:        model.NewStringType(Required),
-					}
+					pathParams[c.Name] = model.NewParam(
+						c.Value,
+						desc,
+						model.StringType,
+						true,
+					)
 				} else if tools.HasAnyPrefix(c.Name, config.QueryParamPrefixes) {
 					desc := describeParam(c.Comments)
-					queryParams[c.Name] = model.Param{
-						Name:        c.Value,
-						Description: desc,
-						Type:        model.NewStringType(NotRequired), // TOO parse query param definition to determine its type and whether it's required; query parameters are not required by default
-					}
+					queryParams[c.Name] = model.NewParam(
+						c.Value,
+						desc,
+						model.StringType, // TODO parse query param definition to determine its type and whether it's required; query parameters are not required by default
+						false,            // TODO parse query param definition to determine whether it's required; query parameters are not required by default
+					)
 				} else if tools.HasAnyPrefix(c.Name, config.HeaderParamPrefixes) {
 					desc := describeParam(c.Comments)
-					headerParams[c.Name] = model.Param{
-						Name:        c.Value,
-						Description: desc,
-						Type:        model.NewStringType(NotRequired), // TOO parse header param definition to determine its type and whether it's required; query parameters are not required by default
-					}
+					headerParams[c.Name] = model.NewParam(
+						c.Value,
+						desc,
+						model.StringType, // TODO parse header param definition to determine its type and whether it's required; header parameters are not required by default
+						false,            // TODO parse query param definition to determine whether it's required; header parameters are not required by default
+					)
 				}
 			}
 		}
@@ -452,6 +450,47 @@ var (
 		"Calendar": {"ErrorMissingCalendarsSessionCapability", "ErrorMissingCalendarsAccountCapability"},
 		"Task":     {"ErrorMissingTasksSessionCapability", "ErrorMissingTasksAccountCapability"},
 	}
+	GlobalPotentialErrors = []string{
+		"ErrorForbidden",
+		"ErrorInvalidBackendRequest",
+		"ErrorServerResponse",
+		"ErrorReadingResponse",
+		"ErrorProcessingResponse",
+		"ErrorEncodingRequestBody",
+		"ErrorCreatingRequest",
+		"ErrorSendingRequest",
+		"ErrorInvalidSessionResponse",
+		"ErrorInvalidRequestPayload",
+		"ErrorInvalidResponsePayload",
+		"ErrorServerUnavailable",
+		"ErrorServerFailure",
+		"ErrorForbiddenOperation",
+	}
+	GlobalPotentialErrorsForQueryParams = []string{
+		"ErrorInvalidRequestParameter",
+	}
+	GlobalPotentialErrorsForMandatoryQueryParams = []string{
+		"ErrorMissingMandatoryRequestParameter",
+	}
+	GlobalPotentialErrorsForPathParams = []string{
+		"ErrorInvalidRequestParameter",
+	}
+	GlobalPotentialErrorsForMandatoryPathParams = []string{
+		"ErrorMissingMandatoryRequestParameter",
+	}
+	GlobalPotentialErrorsForBodyParams = []string{
+		"ErrorInvalidRequestBody",
+	}
+	GlobalPotentialErrorsForMandatoryBodyParams = []string{
+		"ErrorMissingMandatoryRequestParameter",
+	}
+	GlobalPotentialErrorsForAccount = []string{
+		"ErrorNonExistingAccount",
+	}
+
+	// "ErrorAccountNotFound",
+	// "ErrorAccountNotSupportedByMethod",
+	// "ErrorAccountReadOnly",
 )
 
 func (v returnVisitor) isErrorResponseFunc(r *ast.ReturnStmt) bool {
@@ -474,7 +513,7 @@ func (v returnVisitor) isErrorResponseFunc(r *ast.ReturnStmt) bool {
 							case *ast.AssignStmt:
 								for _, rhs := range decl.Rhs {
 									if call, ok := isCallExpr(rhs); ok {
-										if _, neededType, _, ok := isNeedAccountCall(call, v.pkg); ok {
+										if p, neededType, ok := isNeedAccountCall(call, v.pkg); ok && p.Required {
 											v.potentialErrors[MissingAccountError] = true
 											if moreErrs, ok := MissingObjTypeErrors[neededType]; ok {
 												for _, e := range moreErrs {
@@ -536,13 +575,12 @@ func (v returnVisitor) resolveIdent(x *ast.Ident) (model.Type, error) {
 func (v returnVisitor) resolveType(t types.Type) (model.Type, error) {
 	name := ""
 	var pos token.Pos
-	var req *bool = nil // TODO annotations to determine whether a type is required or not
 	switch n := t.(type) {
 	case *types.Named:
 		name = nameType(n.Obj())
 		pos = n.Obj().Pos()
 	}
-	r, err := typeOf(t, req, v.typeMap, v.pkg)
+	r, err := typeOf(t, v.typeMap, v.pkg)
 	if err != nil {
 		return nil, err
 	}
@@ -794,7 +832,18 @@ func newParamsVisitor(fset *token.FileSet, pkg *packages.Package, fun string, ty
 	}
 }
 
-func (v paramsVisitor) isBodyCall(call *ast.CallExpr) (string, string, bool, error) {
+type param struct {
+	Name     string
+	TypeId   string
+	Summary  string
+	Required bool
+}
+
+func (v paramsVisitor) isBodyCall(call *ast.CallExpr) (param, bool, error) {
+	// TODO if needed, implement a way for body parameters to be optional
+	required := true // body parameters are required by default
+	desc := ""
+	// TODO if needed, implement a way for body parameters to be optional
 	if s, ok := isSelector(call.Fun); ok {
 		if x, ok := isIdent(s.X); ok {
 			if s.Sel.Name == "body" && len(call.Args) == 1 && x.Obj != nil {
@@ -806,22 +855,22 @@ func (v paramsVisitor) isBodyCall(call *ast.CallExpr) (string, string, bool, err
 							if x, ok := isIdent(e.X); ok && e.Op == token.AND && x.Obj != nil {
 								if vs, ok := isValueSpec(x.Obj.Decl); ok {
 									if n, err := nameOf(vs.Type, v.pkg.Name); err == nil {
-										return n, "", true, nil
+										return param{Name: n, TypeId: n, Summary: desc, Required: required}, true, nil
 									} else {
-										return "", "", false, err
+										return param{}, false, err
 									}
 								} else {
-									return "", "", false, fmt.Errorf("unsupported call to Request.body(): UnaryExpr argument is not an Ident but a %v", e)
+									return param{}, false, fmt.Errorf("unsupported call to Request.body(): UnaryExpr argument is not an Ident but a %v", e)
 								}
 							}
 						default:
-							return "", "", false, fmt.Errorf("unsupported call to Request.body(): is not a UnaryExpr but a %v", e)
+							return param{}, false, fmt.Errorf("unsupported call to Request.body(): is not a UnaryExpr but a %v", e)
 						}
 					} else {
-						return "", "", false, fmt.Errorf("call to body() but not on a Request: %v", f)
+						return param{}, false, fmt.Errorf("call to body() but not on a Request: %v", f)
 					}
 				} else {
-					return "", "", false, fmt.Errorf("call to body() but is not a field: %v", x.Obj)
+					return param{}, false, fmt.Errorf("call to body() but is not a field: %v", x.Obj)
 				}
 			} else if s.Sel.Name == "bodydoc" && len(call.Args) == 2 && x.Obj != nil {
 				if f, ok := isField(x.Obj.Decl); ok {
@@ -832,31 +881,30 @@ func (v paramsVisitor) isBodyCall(call *ast.CallExpr) (string, string, bool, err
 							if x, ok := isIdent(e.X); ok && e.Op == token.AND && x.Obj != nil {
 								if vs, ok := isValueSpec(x.Obj.Decl); ok {
 									if n, err := nameOf(vs.Type, v.pkg.Name); err == nil {
-										desc := ""
 										if b, ok := isString(call.Args[1]); ok {
 											desc = b
 										}
-										return n, desc, true, nil
+										return param{Name: n, TypeId: n, Summary: desc, Required: required}, true, nil
 									} else {
-										return "", "", false, err
+										return param{}, false, err
 									}
 								} else {
-									return "", "", false, fmt.Errorf("unsupported call to Request.bodydoc(): UnaryExpr argument is not an Ident but a %v", e)
+									return param{}, false, fmt.Errorf("unsupported call to Request.bodydoc(): UnaryExpr argument is not an Ident but a %v", e)
 								}
 							}
 						default:
-							return "", "", false, fmt.Errorf("unsupported call to Request.bodydoc(): is not a UnaryExpr but a %v", e)
+							return param{}, false, fmt.Errorf("unsupported call to Request.bodydoc(): is not a UnaryExpr but a %v", e)
 						}
 					} else {
-						return "", "", false, fmt.Errorf("call to bodydoc() but not on a Request: %v", f)
+						return param{}, false, fmt.Errorf("call to bodydoc() but not on a Request: %v", f)
 					}
 				} else {
-					return "", "", false, fmt.Errorf("call to bodydoc() but is not a field: %v", x.Obj)
+					return param{}, false, fmt.Errorf("call to bodydoc() but is not a field: %v", x.Obj)
 				}
 			}
 		}
 	}
-	return "", "", false, nil
+	return param{}, false, nil
 }
 
 func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Resp, map[string]bool, map[string]token.Position, bool, error) {
@@ -876,13 +924,23 @@ func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Resp, ma
 	return nil, nil, nil, false, nil
 }
 
-func isAccountCall(call *ast.CallExpr) bool {
-	return len(call.Args) == 0 && isMethodCallPrefix(call, "Request", []string{"GetAccountFor", "GetAccountIdFor"})
+func isAccountCall(call *ast.CallExpr, p *packages.Package) (param, bool) {
+	if len(call.Args) == 0 && isMethodCallPrefix(call, "Request", []string{"GetAccountFor", "GetAccountIdFor"}) {
+		required := true
+		summary := ""
+		if cg := findInlineComment(call.Pos(), p); cg != nil && cg.List != nil {
+			summary = strings.Join(lines(cg.List), "\n")
+		}
+		return param{Name: config.AccountIdUriParamName, TypeId: "string", Summary: summary, Required: required}, true
+	} else {
+		return param{}, false
+	}
 }
 
 var needObjectWithAccountCallRegex = regexp.MustCompile(`^need(Contact|Calendar|Task)WithAccount$`)
 
-func isNeedAccountCall(call *ast.CallExpr, p *packages.Package) (string, string, string, bool) {
+func isNeedAccountCall(call *ast.CallExpr, p *packages.Package) (param, string, bool) {
+	required := true
 	if s, ok := isSelector(call.Fun); ok {
 		if x, ok := isIdent(s.X); ok && len(call.Args) == 0 && x.Obj != nil {
 			if m := needObjectWithAccountCallRegex.FindAllStringSubmatch(s.Sel.Name, 1); m != nil {
@@ -892,13 +950,13 @@ func isNeedAccountCall(call *ast.CallExpr, p *packages.Package) (string, string,
 						if cg := findInlineComment(call.Pos(), p); cg != nil && cg.List != nil {
 							summary = strings.Join(lines(cg.List), "\n")
 						}
-						return config.AccountIdUriParamName, m[0][1], summary, true
+						return param{Name: config.AccountIdUriParamName, TypeId: "string", Summary: summary, Required: required}, m[0][1], true
 					}
 				}
 			}
 		}
 	}
-	return "", "", "", false
+	return param{}, "", false
 }
 
 var (
@@ -906,24 +964,24 @@ var (
 	parseMandatoryParamCallRegex = regexp.MustCompile(`^(?:parse|get)Mandatory([A-Z].*?)Param$`)
 )
 
-func (v paramsVisitor) isParseQueryParamCall(call *ast.CallExpr) (string, string, model.Type, bool, error) {
+func (v paramsVisitor) isParseQueryParamCall(call *ast.CallExpr) (model.Param, bool, error) {
 	var re *regexp.Regexp = nil
-	var req *bool = NotRequired
+	required := false
 	switch len(call.Args) {
 	case 1:
 		re = parseMandatoryParamCallRegex
-		req = Required
+		required = true
 	case 2:
 		re = parseOptionalParamCallRegex
 	default:
-		return "", "", nil, false, nil
+		return model.Param{}, false, nil
 	}
 
 	name := ""
 	if a, ok := isIdent(call.Args[0]); ok {
 		name = a.Name
 	} else {
-		return "", "", nil, false, nil
+		return model.Param{}, false, nil
 	}
 
 	if m := isMethodCallRegex(call, "Request", re, 1); m != nil {
@@ -936,71 +994,72 @@ func (v paramsVisitor) isParseQueryParamCall(call *ast.CallExpr) (string, string
 		{
 			switch typeDef {
 			case "String":
-				typ = model.NewStringType(req)
+				typ = model.StringType
 			case "Int":
-				typ = model.NewIntType(req)
+				typ = model.IntType
 			case "UInt":
-				typ = model.NewUIntType(req)
+				typ = model.UIntType
 			case "Date":
-				typ = model.NewStringType(req)
+				typ = model.StringType
 			case "Bool":
-				typ = model.NewBoolType(req)
+				typ = model.BoolType
 			case "Map":
-				typ = model.NewMapType(model.NewStringType(Required), model.NewStringType(Required), req)
+				typ = model.NewMapType(model.StringType, model.StringType)
 			default:
-				return "", "", nil, true, fmt.Errorf("unsupported type '%s' for query parameter through call to 'Request'", typeDef)
+				return model.Param{}, true, fmt.Errorf("unsupported type '%s' for query parameter through call to 'Request'", typeDef)
 			}
 		}
-		return name, summary, typ, true, nil
+		return model.NewParam(name, summary, typ, required), true, nil
 	} else {
-		return "", "", nil, false, nil
+		return model.Param{}, false, nil
 	}
 }
 
-func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (string, string, model.Type, bool) {
+func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (model.Param, bool) {
+	required := true
 	if len(call.Args) == 2 && isStaticFunc(call, "chi", "URLParam") {
 		if a, ok := isIdent(call.Args[1]); ok {
-			return a.Name, "", nil, true
+			return model.NewParam(a.Name, "", nil, required), true
 		}
 	} else if len(call.Args) == 2 && isMethodCall(call, "Request", "PathParamDoc") {
 		if a, ok := isIdent(call.Args[0]); ok {
 			if b, ok := isString(call.Args[1]); ok {
-				return a.Name, b, model.NewStringType(Required), true
+				return model.NewParam(a.Name, b, model.StringType, required), true
 			}
 		}
 	} else if len(call.Args) == 1 && isMethodCall(call, "Request", "PathParam") {
 		if a, ok := isIdent(call.Args[0]); ok {
-			return a.Name, "", model.NewStringType(Required), true
+			return model.NewParam(a.Name, "", model.StringType, required), true
 		}
 	}
 	// TODO PathParam methods that also cast to a different type (int, ...) than string, if needed
 	// TODO optional PathParam methods where req=NotRequired, if needed (although path params should always be required, in theory)
-	return "", "", nil, false
+	return model.Param{}, false
 }
 
-func (v paramsVisitor) isHeaderParamCall(call *ast.CallExpr) (string, string, bool, bool) {
+func (v paramsVisitor) isHeaderParamCall(call *ast.CallExpr) (param, bool) {
 	if len(call.Args) == 2 && isMethodCall(call, "Request", "HeaderParamDoc") {
 		if a, ok := isIdent(call.Args[0]); ok {
 			if b, ok := isString(call.Args[1]); ok {
-				return a.Name, b, true, true
+				return param{Name: a.Name, TypeId: "string", Summary: b, Required: true}, true
 			}
 		}
 	} else if len(call.Args) == 1 && isMethodCall(call, "Request", "HeaderParam") {
 		if a, ok := isIdent(call.Args[0]); ok {
-			return a.Name, "", true, true
+			return param{Name: a.Name, TypeId: "string", Summary: "", Required: true}, true
 		}
 	} else if len(call.Args) == 2 && isMethodCall(call, "Request", "OptHeaderParamDoc") {
 		if a, ok := isIdent(call.Args[0]); ok {
 			if b, ok := isString(call.Args[1]); ok {
-				return a.Name, b, false, true
+				return param{Name: a.Name, TypeId: "string", Summary: b, Required: false}, true
 			}
 		}
 	} else if len(call.Args) == 1 && isMethodCall(call, "Request", "OptHeaderParam") {
 		if a, ok := isIdent(call.Args[0]); ok {
-			return a.Name, "", false, true
+			return param{Name: a.Name, TypeId: "string", Summary: "", Required: false}, true
 		}
 	}
-	return "", "", false, false
+	return param{}, false
 }
 
 func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
@@ -1019,46 +1078,31 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 			}
 	*/
 	case *ast.CallExpr:
-		if t, desc, ok, err := v.isBodyCall(d); err != nil {
+		if p, ok, err := v.isBodyCall(d); err != nil {
 			*v.errs = append(*v.errs, err)
 			return nil
 		} else if ok {
-			typ, ok := v.typeMap[t]
-			if ok {
-				v.bodyParams[t] = model.Param{Name: t, Description: desc, Type: typ}
+			if typ, err := toType(p.TypeId, v.typeMap); err != nil {
+				*v.errs = append(*v.errs, fmt.Errorf("failed to find type '%s' in typeMap for body parameter '%s'", p.TypeId, p.Name))
+				return nil
 			} else {
-				switch t {
-				case "map[string]any":
-					typ = model.NewMapType(model.NewStringType(Required), model.NewAnyType(NotRequired), Required)
-				case "string":
-					typ = model.NewStringType(Required)
-				case "[]string":
-					typ = model.NewArrayType(model.NewStringType(Required), Required)
-				case "int":
-					typ = model.NewIntType(Required)
-				case "[]int":
-					typ = model.NewArrayType(model.NewIntType(Required), Required)
-				case "uint":
-					typ = model.NewUIntType(Required)
-				case "[]uint":
-					typ = model.NewArrayType(model.NewUIntType(Required), Required)
-				case "any":
-					typ = model.NewAnyType(Required)
-				default:
-					*v.errs = append(*v.errs, fmt.Errorf("failed to find type '%s' in typeMap for body parameter '%s'", typ, t))
-					return nil
+				v.bodyParams[p.Name] = model.NewParam(p.Name, p.Summary, typ, p.Required)
+				if p.Summary == "" {
+					pos := v.fset.Position(d.Pos())
+					v.undocumentedRequestBodies[p.Name] = pos
 				}
+				return v
 			}
-			if desc == "" {
-				pos := v.fset.Position(d.Pos())
-				v.undocumentedRequestBodies[t] = pos
-			}
-			return v
 		}
 
-		if isAccountCall(d) {
-			v.pathParams[config.AccountIdUriParamName] = model.Param{Name: config.AccountIdUriParamName, Description: "", Type: model.NewStringType(Required)}
-			return v
+		if p, ok := isAccountCall(d, v.pkg); ok {
+			if t, err := toType(p.TypeId, v.typeMap); err != nil {
+				*v.errs = append(*v.errs, err)
+				return nil
+			} else {
+				v.pathParams[p.Name] = model.NewParam(p.Name, p.Summary, t, p.Required)
+				return v
+			}
 		}
 		if responses, potentialErrors, undocumented, ok, err := v.isRespondCall(d); err != nil {
 			*v.errs = append(*v.errs, err)
@@ -1069,26 +1113,36 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 			maps.Copy(v.undocumentedResults, undocumented)
 			return v
 		}
-		if z, _, desc, ok := isNeedAccountCall(d, v.pkg); ok {
-			v.pathParams[z] = model.Param{Name: z, Description: desc, Type: model.NewStringType(Required)}
-			return v
+		if p, _, ok := isNeedAccountCall(d, v.pkg); ok {
+			if t, err := toType(p.TypeId, v.typeMap); err != nil {
+				*v.errs = append(*v.errs, err)
+				return nil
+			} else {
+				v.pathParams[p.Name] = model.NewParam(p.Name, p.Summary, t, p.Required)
+				return v
+			}
 		}
-		if z, desc, typ, ok := v.isPathParamCall(d); ok {
-			v.pathParams[z] = model.Param{Name: z, Description: desc, Type: typ}
+		if p, ok := v.isPathParamCall(d); ok {
+			v.pathParams[p.Name] = model.NewParam(p.Name, p.Description, p.Type, p.Required)
 			return v
 		}
 
-		if z, desc, typ, ok, err := v.isParseQueryParamCall(d); err != nil {
+		if p, ok, err := v.isParseQueryParamCall(d); err != nil {
 			*v.errs = append(*v.errs, err)
 			return nil
 		} else if ok {
-			v.queryParams[z] = model.Param{Name: z, Description: desc, Type: typ}
+			v.queryParams[p.Name] = p
 			return v
 		}
 
-		if z, desc, req, ok := v.isHeaderParamCall(d); ok {
-			v.headerParams[z] = model.Param{Name: z, Description: desc, Type: model.NewStringType(&req)}
-			return v
+		if p, ok := v.isHeaderParamCall(d); ok {
+			if t, err := toType(p.TypeId, v.typeMap); err != nil {
+				*v.errs = append(*v.errs, err)
+				return nil
+			} else {
+				v.headerParams[p.Name] = model.NewParam(p.Name, p.Summary, t, p.Required)
+				return v
+			}
 		}
 	}
 	return v
@@ -1342,8 +1396,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 					// skip methods
 				case *types.Named:
 					// this is a globally defined type
-					var req *bool = nil // there is probably no way to determine whether the type is required or not on the top-level definition of it
-					if r, err := typeOf(t, req, typeMap, p); err != nil {
+					if r, err := typeOf(t, typeMap, p); err != nil {
 						log.Panicf("failed to determine type of named %#v: %v", t, err)
 					} else if r != nil {
 						typeMap[r.Key()] = r
@@ -1685,11 +1738,15 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 
 	enums := map[string][]string{} // TODO implement enums
 
-	defaultResponses := map[int]model.Type{}
+	defaultResponses := map[int]model.DefaultResponseDesc{}
 	{
 		if t, ok := typeMap["groupware.ErrorResponse"]; ok {
 			for _, statusCode := range []int{400, 404, 500} {
-				defaultResponses[statusCode] = t
+				summary := tools.MustHttpStatusText(statusCode) // TODO describe default responses
+				defaultResponses[statusCode] = model.DefaultResponseDesc{
+					Type:    t,
+					Summary: summary,
+				}
 			}
 		}
 	}
@@ -1783,20 +1840,47 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 	types := slices.Collect(maps.Values(typeMap))
 
 	return model.Model{
-		Routes:                    routes,
-		PathParams:                pathParams,
-		QueryParams:               queryParams,
-		HeaderParams:              headerParams,
-		Impls:                     ims,
-		Types:                     types,
-		Examples:                  exampleMap,
-		Enums:                     enums,
-		DefaultResponses:          defaultResponses,
-		DefaultResponseHeaders:    defaultResponseHeaders,
-		CommonRequestHeaders:      commonRequestHeaders,
-		UndocumentedResults:       undocumentedResults,
-		UndocumentedRequestBodies: undocumentedResultBodies,
+		Routes:                              routes,
+		PathParams:                          pathParams,
+		QueryParams:                         queryParams,
+		HeaderParams:                        headerParams,
+		Impls:                               ims,
+		Types:                               types,
+		Examples:                            exampleMap,
+		Enums:                               enums,
+		DefaultResponses:                    defaultResponses,
+		DefaultResponseHeaders:              defaultResponseHeaders,
+		CommonRequestHeaders:                commonRequestHeaders,
+		UndocumentedResults:                 undocumentedResults,
+		UndocumentedRequestBodies:           undocumentedResultBodies,
+		GlobalPotentialErrors:               mustMapPotentialErrors(GlobalPotentialErrors, groupwareErrorsMap),
+		GlobalPotentialErrorsForQueryParams: mustMapPotentialErrors(GlobalPotentialErrorsForQueryParams, groupwareErrorsMap),
+		GlobalPotentialErrorsForMandatoryQueryParams: mustMapPotentialErrors(GlobalPotentialErrorsForMandatoryQueryParams, groupwareErrorsMap),
+		GlobalPotentialErrorsForPathParams:           mustMapPotentialErrors(GlobalPotentialErrorsForPathParams, groupwareErrorsMap),
+		GlobalPotentialErrorsForMandatoryPathParams:  mustMapPotentialErrors(GlobalPotentialErrorsForMandatoryPathParams, groupwareErrorsMap),
+		GlobalPotentialErrorsForBodyParams:           mustMapPotentialErrors(GlobalPotentialErrorsForBodyParams, groupwareErrorsMap),
+		GlobalPotentialErrorsForMandatoryBodyParams:  mustMapPotentialErrors(GlobalPotentialErrorsForMandatoryBodyParams, groupwareErrorsMap),
 	}, nil
+}
+
+func mapPotentialErrors(ids []string, errorMap map[string]model.PotentialError) ([]model.PotentialError, error) {
+	result := make([]model.PotentialError, len(ids))
+	for i, k := range ids {
+		if e, ok := errorMap[k]; ok {
+			result[i] = e
+		} else {
+			return nil, fmt.Errorf("failed to find potential error entry '%s' in the groupwareErrorsMap", k)
+		}
+	}
+	return result, nil
+}
+
+func mustMapPotentialErrors(ids []string, errorMap map[string]model.PotentialError) []model.PotentialError {
+	result, err := mapPotentialErrors(ids, errorMap)
+	if err != nil {
+		panic(err)
+	}
+	return result
 }
 
 func nameType(t *types.TypeName) string {
@@ -1821,17 +1905,48 @@ func typeNames(t *types.TypeName) (string, string) {
 	return "", name
 }
 
-func typeOf(t types.Type, req *bool, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
+var (
+	arrayRegex = regexp.MustCompile(`^\[\](.+)$`)
+	mapRegex   = regexp.MustCompile(`^map\[(.+?)\](.+?)$`)
+)
+
+func toType(id string, typeMap map[string]model.Type) (model.Type, error) {
+	if m := arrayRegex.FindAllStringSubmatch(id, 1); m != nil {
+		if elt, err := toType(m[0][1], typeMap); err != nil {
+			return nil, err
+		} else {
+			return model.NewArrayType(elt), nil
+		}
+	}
+	if m := mapRegex.FindAllStringSubmatch(id, 2); m != nil {
+		if key, err := toType(m[0][1], typeMap); err != nil {
+			return nil, err
+		} else if value, err := toType(m[0][2], typeMap); err != nil {
+			return nil, err
+		} else {
+			return model.NewMapType(key, value), nil
+		}
+	}
+	if t, ok := model.ToBasicType(id); ok {
+		return t, nil
+	}
+	if t, ok := typeMap[id]; ok {
+		return t, nil
+	}
+	return nil, fmt.Errorf("failed to map '%s' to a type", id)
+}
+
+func typeOf(t types.Type, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
 	switch t := t.(type) {
 	case *types.Named:
 		pkg, name := typeNames(t.Obj())
 		if pkg != "" {
 			if model.IsBuiltinSelectorType(pkg, name) { // for things like time.Time
-				return model.NewBuiltinType(pkg, name, Required), nil
+				return model.NewBuiltinType(pkg, name), nil
 			}
 		} else {
 			if model.IsBuiltinType(name) {
-				return model.NewBuiltinType(pkg, name, Required), nil
+				return model.NewBuiltinType(pkg, name), nil
 			}
 		}
 
@@ -1848,21 +1963,21 @@ func typeOf(t types.Type, req *bool, mem map[string]model.Type, p *packages.Pack
 
 		switch u := t.Underlying().(type) {
 		case *types.Basic:
-			return model.NewAliasType(pkg, name, model.NewBuiltinType("", u.Name(), tools.OrPtr(req, Required)), position), nil
+			return model.NewAliasType(pkg, name, model.NewBuiltinType("", u.Name()), position), nil
 		case *types.Interface:
-			return model.NewInterfaceType(pkg, name, position, tools.OrPtr(req, Required)), nil
+			return model.NewInterfaceType(pkg, name, position), nil
 		case *types.Map:
-			r, err := mapOf(u, tools.OrPtr(req, NotRequired), mem, p)
+			r, err := mapOf(u, mem, p)
 			return r, err
 		case *types.Array:
-			r, err := arrayOf(u.Elem(), tools.OrPtr(req, NotRequired), mem, p)
+			r, err := arrayOf(u.Elem(), mem, p)
 			return r, err
 		case *types.Slice:
-			r, err := arrayOf(u.Elem(), tools.OrPtr(req, NotRequired), mem, p)
+			r, err := arrayOf(u.Elem(), mem, p)
 			return r, err
 		case *types.Pointer:
 			// pointer denotes that it's optional, unless it's explicitly marked as required or not required through annotations or other conventions
-			return typeOf(u.Elem(), tools.OrPtr(req, NotRequired), mem, p)
+			return typeOf(u.Elem(), mem, p)
 		case *types.Struct:
 			id := fmt.Sprintf("%s.%s", pkg, name)
 			if ex, ok := mem[id]; ok {
@@ -1884,7 +1999,7 @@ func typeOf(t types.Type, req *bool, mem map[string]model.Type, p *packages.Pack
 			// add the struct with an empty list of fields into the memory (mem) to avoid
 			// endless looping when attempting to resolve the type using typeOf(), in case
 			// of circular references
-			r := model.NewStructType(pkg, name, fields, summary, description, position, tools.OrPtr(req, Required))
+			r := model.NewStructType(pkg, name, fields, summary, description, position)
 			mem[id] = r
 			{
 				name := nameType(t.Obj())
@@ -1900,7 +2015,7 @@ func typeOf(t types.Type, req *bool, mem map[string]model.Type, p *packages.Pack
 					fieldInRequest := fieldInRequest(f.tag)
 					fieldInResponse := fieldInResponse(f.tag)
 					fieldSummary := strings.Join(findComments(name+"."+f.name, f.pos, token.VAR, p), "\n") // TODO process comments for fields
-					if typ, err := typeOf(f.typ, fieldReq, mem, p); err != nil {
+					if typ, err := typeOf(f.typ, mem, p); err != nil {
 						return nil, err
 					} else {
 						fields = append(fields, model.NewField(f.name, attr, typ, f.tag, fieldSummary, fieldReq, fieldInRequest, fieldInResponse))
@@ -1908,27 +2023,27 @@ func typeOf(t types.Type, req *bool, mem map[string]model.Type, p *packages.Pack
 				}
 			}
 			// and now overwrite the struct type with a definition that contains the fields
-			r = model.NewStructType(pkg, name, fields, summary, description, position, tools.OrPtr(req, Required))
+			r = model.NewStructType(pkg, name, fields, summary, description, position)
 			mem[id] = r
 			return r, nil
 		default:
 			return nil, fmt.Errorf("typeOf: unsupported underlying type of named %s.%s is a %T: %#v", pkg, name, u, u)
 		}
 	case *types.Basic:
-		return model.NewBuiltinType("", t.Name(), tools.OrPtr(req, Required)), nil
+		return model.NewBuiltinType("", t.Name()), nil
 	case *types.Map:
-		return mapOf(t, tools.OrPtr(req, NotRequired), mem, p)
+		return mapOf(t, mem, p)
 	case *types.Array:
-		return arrayOf(t.Elem(), tools.OrPtr(req, NotRequired), mem, p)
+		return arrayOf(t.Elem(), mem, p)
 	case *types.Slice:
-		return arrayOf(t.Elem(), tools.OrPtr(req, NotRequired), mem, p)
+		return arrayOf(t.Elem(), mem, p)
 	case *types.Pointer:
-		return typeOf(t.Elem(), tools.OrPtr(req, NotRequired), mem, p)
+		return typeOf(t.Elem(), mem, p)
 	case *types.Alias:
-		return aliasOf(t, req, mem, p)
+		return aliasOf(t, mem, p)
 	case *types.Interface:
 		if t.String() == "any" {
-			return model.NewAnyType(tools.OrPtr(req, NotRequired)), nil
+			return model.AnyType, nil
 		} else {
 			return nil, fmt.Errorf("typeOf: unsupported: using an interface type that isn't any: %T: %#v", t, t)
 		}
@@ -1960,6 +2075,11 @@ func fieldAttr(tag string) string {
 		return ""
 	}
 }
+
+var (
+	Required    = tools.BoolPtr(true)
+	NotRequired = tools.BoolPtr(false)
+)
 
 func fieldRequirement(tag string) *bool {
 	if m := tagDocRegex.FindAllStringSubmatch(tag, 1); m != nil {
@@ -2042,28 +2162,28 @@ func decompose(name string, u *types.Struct, level int, p *packages.Package) ([]
 	return structFields, nil
 }
 
-func arrayOf(t types.Type, req *bool, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
-	if e, err := typeOf(t, req, mem, p); err != nil {
+func arrayOf(t types.Type, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
+	if e, err := typeOf(t, mem, p); err != nil {
 		return nil, err
 	} else {
-		return model.NewArrayType(e, req), nil
+		return model.NewArrayType(e), nil
 	}
 }
 
-func mapOf(t *types.Map, req *bool, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
-	if k, err := typeOf(t.Key(), req, mem, p); err != nil {
+func mapOf(t *types.Map, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
+	if k, err := typeOf(t.Key(), mem, p); err != nil {
 		return nil, err
 	} else {
-		if v, err := typeOf(t.Elem(), req, mem, p); err != nil {
+		if v, err := typeOf(t.Elem(), mem, p); err != nil {
 			return nil, err
 		} else {
-			return model.NewMapType(k, v, req), nil
+			return model.NewMapType(k, v), nil
 		}
 	}
 }
 
-func aliasOf(t *types.Alias, req *bool, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
-	if e, err := typeOf(t.Underlying(), req, mem, p); err != nil {
+func aliasOf(t *types.Alias, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
+	if e, err := typeOf(t.Underlying(), mem, p); err != nil {
 		return nil, err
 	} else {
 		name, pkg := typeNames(t.Obj())
