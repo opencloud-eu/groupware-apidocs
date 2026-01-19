@@ -119,6 +119,67 @@ func (r renderedExample) forResponse() *yaml.Node {
 	return r.defaultExample
 }
 
+func renderExamples(qualified model.Examples, patcher func(*yaml.Node) *yaml.Node) map[string]renderedExample {
+	defaultExampleByKey := map[string]*yaml.Node{}
+	requestExampleByKey := map[string]*yaml.Node{}
+	for _, e := range qualified.DefaultExamples {
+		if n, err := renderExample(e.Text); err != nil {
+			panic(fmt.Errorf("failed to render default example for '%s': %w", e.Key, err))
+		} else {
+			defaultExampleByKey[e.Key] = n
+		}
+	}
+	for _, e := range qualified.RequestExamples {
+		if n, err := renderExample(e.Text); err != nil {
+			panic(fmt.Errorf("failed to render request example for '%s': %w", e.Key, err))
+		} else {
+			requestExampleByKey[e.Key] = n
+		}
+	}
+
+	keys := tools.UniqKeys(defaultExampleByKey, requestExampleByKey)
+	result := map[string]renderedExample{}
+	for _, k := range keys {
+		rendered := renderedExample{}
+		if defaultExample, ok := defaultExampleByKey[k]; ok {
+			rendered.defaultExample = defaultExample
+			if requestExample, ok := requestExampleByKey[k]; ok {
+				rendered.requestExample = requestExample
+			}
+		} else {
+			panic(fmt.Errorf("no default example for '%s'", k))
+		}
+		result[k] = rendered
+	}
+	return result
+}
+
+func renderExamplesAsArrays(qualified model.Examples) map[string]renderedExample {
+	return renderExamples(qualified, func(s *yaml.Node) *yaml.Node {
+		ary := yaml.Node{
+			Kind: yaml.SequenceNode,
+		}
+		ary.Content = []*yaml.Node{s}
+		return &ary
+	})
+}
+
+func renderExamplesAsMaps(key string, qualified model.Examples) map[string]renderedExample {
+	return renderExamples(qualified, func(s *yaml.Node) *yaml.Node {
+		dict := yaml.Node{
+			Kind: yaml.MappingNode,
+			Tag:  "!!map",
+		}
+		keyNode := yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Tag:   "!!str",
+			Value: key,
+		}
+		dict.Content = []*yaml.Node{&keyNode, s}
+		return &dict
+	})
+}
+
 func renderExample(text string) (*yaml.Node, error) {
 	var data yaml.Node
 	{
@@ -153,25 +214,30 @@ func renderObj(value any) (*yaml.Node, error) {
 	}
 }
 
-func patchExampleIntoSchema(name string, example model.Example, schema *highbase.Schema) error {
+func patchExampleIntoSchema(name string, examples []model.Example, schema *highbase.Schema) error {
 	if !schemaPropertiesExamples {
 		return nil
 	}
+	if len(examples) < 1 {
+		return nil
+	}
 	t := map[string]any{}
-	if err := json.Unmarshal([]byte(example.Text), &t); err != nil {
-		return fmt.Errorf("bodyparams: failed to unmarshall example JSON payload: %w", err)
-	} else {
-		if value, ok := t[name]; ok {
-			examples := schema.Examples
-			if examples == nil {
-				examples = []*yaml.Node{}
+	for _, example := range examples {
+		if err := json.Unmarshal([]byte(example.Text), &t); err != nil {
+			return fmt.Errorf("bodyparams: failed to unmarshall example JSON payload: %w", err)
+		} else {
+			if value, ok := t[name]; ok {
+				examples := schema.Examples
+				if examples == nil {
+					examples = []*yaml.Node{}
+				}
+				if ser, err := renderObj(value); err != nil {
+					return fmt.Errorf("bodyparams: failed to marshall example JSON payload for attribute: %w", err)
+				} else {
+					examples = append(examples, ser)
+				}
+				schema.Examples = examples
 			}
-			if ser, err := renderObj(value); err != nil {
-				return fmt.Errorf("bodyparams: failed to marshall example JSON payload for attribute: %w", err)
-			} else {
-				examples = append(examples, ser)
-			}
-			schema.Examples = examples
 		}
 	}
 	return nil
@@ -200,25 +266,14 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 	imMap := tools.Index(m.Impls, func(i model.Impl) string { return i.Name })
 	routesByPath := tools.IndexMany(m.Routes, func(r model.Endpoint) string { return r.Path })
 	renderedExampleMap := map[string]renderedExample{}
-	for name, qualified := range m.Examples {
-		rendered := renderedExample{}
-		if n, err := renderExample(qualified.DefaultExample.Text); err != nil {
-			panic(fmt.Errorf("failed to render default example for '%s': %w", name, err))
-		} else {
-			rendered.defaultExample = n
-		}
-		if qualified.RequestExample != nil {
-			if n, err := renderExample(qualified.RequestExample.Text); err != nil {
-				panic(fmt.Errorf("failed to render request example for '%s': %w", name, err))
-			} else {
-				rendered.requestExample = n
-			}
-		}
-		renderedExampleMap[name] = rendered
+	for _, qualified := range m.Examples {
+		maps.Copy(renderedExampleMap, renderExamples(qualified, tools.Identity))
 	}
 
 	pathItemMap := orderedmap.New[string, *v3.PathItem]()
 	schemaComponentTypes := map[string]model.Type{} // collects items that need to be documented in /components/schemas
+	neededArrayExamples := map[string]bool{}
+	neededMapExamples := map[string]bool{}
 
 	pathKeys := slices.Collect(maps.Keys(routesByPath))
 	slices.Sort(pathKeys)
@@ -274,17 +329,14 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 					// common header parameters
 					for _, h := range m.CommonRequestHeaders {
-						req := false
-						if h.Required {
-							req = true
-						}
 						schemaRef := highbase.CreateSchemaProxy(stringSchema(h.Description))
 						param := &v3.Parameter{
 							Name:        h.Name,
 							In:          "header",
 							Schema:      schemaRef,
 							Description: h.Description,
-							Required:    &req,
+							Required:    &h.Required,
+							Explode:     &h.Exploded,
 						}
 						if len(h.Examples) > 0 {
 							examples := orderedmap.New[string, *highbase.Example]()
@@ -307,7 +359,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 					}
 
 					// responses
-					if responses, err := res.responses(im, m, schemaComponentTypes); err != nil {
+					if responses, err := res.responses(im, m, schemaComponentTypes, neededArrayExamples, neededMapExamples); err != nil {
 						return err
 					} else if responses != nil {
 						op.Responses = responses
@@ -507,18 +559,75 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 	componentExamples := orderedmap.New[string, *highbase.Example]()
 	{
-		for name, examples := range m.Examples {
-			example, _ := examples.ForResponse()
-			rendered := renderedExampleMap[name].forResponse()
-			componentExamples.Set(name, &highbase.Example{
-				Summary:     name,
-				Description: example.Title,
-				Value:       rendered,
-				Extensions: ext2(
-					"oc-example-source-file", example.Origin,
-					"oc-example-scope", string(ResponseScope),
-				),
-			})
+		for _, examples := range m.Examples {
+			if list, ok := examples.ForResponse(); ok {
+				for _, e := range list {
+					rendered := renderedExampleMap[e.Key].forResponse()
+					// e.Key is e.g. "jmap.Identity:default"
+					componentExamples.Set(e.Key, &highbase.Example{
+						//Summary:     name, // not used
+						Description: e.Title,
+						Value:       rendered,
+						Extensions: ext3(
+							"oc-example-key", e.Key,
+							"oc-example-origin", e.Origin,
+							"oc-example-scope", string(ResponseScope),
+						),
+					})
+				}
+			}
+		}
+
+		for name := range neededArrayExamples {
+			if examples, ok := m.Examples[name]; ok {
+				rendereds := renderExamplesAsArrays(examples)
+				maps.Copy(renderedExampleMap, rendereds)
+
+				if list, ok := examples.ForResponse(); ok {
+					for _, e := range list {
+						rendered := rendereds[e.Key].forResponse()
+						key := "[]" + e.Key
+						componentExamples.Set(key, &highbase.Example{
+							// Summary:     "Array of " + name, // not used
+							Description: e.Title,
+							Value:       rendered,
+							Extensions: ext4(
+								"oc-example-key", e.Key,
+								"oc-example-origin", e.Origin,
+								"oc-example-scope", string(ResponseScope),
+								"oc-example-auto", "array",
+							),
+						})
+
+					}
+				}
+			}
+		}
+
+		for name := range neededMapExamples {
+			if examples, ok := m.Examples[name]; ok {
+				rendereds := renderExamplesAsMaps("key", examples)
+				maps.Copy(renderedExampleMap, rendereds)
+
+				if list, ok := examples.ForResponse(); ok {
+					for _, e := range list {
+						rendered := rendereds[e.Key].forResponse()
+						key := "map[string]" + e.Key
+						componentExamples.Set(key, &highbase.Example{
+							// Summary:     "Array of " + name, // not used
+							Description: e.Title,
+							Value:       rendered,
+							Extensions: ext4(
+								"oc-example-key", e.Key,
+								"oc-example-origin", e.Origin,
+								"oc-example-scope", string(ResponseScope),
+								"oc-example-auto", "map",
+							),
+						})
+
+					}
+				}
+			}
 		}
 	}
 
@@ -824,6 +933,23 @@ func ext2(k1, v1, k2, v2 string) *orderedmap.Map[string, *yaml.Node] {
 	ext := orderedmap.New[string, *yaml.Node]()
 	ext.Set(k1, &yaml.Node{Kind: yaml.ScalarNode, Value: v1})
 	ext.Set(k2, &yaml.Node{Kind: yaml.ScalarNode, Value: v2})
+	return ext
+}
+
+func ext3(k1, v1, k2, v2, k3, v3 string) *orderedmap.Map[string, *yaml.Node] {
+	ext := orderedmap.New[string, *yaml.Node]()
+	ext.Set(k1, &yaml.Node{Kind: yaml.ScalarNode, Value: v1})
+	ext.Set(k2, &yaml.Node{Kind: yaml.ScalarNode, Value: v2})
+	ext.Set(k3, &yaml.Node{Kind: yaml.ScalarNode, Value: v3})
+	return ext
+}
+
+func ext4(k1, v1, k2, v2, k3, v3, k4, v4 string) *orderedmap.Map[string, *yaml.Node] {
+	ext := orderedmap.New[string, *yaml.Node]()
+	ext.Set(k1, &yaml.Node{Kind: yaml.ScalarNode, Value: v1})
+	ext.Set(k2, &yaml.Node{Kind: yaml.ScalarNode, Value: v2})
+	ext.Set(k3, &yaml.Node{Kind: yaml.ScalarNode, Value: v3})
+	ext.Set(k4, &yaml.Node{Kind: yaml.ScalarNode, Value: v4})
 	return ext
 }
 

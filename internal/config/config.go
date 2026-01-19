@@ -13,7 +13,7 @@ const (
 	JSCalendarPackageID = "github.com/opencloud-eu/opencloud/pkg/jscalendar"
 	JSContactPacakgeID  = "github.com/opencloud-eu/opencloud/pkg/jscontact"
 
-	HttpPackageID = "net/http"
+	NetHttpPackageID = "net/http"
 )
 
 var SourceDirectories = []string{

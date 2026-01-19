@@ -17,6 +17,63 @@ import (
 	"opencloud.eu/groupware-apidocs/internal/tools"
 )
 
+func isFQMethodCall(call *ast.CallExpr, pkg *packages.Package,
+	pkgPath string,
+	objNamePredicate func(string) bool,
+	funcNamePredicate func(string) bool) bool {
+	_, _, _, ok := expandFQMethodCall(call, pkg, pkgPath, objNamePredicate, funcNamePredicate)
+	return ok
+}
+
+func expandFQMethodCall(call *ast.CallExpr, pkg *packages.Package,
+	pkgPath string,
+	objNamePredicate func(string) bool,
+	funcNamePredicate func(string) bool) (string, string, string, bool) {
+	if s, ok := isSelector(call.Fun); ok {
+		if i, ok := isIdent(s.Sel); ok {
+			if funcNamePredicate(i.Name) {
+				if sel, ok := pkg.TypesInfo.Selections[s]; ok {
+					t := sel.Recv()
+					if p, ok := isPointer(t); ok {
+						t = p.Elem()
+					}
+					if n, ok := isNamed(t); ok && objNamePredicate(n.Obj().Name()) {
+						if pkgPath == "" && n.Obj().Pkg() == nil {
+							return "", n.Obj().Name(), i.Name, true
+						} else if n.Obj().Pkg() != nil && n.Obj().Pkg().Path() == pkgPath {
+							return n.Obj().Pkg().Path(), n.Obj().Name(), i.Name, true
+						}
+					}
+				}
+			}
+		}
+	}
+	return "", "", "", false
+}
+
+func isFQFuncDecl(decl ast.Decl, pkg *packages.Package, objname string, fname string) *ast.FuncDecl {
+	switch f := decl.(type) {
+	case *ast.FuncDecl:
+		if f.Name.Name == fname {
+			if d, ok := pkg.TypesInfo.Defs[f.Name]; ok {
+				switch ff := d.(type) {
+				case *types.Func:
+					t := ff.Signature().Recv().Type()
+					if p, ok := isPointer(t); ok {
+						t = p.Elem()
+					}
+					if n, ok := isNamed(t); ok {
+						if n.Obj().Name() == objname {
+							return f
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func isMethodCall(call *ast.CallExpr, pkg string, method string) bool {
 	if s, ok := isSelector(call.Fun); ok {
 		if x, ok := isIdent(s.X); ok && s.Sel.Name == method && x.Obj != nil {
@@ -349,6 +406,14 @@ func isInt(expr ast.Expr) (int, bool, error) {
 	return 0, false, nil
 }
 
+func isPointer(expr types.Type) (*types.Pointer, bool) {
+	switch p := expr.(type) {
+	case *types.Pointer:
+		return p, true
+	}
+	return nil, false
+}
+
 func isNamed(expr types.Type) (*types.Named, bool) {
 	switch n := expr.(type) {
 	case *types.Named:
@@ -544,4 +609,20 @@ func findGroupwareErrorDefinitions(s ast.Spec, groupwareErrorType model.Type, er
 		}
 	}
 	return m, nil
+}
+
+func seqp(s string) func(string) bool {
+	return func(str string) bool { return str == s }
+}
+
+func contp[T comparable](s []T) func(T) bool {
+	return func(e T) bool { return slices.Contains(s, e) }
+}
+
+func truep[T any]() func(T) bool {
+	return func(T) bool { return true }
+}
+
+func falsep[T any]() func(T) bool {
+	return func(T) bool { return false }
 }

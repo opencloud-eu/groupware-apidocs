@@ -90,50 +90,35 @@ func endpoints(base string, stmts []ast.Stmt, pkg string) ([]model.Endpoint, err
 	return result, nil
 }
 
-type GlobalParamDecls struct {
-	pathParams   map[string]model.Param
-	queryParams  map[string]model.Param
-	headerParams map[string]model.Param
+type GlobalParamDefinitions struct {
+	pathParams   map[string]model.ParamDefinition
+	queryParams  map[string]model.ParamDefinition
+	headerParams map[string]model.ParamDefinition
 }
 
-func scrapeGlobalParamDecls(decls []ast.Decl) (GlobalParamDecls, error) {
-	pathParams := map[string]model.Param{}
-	queryParams := map[string]model.Param{}
-	headerParams := map[string]model.Param{}
+func scrapeGlobalParamDecls(decls []ast.Decl) (GlobalParamDefinitions, error) {
+	pathParams := map[string]model.ParamDefinition{}
+	queryParams := map[string]model.ParamDefinition{}
+	headerParams := map[string]model.ParamDefinition{}
 	for _, decl := range decls {
 		if list, err := consts(decl); err != nil {
-			return GlobalParamDecls{}, err
+			return GlobalParamDefinitions{}, err
 		} else {
 			for _, c := range list {
 				if tools.HasAnyPrefix(c.Name, config.PathParamPrefixes) {
 					desc := describeParam(c.Comments)
-					pathParams[c.Name] = model.NewParam(
-						c.Value,
-						desc,
-						model.StringType,
-						true,
-					)
+					pathParams[c.Name] = model.NewParamDefinition(c.Value, desc)
 				} else if tools.HasAnyPrefix(c.Name, config.QueryParamPrefixes) {
 					desc := describeParam(c.Comments)
-					queryParams[c.Name] = model.NewParam(
-						c.Value,
-						desc,
-						model.StringType, // TODO parse query param definition to determine its type and whether it's required; query parameters are not required by default
-						false,            // TODO parse query param definition to determine whether it's required; query parameters are not required by default
-					)
+					queryParams[c.Name] = model.NewParamDefinition(c.Value, desc)
 				} else if tools.HasAnyPrefix(c.Name, config.HeaderParamPrefixes) {
 					desc := describeParam(c.Comments)
-					headerParams[c.Name] = model.NewParam(
-						c.Value,
-						desc,
-						model.StringType, // TODO parse header param definition to determine its type and whether it's required; header parameters are not required by default
-						false,            // TODO parse query param definition to determine whether it's required; header parameters are not required by default
-					)
+					headerParams[c.Name] = model.NewParamDefinition(c.Value, desc)
 				}
 			}
 		}
 	}
-	return GlobalParamDecls{
+	return GlobalParamDefinitions{
 		pathParams:   pathParams,
 		queryParams:  queryParams,
 		headerParams: headerParams,
@@ -414,7 +399,6 @@ func summarizeEndpoint(verb string, path string, comments []string) (string, str
 }
 
 type responseFunc struct {
-	hasBody    bool
 	bodyArgPos int
 	statusCode int
 }
@@ -422,7 +406,7 @@ type responseFunc struct {
 type returnVisitor struct {
 	fset                    *token.FileSet
 	typeMap                 map[string]model.Type
-	pkg                     *packages.Package
+	groupwarePkg            *packages.Package
 	responses               map[int]model.Resp
 	successfulResponseFuncs map[string]responseFunc
 	potentialErrors         map[string]bool
@@ -430,10 +414,10 @@ type returnVisitor struct {
 	errs                    *[]error
 }
 
-func newReturnVisitor(fset *token.FileSet, pkg *packages.Package, typeMap map[string]model.Type, successfulResponseFuncs map[string]responseFunc) returnVisitor {
+func newReturnVisitor(fset *token.FileSet, groupwarePkg *packages.Package, typeMap map[string]model.Type, successfulResponseFuncs map[string]responseFunc) returnVisitor {
 	return returnVisitor{
 		fset:                    fset,
-		pkg:                     pkg,
+		groupwarePkg:            groupwarePkg,
 		typeMap:                 typeMap,
 		responses:               map[int]model.Resp{},
 		potentialErrors:         map[string]bool{},
@@ -505,7 +489,7 @@ func (v returnVisitor) isErrorResponseFunc(r *ast.ReturnStmt) bool {
 		} else if ident, ok := isIdent(result); ok {
 			//obj := v.pkg.TypesInfo.Uses[ident]
 			//tv := v.pkg.TypesInfo.Defs[ident]
-			if t, ok := v.pkg.TypesInfo.Types[ident]; ok {
+			if t, ok := v.groupwarePkg.TypesInfo.Types[ident]; ok {
 				if t.Type != nil {
 					if n, ok := isNamed(t.Type); ok {
 						if n.Obj() != nil && n.Obj().Name() == "Response" && n.Obj().Pkg() != nil && n.Obj().Pkg().Name() == "groupware" {
@@ -513,7 +497,7 @@ func (v returnVisitor) isErrorResponseFunc(r *ast.ReturnStmt) bool {
 							case *ast.AssignStmt:
 								for _, rhs := range decl.Rhs {
 									if call, ok := isCallExpr(rhs); ok {
-										if p, neededType, ok := isNeedAccountCall(call, v.pkg); ok && p.Required {
+										if p, neededType, ok := isNeedAccountCall(call, v.groupwarePkg); ok && p.Required {
 											v.potentialErrors[MissingAccountError] = true
 											if moreErrs, ok := MissingObjTypeErrors[neededType]; ok {
 												for _, e := range moreErrs {
@@ -545,14 +529,14 @@ func (v returnVisitor) isSuccessfulResponseFunc(r *ast.ReturnStmt) (ast.Expr, st
 			for f, spec := range v.successfulResponseFuncs {
 				if i.Name == f {
 					summary := ""
-					if cg := findInlineComment(c.Pos(), v.pkg); cg != nil && len(cg.List) > 0 {
+					if cg := findInlineComment(c.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
 						summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
 					}
-					if spec.hasBody {
-						return c.Args[spec.bodyArgPos], summary, spec.statusCode, true
-					} else {
-						return nil, summary, spec.statusCode, true
+					var body ast.Expr = nil
+					if spec.bodyArgPos >= 0 {
+						body = c.Args[spec.bodyArgPos]
 					}
+					return body, summary, spec.statusCode, true
 				}
 			}
 		}
@@ -561,9 +545,9 @@ func (v returnVisitor) isSuccessfulResponseFunc(r *ast.ReturnStmt) (ast.Expr, st
 }
 
 func (v returnVisitor) resolveIdent(x *ast.Ident) (model.Type, error) {
-	z, ok := v.pkg.TypesInfo.Uses[x]
+	z, ok := v.groupwarePkg.TypesInfo.Uses[x]
 	if !ok {
-		z, ok = v.pkg.TypesInfo.Defs[x]
+		z, ok = v.groupwarePkg.TypesInfo.Defs[x]
 	}
 	if !ok {
 		return nil, fmt.Errorf("failed to find in TypesInfo.Uses or TypesInfo.Defs: %#v", x)
@@ -580,7 +564,7 @@ func (v returnVisitor) resolveType(t types.Type) (model.Type, error) {
 		name = nameType(n.Obj())
 		pos = n.Obj().Pos()
 	}
-	r, err := typeOf(t, v.typeMap, v.pkg)
+	r, err := typeOf(t, v.typeMap, v.groupwarePkg)
 	if err != nil {
 		return nil, err
 	}
@@ -589,7 +573,7 @@ func (v returnVisitor) resolveType(t types.Type) (model.Type, error) {
 	} else {
 		if r.Summary() == "" {
 			if name != "" {
-				v.undocumented[name] = v.pkg.Fset.Position(pos)
+				v.undocumented[name] = v.groupwarePkg.Fset.Position(pos)
 			}
 		}
 	}
@@ -623,7 +607,7 @@ func (v returnVisitor) deduceArgType(code int, arg ast.Expr) (int, model.Type, e
 				key := t.Obj.Name
 				if !strings.Contains(key, ".") {
 					if !model.IsBuiltinType(key) {
-						key = v.pkg.Name + "." + key
+						key = v.groupwarePkg.Name + "." + key
 					}
 				}
 				if m, ok := v.typeMap[key]; ok {
@@ -704,7 +688,7 @@ func (v returnVisitor) deduceArgType(code int, arg ast.Expr) (int, model.Type, e
 			case *ast.FuncDecl:
 				if d.Type.Results != nil && len(d.Type.Results.List) > 0 {
 					ret := d.Type.Results.List[0].Type
-					if tv, ok := v.pkg.TypesInfo.Types[ret]; ok {
+					if tv, ok := v.groupwarePkg.TypesInfo.Types[ret]; ok {
 						if t, err := v.resolveType(tv.Type); err != nil {
 							return 0, nil, err
 						} else if t == nil {
@@ -728,7 +712,7 @@ func (v returnVisitor) deduceArgType(code int, arg ast.Expr) (int, model.Type, e
 	case *ast.IndexExpr:
 		switch x := arg.X.(type) {
 		case *ast.SelectorExpr:
-			if sel, ok := v.pkg.TypesInfo.Selections[x]; ok {
+			if sel, ok := v.groupwarePkg.TypesInfo.Selections[x]; ok {
 				p := sel.Obj().Type()
 				switch u := p.(type) {
 				case *types.Slice:
@@ -746,13 +730,13 @@ func (v returnVisitor) deduceArgType(code int, arg ast.Expr) (int, model.Type, e
 					return 0, nil, fmt.Errorf("sel is not a slice")
 				}
 			} else {
-				def, ok := v.pkg.TypesInfo.Defs[x.Sel]
+				def, ok := v.groupwarePkg.TypesInfo.Defs[x.Sel]
 				if ok {
 					buf := new(bytes.Buffer)
 					ast.Fprint(buf, v.fset, arg, nil)
 					log.Printf("definition of %s:\n%s", x.X.(*ast.Ident).Name, def.Name())
 				} else {
-					tv, ok := v.pkg.TypesInfo.Types[x.Sel]
+					tv, ok := v.groupwarePkg.TypesInfo.Types[x.Sel]
 					if !ok {
 						return 0, nil, fmt.Errorf("failed to find something")
 					}
@@ -799,7 +783,7 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 type paramsVisitor struct {
 	fset                      *token.FileSet
 	fun                       string
-	pkg                       *packages.Package
+	groupwarePkg              *packages.Package
 	typeMap                   map[string]model.Type
 	headerParams              map[string]model.Param
 	queryParams               map[string]model.Param
@@ -813,11 +797,11 @@ type paramsVisitor struct {
 	errs                      *[]error
 }
 
-func newParamsVisitor(fset *token.FileSet, pkg *packages.Package, fun string, typeMap map[string]model.Type, responseFuncs map[string]responseFunc) paramsVisitor {
+func newParamsVisitor(fset *token.FileSet, groupwarePkg *packages.Package, fun string, typeMap map[string]model.Type, responseFuncs map[string]responseFunc) paramsVisitor {
 	return paramsVisitor{
 		fset:                      fset,
 		fun:                       fun,
-		pkg:                       pkg,
+		groupwarePkg:              groupwarePkg,
 		typeMap:                   typeMap,
 		headerParams:              map[string]model.Param{},
 		queryParams:               map[string]model.Param{},
@@ -832,86 +816,67 @@ func newParamsVisitor(fset *token.FileSet, pkg *packages.Package, fun string, ty
 	}
 }
 
-type param struct {
-	Name     string
-	TypeId   string
-	Summary  string
-	Required bool
-}
+func (v paramsVisitor) isBodyCall(call *ast.CallExpr) (model.Param, bool, error) {
+	if len(call.Args) != 1 && len(call.Args) != 2 {
+		return model.Param{}, false, nil
+	}
 
-func (v paramsVisitor) isBodyCall(call *ast.CallExpr) (param, bool, error) {
-	// TODO if needed, implement a way for body parameters to be optional
-	required := true // body parameters are required by default
+	_, _, funcName, ok := expandFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), contp([]string{"body", "bodydoc"}))
+	if !ok {
+		return model.Param{}, false, nil
+	}
+
+	required := true  // TODO if needed, implement a way for body parameters to be optional; body parameters are required by default
+	exploded := false // TODO body parameters typically aren't exploded since they are JSON payloads but implement something if needed
+	var bodyArg ast.Expr
+	var descArg ast.Expr
+	if funcName == "body" && len(call.Args) == 1 {
+		bodyArg = call.Args[0]
+	} else if funcName == "bodydoc" && len(call.Args) == 2 {
+		bodyArg = call.Args[0]
+		descArg = call.Args[1]
+	} else {
+		return model.Param{}, false, nil
+	}
+
 	desc := ""
-	// TODO if needed, implement a way for body parameters to be optional
-	if s, ok := isSelector(call.Fun); ok {
-		if x, ok := isIdent(s.X); ok {
-			if s.Sel.Name == "body" && len(call.Args) == 1 && x.Obj != nil {
-				if f, ok := isField(x.Obj.Decl); ok {
-					if t, ok := isIdent(f.Type); ok && t.Name == "Request" {
-						a := call.Args[0]
-						switch e := a.(type) {
-						case *ast.UnaryExpr:
-							if x, ok := isIdent(e.X); ok && e.Op == token.AND && x.Obj != nil {
-								if vs, ok := isValueSpec(x.Obj.Decl); ok {
-									if n, err := nameOf(vs.Type, v.pkg.Name); err == nil {
-										return param{Name: n, TypeId: n, Summary: desc, Required: required}, true, nil
-									} else {
-										return param{}, false, err
-									}
-								} else {
-									return param{}, false, fmt.Errorf("unsupported call to Request.body(): UnaryExpr argument is not an Ident but a %v", e)
-								}
-							}
-						default:
-							return param{}, false, fmt.Errorf("unsupported call to Request.body(): is not a UnaryExpr but a %v", e)
-						}
-					} else {
-						return param{}, false, fmt.Errorf("call to body() but not on a Request: %v", f)
-					}
-				} else {
-					return param{}, false, fmt.Errorf("call to body() but is not a field: %v", x.Obj)
-				}
-			} else if s.Sel.Name == "bodydoc" && len(call.Args) == 2 && x.Obj != nil {
-				if f, ok := isField(x.Obj.Decl); ok {
-					if t, ok := isIdent(f.Type); ok && t.Name == "Request" {
-						a := call.Args[0]
-						switch e := a.(type) {
-						case *ast.UnaryExpr:
-							if x, ok := isIdent(e.X); ok && e.Op == token.AND && x.Obj != nil {
-								if vs, ok := isValueSpec(x.Obj.Decl); ok {
-									if n, err := nameOf(vs.Type, v.pkg.Name); err == nil {
-										if b, ok := isString(call.Args[1]); ok {
-											desc = b
-										}
-										return param{Name: n, TypeId: n, Summary: desc, Required: required}, true, nil
-									} else {
-										return param{}, false, err
-									}
-								} else {
-									return param{}, false, fmt.Errorf("unsupported call to Request.bodydoc(): UnaryExpr argument is not an Ident but a %v", e)
-								}
-							}
-						default:
-							return param{}, false, fmt.Errorf("unsupported call to Request.bodydoc(): is not a UnaryExpr but a %v", e)
-						}
-					} else {
-						return param{}, false, fmt.Errorf("call to bodydoc() but not on a Request: %v", f)
-					}
-				} else {
-					return param{}, false, fmt.Errorf("call to bodydoc() but is not a field: %v", x.Obj)
-				}
-			}
+	if descArg != nil {
+		if value, ok := isString(descArg); ok {
+			desc = value
+		} else {
+			return model.Param{}, false, fmt.Errorf("unsupported call to Request.bodydoc(): description argument is not a BasicLit STRING but a STRING %T: %v", descArg, descArg)
 		}
 	}
-	return param{}, false, nil
+
+	switch a := bodyArg.(type) {
+	case *ast.UnaryExpr:
+		if ident, ok := isIdent(a.X); ok && a.Op == token.AND && ident.Obj != nil {
+			if vs, ok := isValueSpec(ident.Obj.Decl); ok {
+				if n, err := nameOf(vs.Type, v.groupwarePkg.Name); err == nil {
+					if typ, err := toType(n, v.typeMap); err != nil {
+						return model.Param{}, false, fmt.Errorf("failed to resolve type identifier '%s' from call to Request.body[doc]()", n)
+					} else {
+						return model.NewParam(n, desc, typ, required, exploded), true, nil
+					}
+				} else {
+					return model.Param{}, false, err
+				}
+			} else {
+				return model.Param{}, false, fmt.Errorf("unsupported call to Request.body[doc](): UnaryExpr argument is not an Ident but a %v", a)
+			}
+		} else {
+			return model.Param{}, false, fmt.Errorf("unsupported call to Request.body[doc](): UnaryExpr X is not an Ident but a %T: %v", a.X, a.X)
+		}
+	default:
+		return model.Param{}, false, fmt.Errorf("unsupported call to Request.body[doc](): argument is not a UnaryExpr but a %T: %v", a, a)
+	}
 }
 
 func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Resp, map[string]bool, map[string]token.Position, bool, error) {
 	if len(call.Args) == 3 && isMethodCall(call, "Groupware", "respond") {
 		arg := call.Args[2]
 		if c, ok := isClosure(arg); ok {
-			rv := newReturnVisitor(v.fset, v.pkg, v.typeMap, v.responseFuncs)
+			rv := newReturnVisitor(v.fset, v.groupwarePkg, v.typeMap, v.responseFuncs)
 			ast.Walk(rv, c)
 			if err := errors.Join(*rv.errs...); err != nil {
 				return nil, nil, nil, false, err
@@ -924,23 +889,25 @@ func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Resp, ma
 	return nil, nil, nil, false, nil
 }
 
-func isAccountCall(call *ast.CallExpr, p *packages.Package) (param, bool) {
+func isAccountCall(call *ast.CallExpr, p *packages.Package) (model.Param, bool) {
 	if len(call.Args) == 0 && isMethodCallPrefix(call, "Request", []string{"GetAccountFor", "GetAccountIdFor"}) {
 		required := true
+		exploded := false
 		summary := ""
 		if cg := findInlineComment(call.Pos(), p); cg != nil && cg.List != nil {
 			summary = strings.Join(lines(cg.List), "\n")
 		}
-		return param{Name: config.AccountIdUriParamName, TypeId: "string", Summary: summary, Required: required}, true
+		return model.NewParam(config.AccountIdUriParamName, summary, model.StringType, required, exploded), true
 	} else {
-		return param{}, false
+		return model.Param{}, false
 	}
 }
 
 var needObjectWithAccountCallRegex = regexp.MustCompile(`^need(Contact|Calendar|Task)WithAccount$`)
 
-func isNeedAccountCall(call *ast.CallExpr, p *packages.Package) (param, string, bool) {
+func isNeedAccountCall(call *ast.CallExpr, p *packages.Package) (model.Param, string, bool) {
 	required := true
+	exploded := false
 	if s, ok := isSelector(call.Fun); ok {
 		if x, ok := isIdent(s.X); ok && len(call.Args) == 0 && x.Obj != nil {
 			if m := needObjectWithAccountCallRegex.FindAllStringSubmatch(s.Sel.Name, 1); m != nil {
@@ -950,86 +917,126 @@ func isNeedAccountCall(call *ast.CallExpr, p *packages.Package) (param, string, 
 						if cg := findInlineComment(call.Pos(), p); cg != nil && cg.List != nil {
 							summary = strings.Join(lines(cg.List), "\n")
 						}
-						return param{Name: config.AccountIdUriParamName, TypeId: "string", Summary: summary, Required: required}, m[0][1], true
+						return model.NewParam(config.AccountIdUriParamName, summary, model.StringType, required, exploded), m[0][1], true
 					}
 				}
 			}
 		}
 	}
-	return param{}, "", false
+	return model.Param{}, "", false
 }
 
 var (
-	parseOptionalParamCallRegex  = regexp.MustCompile(`^(?:parse|get)([A-Z].*?)Param$`)
-	parseMandatoryParamCallRegex = regexp.MustCompile(`^(?:parse|get)Mandatory([A-Z].*?)Param$`)
+	parseOptionalParamCallRegex          = regexp.MustCompile(`^(?:parse|get)([A-Z].*?)Param$`)
+	parseMandatoryParamCallRegex         = regexp.MustCompile(`^(?:parse|get)Mandatory([A-Z].*?)Param$`)
+	parseOptionalSingleArgParamCallRegex = regexp.MustCompile(`^parseOpt([A-Z].*?)Param$`)
 )
 
 func (v paramsVisitor) isParseQueryParamCall(call *ast.CallExpr) (model.Param, bool, error) {
-	var re *regexp.Regexp = nil
+	typeDef := ""
+	summary := ""
 	required := false
-	switch len(call.Args) {
-	case 1:
-		re = parseMandatoryParamCallRegex
+	var nameArg ast.Expr
+	if m := isMethodCallRegex(call, "Request", parseOptionalSingleArgParamCallRegex, 1); m != nil {
+		typeDef = m[0][1]
+		required = false
+		nameArg = call.Args[0]
+	} else if m := isMethodCallRegex(call, "Request", parseMandatoryParamCallRegex, 1); m != nil {
+		typeDef = m[0][1]
 		required = true
-	case 2:
-		re = parseOptionalParamCallRegex
-	default:
-		return model.Param{}, false, nil
+		nameArg = call.Args[0]
+	} else if m := isMethodCallRegex(call, "Request", parseOptionalParamCallRegex, 1); m != nil {
+		typeDef = m[0][1]
+		required = false
+		nameArg = call.Args[0]
 	}
 
 	name := ""
-	if a, ok := isIdent(call.Args[0]); ok {
+	if a, ok := isIdent(nameArg); ok {
 		name = a.Name
 	} else {
 		return model.Param{}, false, nil
 	}
 
-	if m := isMethodCallRegex(call, "Request", re, 1); m != nil {
-		typeDef := m[0][1]
-		summary := ""
-		if cg := findInlineComment(call.Pos(), v.pkg); cg != nil && len(cg.List) > 0 {
-			summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
+	exploded := false
+	var typ model.Type = nil
+	if typeDef != "" {
+		switch typeDef {
+		case "String":
+			typ = model.StringType
+		case "Int":
+			typ = model.IntType
+		case "UInt":
+			typ = model.UIntType
+		case "Date":
+			typ = model.StringType
+		case "Bool":
+			typ = model.BoolType
+		case "StringList":
+			typ = model.NewArrayType(model.StringType)
+			exploded = true
+		case "Map":
+			typ = model.NewMapType(model.StringType, model.StringType)
+		default:
+			return model.Param{}, true, fmt.Errorf("unsupported type '%s' for query parameter through call to 'Request'", typeDef)
 		}
-		var typ model.Type = nil
-		{
-			switch typeDef {
-			case "String":
-				typ = model.StringType
-			case "Int":
-				typ = model.IntType
-			case "UInt":
-				typ = model.UIntType
-			case "Date":
-				typ = model.StringType
-			case "Bool":
-				typ = model.BoolType
-			case "Map":
-				typ = model.NewMapType(model.StringType, model.StringType)
-			default:
-				return model.Param{}, true, fmt.Errorf("unsupported type '%s' for query parameter through call to 'Request'", typeDef)
-			}
-		}
-		return model.NewParam(name, summary, typ, required), true, nil
+	} else if len(call.Args) == 1 && tools.HasAnyPrefix(name, config.QueryParamPrefixes) &&
+		isFQMethodCall(call, v.groupwarePkg, "net/url", seqp("Values"), seqp("Get")) {
+		required = false
+		typ = model.StringType
 	} else {
 		return model.Param{}, false, nil
 	}
+
+	if summary == "" {
+		if cg := findInlineComment(call.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
+			summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
+		}
+	}
+
+	// TODO resolve name (QueryParamXYZ) to its string value using model.QueryParams map
+
+	return model.NewParam(name, summary, typ, required, exploded), true, nil
+
 }
 
 func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (model.Param, bool) {
 	required := true
 	if len(call.Args) == 2 && isStaticFunc(call, "chi", "URLParam") {
 		if a, ok := isIdent(call.Args[1]); ok {
-			return model.NewParam(a.Name, "", nil, required), true
-		}
-	} else if len(call.Args) == 2 && isMethodCall(call, "Request", "PathParamDoc") {
-		if a, ok := isIdent(call.Args[0]); ok {
-			if b, ok := isString(call.Args[1]); ok {
-				return model.NewParam(a.Name, b, model.StringType, required), true
+			summary := ""
+			if cg := findInlineComment(call.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
+				summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
 			}
+			return model.NewParam(a.Name, summary, model.StringType, required, false), true
+		} else {
+			panic(fmt.Errorf("chi.URLParam first argument is not an Ident but a %T: %v", call.Args[0], call.Args[0]))
 		}
-	} else if len(call.Args) == 1 && isMethodCall(call, "Request", "PathParam") {
-		if a, ok := isIdent(call.Args[0]); ok {
-			return model.NewParam(a.Name, "", model.StringType, required), true
+	} else if _, _, f, ok := expandFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), contp([]string{"PathParam", "PathParamDoc", "PathListParamDoc"})); ok {
+		if f == "PathParam" && len(call.Args) == 1 {
+			if a, ok := isIdent(call.Args[0]); ok {
+				summary := ""
+				if cg := findInlineComment(call.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
+					summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
+				}
+				return model.NewParam(a.Name, summary, model.StringType, required, false), true
+			} else {
+				panic(fmt.Errorf("Request.%s first argument is not an Ident but a %T: %v", f, call.Args[0], call.Args[0]))
+			}
+		} else if len(call.Args) == 2 {
+			var typ model.Type = model.StringType
+			if strings.HasPrefix(f, "PathList") {
+				typ = model.NewArrayType(model.StringType)
+			}
+			if a, ok := isIdent(call.Args[0]); ok {
+				if desc, ok := isString(call.Args[1]); ok {
+					return model.NewParam(a.Name, desc, typ, required, true), true
+				} else {
+					panic(fmt.Errorf("Request.%s second argument is not a BasicLit STRING but a %T: %v", f, call.Args[1], call.Args[1]))
+				}
+			} else {
+				panic(fmt.Errorf("Request.%s first argument is not an Ident but a %T: %v", f, call.Args[0], call.Args[0]))
+			}
 		}
 	}
 	// TODO PathParam methods that also cast to a different type (int, ...) than string, if needed
@@ -1037,29 +1044,72 @@ func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (model.Param, bool) {
 	return model.Param{}, false
 }
 
-func (v paramsVisitor) isHeaderParamCall(call *ast.CallExpr) (param, bool) {
-	if len(call.Args) == 2 && isMethodCall(call, "Request", "HeaderParamDoc") {
+func (v paramsVisitor) isHeaderParamCall(call *ast.CallExpr) (model.Param, bool) {
+	if len(call.Args) == 2 && isFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), seqp("HeaderParamDoc")) {
 		if a, ok := isIdent(call.Args[0]); ok {
-			if b, ok := isString(call.Args[1]); ok {
-				return param{Name: a.Name, TypeId: "string", Summary: b, Required: true}, true
+			if summary, ok := isString(call.Args[1]); ok {
+				return model.NewParam(a.Name, summary, model.StringType, true, false), true
 			}
 		}
-	} else if len(call.Args) == 1 && isMethodCall(call, "Request", "HeaderParam") {
+	} else if len(call.Args) == 1 && isFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), seqp("HeaderParam")) {
 		if a, ok := isIdent(call.Args[0]); ok {
-			return param{Name: a.Name, TypeId: "string", Summary: "", Required: true}, true
+			summary := ""
+			if cg := findInlineComment(call.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
+				summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
+			}
+			return model.NewParam(a.Name, summary, model.StringType, true, false), true
 		}
-	} else if len(call.Args) == 2 && isMethodCall(call, "Request", "OptHeaderParamDoc") {
+	} else if len(call.Args) == 2 && isFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), seqp("OptHeaderParamDoc")) {
 		if a, ok := isIdent(call.Args[0]); ok {
-			if b, ok := isString(call.Args[1]); ok {
-				return param{Name: a.Name, TypeId: "string", Summary: b, Required: false}, true
+			if summary, ok := isString(call.Args[1]); ok {
+				return model.NewParam(a.Name, summary, model.StringType, false, false), true
 			}
 		}
-	} else if len(call.Args) == 1 && isMethodCall(call, "Request", "OptHeaderParam") {
+	} else if len(call.Args) == 1 && isFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), seqp("OptHeaderParam")) {
 		if a, ok := isIdent(call.Args[0]); ok {
-			return param{Name: a.Name, TypeId: "string", Summary: "", Required: false}, true
+			summary := ""
+			if cg := findInlineComment(call.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
+				summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
+			}
+			return model.NewParam(a.Name, summary, model.StringType, false, false), true
 		}
 	}
-	return param{}, false
+	return model.Param{}, false
+}
+
+func (v paramsVisitor) isBuildFilterCall(call *ast.CallExpr) (map[string]model.Param, map[string]model.Param, error) {
+	if len(call.Args) != 1 {
+		return nil, nil, nil
+	}
+	if _, ok := isSelector(call.Fun); !ok {
+		return nil, nil, nil
+	}
+	if !isFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Groupware"), seqp("buildEmailFilter")) {
+		return nil, nil, nil
+	}
+
+	var bf *ast.FuncDecl
+	{
+		for _, syn := range v.groupwarePkg.Syntax {
+			for _, decl := range syn.Decls {
+				if f := isFQFuncDecl(decl, v.groupwarePkg, "Groupware", "buildEmailFilter"); f != nil {
+					bf = f
+					break
+				}
+			}
+		}
+	}
+	if bf == nil {
+		return nil, nil, fmt.Errorf("failed to find declaration of 'buildEmailFilter' in the package '%s'", v.groupwarePkg.ID)
+	}
+
+	p := newParamsVisitor(v.fset, v.groupwarePkg, bf.Name.Name, v.typeMap, v.responseFuncs)
+	ast.Walk(p, bf.Body)
+	if err := errors.Join(*v.errs...); err != nil {
+		return nil, nil, err
+	}
+
+	return p.queryParams, p.headerParams, nil
 }
 
 func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
@@ -1082,27 +1132,17 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 			*v.errs = append(*v.errs, err)
 			return nil
 		} else if ok {
-			if typ, err := toType(p.TypeId, v.typeMap); err != nil {
-				*v.errs = append(*v.errs, fmt.Errorf("failed to find type '%s' in typeMap for body parameter '%s'", p.TypeId, p.Name))
-				return nil
-			} else {
-				v.bodyParams[p.Name] = model.NewParam(p.Name, p.Summary, typ, p.Required)
-				if p.Summary == "" {
-					pos := v.fset.Position(d.Pos())
-					v.undocumentedRequestBodies[p.Name] = pos
-				}
-				return v
+			v.bodyParams[p.Name] = p
+			if p.Description == "" {
+				pos := v.fset.Position(d.Pos())
+				v.undocumentedRequestBodies[p.Name] = pos
 			}
+			return v
 		}
 
-		if p, ok := isAccountCall(d, v.pkg); ok {
-			if t, err := toType(p.TypeId, v.typeMap); err != nil {
-				*v.errs = append(*v.errs, err)
-				return nil
-			} else {
-				v.pathParams[p.Name] = model.NewParam(p.Name, p.Summary, t, p.Required)
-				return v
-			}
+		if p, ok := isAccountCall(d, v.groupwarePkg); ok {
+			v.pathParams[p.Name] = p
+			return v
 		}
 		if responses, potentialErrors, undocumented, ok, err := v.isRespondCall(d); err != nil {
 			*v.errs = append(*v.errs, err)
@@ -1113,17 +1153,11 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 			maps.Copy(v.undocumentedResults, undocumented)
 			return v
 		}
-		if p, _, ok := isNeedAccountCall(d, v.pkg); ok {
-			if t, err := toType(p.TypeId, v.typeMap); err != nil {
-				*v.errs = append(*v.errs, err)
-				return nil
-			} else {
-				v.pathParams[p.Name] = model.NewParam(p.Name, p.Summary, t, p.Required)
-				return v
-			}
+		if p, _, ok := isNeedAccountCall(d, v.groupwarePkg); ok {
+			v.pathParams[p.Name] = p
 		}
 		if p, ok := v.isPathParamCall(d); ok {
-			v.pathParams[p.Name] = model.NewParam(p.Name, p.Description, p.Type, p.Required)
+			v.pathParams[p.Name] = p
 			return v
 		}
 
@@ -1136,13 +1170,16 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 		}
 
 		if p, ok := v.isHeaderParamCall(d); ok {
-			if t, err := toType(p.TypeId, v.typeMap); err != nil {
-				*v.errs = append(*v.errs, err)
-				return nil
-			} else {
-				v.headerParams[p.Name] = model.NewParam(p.Name, p.Summary, t, p.Required)
-				return v
-			}
+			v.headerParams[p.Name] = p
+			return v
+		}
+
+		if queryParams, headerParams, err := v.isBuildFilterCall(d); err != nil {
+			*v.errs = append(*v.errs, err)
+			return nil
+		} else {
+			maps.Copy(v.queryParams, queryParams)
+			maps.Copy(v.headerParams, headerParams)
 		}
 	}
 	return v
@@ -1323,23 +1360,23 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 			Mode:  packages.LoadSyntax,
 			Tests: false,
 		}
-		pkgs, err := packages.Load(cfg, "net/http")
+		pkgs, err := packages.Load(cfg, config.NetHttpPackageID)
 		if err != nil {
 			log.Fatal(err)
 		}
 		if packages.PrintErrors(pkgs) > 0 {
-			return model.Model{}, fmt.Errorf("failed to parse the net/http package")
+			return model.Model{}, fmt.Errorf("failed to parse the package '%s'", config.NetHttpPackageID)
 		}
 		var httpPackage *packages.Package = nil
 		{
 			for _, p := range pkgs {
-				if p.ID == "net/http" {
+				if p.ID == config.NetHttpPackageID {
 					httpPackage = p
 					break
 				}
 			}
 			if httpPackage == nil {
-				panic("failed to find the net/http package")
+				panic(fmt.Errorf("failed to find the package '%s'", config.NetHttpPackageID))
 			}
 		}
 		httpStatusMap = parseHttpStatuses(httpPackage)
@@ -1351,9 +1388,9 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 	groupwareErrorCodesMap := map[string]string{}
 	groupwareErrorsMap := map[string]model.PotentialError{}
 	routes := []model.Endpoint{}
-	pathParams := map[string]model.Param{}
-	queryParams := map[string]model.Param{}
-	headerParams := map[string]model.Param{}
+	pathParams := map[string]model.ParamDefinition{}
+	queryParams := map[string]model.ParamDefinition{}
+	headerParams := map[string]model.ParamDefinition{}
 	ims := []model.Impl{}
 	undocumentedResults := map[string]model.Undocumented{}
 	undocumentedResultBodies := map[string]model.Undocumented{}
@@ -1373,13 +1410,13 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 
 		// TODO extract the response funcs from the source code: look for functions in the groupware package that return a Response object, and look for the "body" parameter
 		responseFuncs := map[string]responseFunc{
-			"etagResponse":              {true, 1, http.StatusOK},
-			"response":                  {true, 1, http.StatusOK},
-			"noContentResponse":         {false, -1, http.StatusNoContent},
-			"noContentResponseWithEtag": {false, -1, http.StatusNoContent},
-			"notFoundResponse":          {false, -1, http.StatusNotFound},
-			"etagNotFoundResponse":      {false, -1, http.StatusNotFound},
-			"notImplementedResponse":    {false, -1, http.StatusNotImplemented},
+			"etagResponse":              {1, http.StatusOK},
+			"response":                  {1, http.StatusOK},
+			"noContentResponse":         {-1, http.StatusNoContent},
+			"noContentResponseWithEtag": {-1, http.StatusNoContent},
+			"notFoundResponse":          {-1, http.StatusNotFound},
+			"etagNotFoundResponse":      {-1, http.StatusNotFound},
+			"notImplementedResponse":    {-1, http.StatusNotImplemented},
 		}
 
 		// iterate over every package that we are interested in (defined in config.PackageIDs),
@@ -1649,10 +1686,11 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 
 	exampleMap := map[string]model.Examples{}
 	{
-		m := map[string]map[string]model.Example{}
+		m := map[string]map[string][]model.Example{}
 
 		type example struct {
 			Type    string          `json:"type"`
+			Key     string          `json:"key"`
 			Title   string          `json:"title"`
 			Scope   string          `json:"scope"`
 			Origin  string          `json:"origin"`
@@ -1699,14 +1737,24 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 								panic(err)
 							} else {
 								if _, ok := m[k]; !ok {
-									m[k] = map[string]model.Example{}
+									m[k] = map[string][]model.Example{}
 								}
-								m[k][q] = model.Example{
-									Key:    k,
+								list, ok := m[k][q]
+								if !ok {
+									list = []model.Example{}
+								}
+								origin := filepath.Join(d, f)
+								if v.Origin != "" {
+									origin = origin + ":" + v.Origin
+								}
+								list = append(list, model.Example{
+									Key:    v.Key,
+									TypeId: v.Type,
 									Title:  title,
 									Text:   string(b),
-									Origin: filepath.Join(d, f),
-								}
+									Origin: origin,
+								})
+								m[k][q] = list
 							}
 						}
 					}
@@ -1721,13 +1769,13 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 			remaining := maps.Clone(qualified)
 			if x, ok := qualified["any"]; ok {
 				delete(remaining, "any")
-				e.DefaultExample = x
+				e.DefaultExamples = append(e.DefaultExamples, x...)
 			} else {
 				panic(fmt.Errorf("no default example for %s", k))
 			}
 			if x, ok := qualified["request"]; ok {
 				delete(remaining, "request")
-				e.RequestExample = &x
+				e.RequestExamples = append(e.RequestExamples, x...)
 			}
 			if len(remaining) > 0 {
 				panic(fmt.Errorf("unsupported qualifiers found for examples for '%s': %s", k, strings.Join(slices.Collect(maps.Keys(remaining)), ", ")))
@@ -1824,6 +1872,8 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 		commonRequestHeaders = append(commonRequestHeaders, model.RequestHeaderDesc{
 			Name:        "X-Request-ID",
 			Description: "When specified, its value is used in logs for correlation",
+			Required:    false,
+			Exploded:    false,
 			Examples: map[string]string{
 				"A UUID as request ID": "433bfe7b-032a-4ec3-8fb9-87ee5fb97af7",
 			},
@@ -1831,6 +1881,8 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 		commonRequestHeaders = append(commonRequestHeaders, model.RequestHeaderDesc{
 			Name:        "Trace-Id",
 			Description: "When specified, its value is used in logs for correlation and if not, a new random value is generated and sent in the response",
+			Required:    false,
+			Exploded:    false,
 			Examples: map[string]string{
 				"A UUID as trace ID": "4ab74941-b178-4565-9e28-2bb35eb2ff0c",
 			},

@@ -258,7 +258,7 @@ type ArrayType struct {
 }
 
 func (t ArrayType) Key() string {
-	return t.elt.Key()
+	return "[]" + t.elt.Key()
 }
 
 func (t ArrayType) Name() string {

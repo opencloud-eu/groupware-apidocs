@@ -42,13 +42,13 @@ func newResolver(basePath string, m model.Model, renderedExampleMap map[string]r
 	}
 }
 
-func (s resolver) parameter(p model.Param, in string, requiredByDefault bool, m map[string]model.Param, schemaComponentTypes map[string]model.Type) (*v3.Parameter, error) {
-	if g, ok := m[p.Name]; ok {
+func (s resolver) parameter(p model.Param, in string, requiredByDefault bool, paramDefs map[string]model.ParamDefinition, schemaComponentTypes map[string]model.Type) (*v3.Parameter, error) {
+	if def, ok := paramDefs[p.Name]; ok {
 		req := requiredByDefault
 		req = p.Required
 		desc := p.Description
 		if desc == "" {
-			desc = g.Description
+			desc = def.Description
 		}
 		var schema *highbase.SchemaProxy
 		var ext *orderedmap.Map[string, *yaml.Node]
@@ -61,12 +61,13 @@ func (s resolver) parameter(p model.Param, in string, requiredByDefault bool, m 
 			}
 		}
 		return &v3.Parameter{
-			Name:        g.Name,
+			Name:        def.Name,
 			In:          in,
 			Required:    &req,
 			Description: desc,
 			Schema:      schema,
 			Extensions:  ext,
+			Explode:     tools.BoolPtr(true),
 		}, nil
 	} else {
 		return nil, fmt.Errorf("failed to resolve %s parameter '%s'", in, p.Name)
@@ -135,26 +136,26 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 	if len(path) == 0 {
 		ext := orderedmap.New[string, *yaml.Node]()
 
-		var examples []*yaml.Node = nil
-		var example *model.Example
+		var renderedExamples []*yaml.Node = nil
+		var examples []model.Example
 		{
 			if e, ok := s.m.Examples[t.Key()]; ok {
 				if rendered, ok := s.renderedExampleMap[t.Key()]; ok {
-					var data *yaml.Node
+					var data []*yaml.Node
 					switch scope {
 					case RequestScope:
 						x, _ := e.ForRequest()
-						example = &x
-						data = rendered.forRequest()
+						examples = x
+						data = rendered.forRequest().Content
 					case ResponseScope:
 						x, _ := e.ForResponse()
-						example = &x
-						data = rendered.forResponse()
+						examples = x
+						data = rendered.forResponse().Content
 					default:
 						return nil, nil, fmt.Errorf("schematize: %s: unsupported %T: %v", ctx, scope, scope)
 					}
 					if data != nil {
-						examples = []*yaml.Node{data}
+						renderedExamples = data
 						ext.Set("x-oc-example-scope", &yaml.Node{Kind: yaml.ScalarNode, Value: string(scope)})
 					}
 				}
@@ -180,8 +181,8 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 				}
 
 				// patch in an example if we have one
-				if example != nil {
-					if err := patchExampleIntoSchema(f.Attr, *example, fs.Schema()); err != nil {
+				if len(examples) > 0 {
+					if err := patchExampleIntoSchema(f.Attr, examples, fs.Schema()); err != nil {
 						return nil, nil, fmt.Errorf("schematize: %s: failed to patch example into schema of '%s' property '%s': %w", ctx, t.Key(), f.Attr, err)
 					}
 				}
@@ -220,7 +221,7 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 			Properties:  props,
 			Description: objdesc,
 			Extensions:  ext,
-			Examples:    examples,
+			Examples:    renderedExamples, // TODO a !!seq here?
 		}
 		if len(requiredFields) > 0 {
 			schema.Required = requiredFields
@@ -287,7 +288,7 @@ func (s resolver) bodyparams(params []model.Param, im model.Impl, schemaComponen
 	var schemaRef *highbase.SchemaProxy
 	var err error
 	desc := ""
-	var examples *orderedmap.Map[string, *highbase.Example]
+	examples := orderedmap.New[string, *highbase.Example]()
 	switch len(params) {
 	case 0:
 		return nil, nil
@@ -295,30 +296,35 @@ func (s resolver) bodyparams(params []model.Param, im model.Impl, schemaComponen
 		schemaRef, _, err = s.reqschema(params[0], im, schemaComponentTypes, params[0].Description)
 		desc = params[0].Description
 		if exampleSet, ok := s.m.Examples[params[0].Name]; ok {
-			example, specific := exampleSet.ForRequest()
+			exampleList, specific := exampleSet.ForRequest()
 			if specific {
-				rendered := s.renderedExampleMap[exampleSet.Key].forRequest()
-				if rendered != nil {
-					examples = omap1("ok", &highbase.Example{
-						Summary:     "body",
-						Description: example.Title,
-						Value:       rendered,
-						Extensions: ext2(
-							"oc-example-source-file", example.Origin,
-							"oc-example-scope", "bodyparam/"+string(RequestScope),
-						),
-					})
+				for _, example := range exampleList {
+					if rendered, ok := s.renderedExampleMap[example.Key]; ok {
+						rendered := rendered.forRequest()
+						if rendered != nil {
+							examples.Set(example.Key, &highbase.Example{
+								// Summary:     "body", // not used
+								Description: example.Title,
+								Value:       rendered,
+								Extensions: ext2(
+									"oc-example-origin", example.Origin,
+									"oc-example-scope", "bodyparam/"+string(RequestScope),
+								),
+							})
+						}
+					}
 				}
-			}
-			if examples == nil {
-				examples = omap1("ok", highbase.CreateExampleRef(ExampleComponentRefPrefix+example.Key))
+			} else {
+				for _, example := range exampleList {
+					examples.Set(example.Key, highbase.CreateExampleRef(ExampleComponentRefPrefix+example.Key))
+				}
 			}
 
 			if schemaRef.Schema() != nil {
 				props := schemaRef.Schema().Properties
 				if props != nil {
 					for pair := props.Oldest(); pair != nil; pair = pair.Next() {
-						if err := patchExampleIntoSchema(pair.Key, example, pair.Value.Schema()); err != nil {
+						if err := patchExampleIntoSchema(pair.Key, exampleList, pair.Value.Schema()); err != nil {
 							return nil, fmt.Errorf("bodyparams: failed to patch example into schema of '%s' property '%s': %w", params[0].Name, pair.Key, err)
 						}
 					}
@@ -377,7 +383,8 @@ func specificResponseSummary(code int, s model.InferredSummary) string {
 	return ""
 }
 
-func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes map[string]model.Type) (*v3.Responses, error) {
+func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes map[string]model.Type,
+	neededArrayExamples map[string]bool, neededMapExamples map[string]bool) (*v3.Responses, error) {
 	respMap := orderedmap.New[string, *v3.Response]()
 
 	resps := map[int]model.Resp{}
@@ -459,8 +466,48 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 				return nil, fmt.Errorf("failed to reference response type %s: %v", resp.Type, err)
 			} else {
 				examples := orderedmap.New[string, *highbase.Example]()
-				if _, ok := m.Examples[resp.Type.Key()]; ok {
-					examples.Set("ok", highbase.CreateExampleRef(ExampleComponentRefPrefix+resp.Type.Key()))
+				if examplesSet, ok := m.Examples[resp.Type.Key()]; ok {
+					exampleList, _ := examplesSet.ForResponse()
+					for _, example := range exampleList {
+						ref := example.Key
+						id := example.Title
+						if id == "" {
+							id = ref
+						}
+						examples.Set(id, highbase.CreateExampleRef(ExampleComponentRefPrefix+ref))
+					}
+				} else {
+					if resp.Type.IsArray() /*&& schema.Schema() != nil && slices.Contains(schema.Schema().Type, "array")*/ {
+						if elt, ok := resp.Type.Element(); ok {
+							k := elt.Key()
+							if exampleList, ok := m.Examples[k]; ok {
+								for _, example := range exampleList.DefaultExamples {
+									ref := "[]" + example.Key
+									id := example.Title
+									if id == "" {
+										id = ref
+									}
+									examples.Set(id, highbase.CreateExampleRef(ExampleComponentRefPrefix+ref))
+									neededArrayExamples[k] = true
+								}
+							}
+						}
+					} else if resp.Type.IsMap() {
+						if elt, ok := resp.Type.Element(); ok {
+							k := elt.Key()
+							if exampleList, ok := m.Examples[k]; ok {
+								for _, example := range exampleList.DefaultExamples {
+									ref := "map[string]" + example.Key
+									id := example.Title
+									if id == "" {
+										id = ref
+									}
+									examples.Set(id, highbase.CreateExampleRef(ExampleComponentRefPrefix+ref))
+									neededMapExamples[k] = true
+								}
+							}
+						}
+					}
 				}
 				for _, pe := range im.PotentialErrors {
 					if pe.Payload.Status == code {

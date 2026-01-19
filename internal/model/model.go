@@ -112,6 +112,7 @@ type RequestHeaderDesc struct {
 	Name        string
 	Description string
 	Required    bool
+	Exploded    bool
 	Examples    map[string]string
 }
 
@@ -126,19 +127,33 @@ type Resp struct {
 	Type    Type
 }
 
+type ParamDefinition struct {
+	Name        string
+	Description string
+}
+
+func NewParamDefinition(name string, description string) ParamDefinition {
+	return ParamDefinition{
+		Name:        name,
+		Description: description,
+	}
+}
+
 type Param struct {
 	Name        string
 	Description string
 	Type        Type
 	Required    bool
+	Exploded    bool
 }
 
-func NewParam(name string, description string, t Type, required bool) Param {
+func NewParam(name string, description string, t Type, required bool, exploded bool) Param {
 	return Param{
 		Name:        name,
 		Description: description,
 		Type:        t,
 		Required:    required,
+		Exploded:    exploded,
 	}
 }
 
@@ -194,37 +209,38 @@ type Undocumented struct {
 
 type Example struct {
 	Key    string
+	TypeId string
 	Title  string
 	Text   string
 	Origin string
 }
 
 type Examples struct {
-	Key            string
-	DefaultExample Example
-	RequestExample *Example
+	Key             string
+	DefaultExamples []Example
+	RequestExamples []Example
 }
 
-func (r Examples) ForRequest() (Example, bool) {
-	if r.RequestExample != nil {
-		return *r.RequestExample, true
+func (r Examples) ForRequest() ([]Example, bool) {
+	if len(r.RequestExamples) > 0 {
+		return r.RequestExamples, true
 	}
-	return r.DefaultExample, false
+	return r.DefaultExamples, false
 }
 
-func (r Examples) ForParameter() (Example, bool) {
-	return r.DefaultExample, false
+func (r Examples) ForParameter() ([]Example, bool) {
+	return r.DefaultExamples, false
 }
 
-func (r Examples) ForResponse() (Example, bool) {
-	return r.DefaultExample, false
+func (r Examples) ForResponse() ([]Example, bool) {
+	return r.DefaultExamples, true
 }
 
 type Model struct {
 	Routes                                       []Endpoint
-	PathParams                                   map[string]Param
-	QueryParams                                  map[string]Param
-	HeaderParams                                 map[string]Param
+	PathParams                                   map[string]ParamDefinition
+	QueryParams                                  map[string]ParamDefinition
+	HeaderParams                                 map[string]ParamDefinition
 	Impls                                        []Impl
 	Types                                        []Type
 	Examples                                     map[string]Examples

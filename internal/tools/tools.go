@@ -2,7 +2,10 @@ package tools
 
 import (
 	"fmt"
+	"iter"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -80,6 +83,22 @@ func Index[K comparable, V any](s []V, indexer func(V) K) map[K]V {
 	return m
 }
 
+func IndexTo[K comparable, V any](it iter.Seq[K], value V) map[K]V {
+	m := map[K]V{}
+	for v := range it {
+		m[v] = value
+	}
+	return m
+}
+
+func UniqKeys[K comparable, V any](m ...map[K]V) []K {
+	keyMaps := map[K]bool{}
+	for _, x := range m {
+		maps.Copy(keyMaps, IndexTo(maps.Keys(x), true))
+	}
+	return slices.Collect(maps.Keys(keyMaps))
+}
+
 func IndexMany[K comparable, V any](s []V, indexer func(V) K) map[K][]V {
 	m := map[K][]V{}
 	for _, v := range s {
@@ -92,6 +111,10 @@ func IndexMany[K comparable, V any](s []V, indexer func(V) K) map[K][]V {
 		m[k] = a
 	}
 	return m
+}
+
+func Identity[E any](e E) E {
+	return e
 }
 
 func MapReduce[A any, B any, C any](s []A, mapper func(A) (B, bool, error), reducer func([]B) (C, error)) (C, error) {
