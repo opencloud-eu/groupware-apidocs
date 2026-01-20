@@ -126,6 +126,7 @@ func renderExamples(qualified model.Examples, patcher func(*yaml.Node) *yaml.Nod
 		if n, err := renderExample(e.Text); err != nil {
 			panic(fmt.Errorf("failed to render default example for '%s': %w", e.Key, err))
 		} else {
+			n = patcher(n)
 			defaultExampleByKey[e.Key] = n
 		}
 	}
@@ -133,6 +134,7 @@ func renderExamples(qualified model.Examples, patcher func(*yaml.Node) *yaml.Nod
 		if n, err := renderExample(e.Text); err != nil {
 			panic(fmt.Errorf("failed to render request example for '%s': %w", e.Key, err))
 		} else {
+			n = patcher(n)
 			requestExampleByKey[e.Key] = n
 		}
 	}
@@ -368,9 +370,13 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 					}
 
 					op.Tags = im.Tags
+					if len(op.Tags) < 1 {
+						op.Tags = append(op.Tags, "untagged")
+					}
 					if strings.HasPrefix(r.Path, "/accounts/all/") || r.Path == "/accounts/all" {
 						op.Tags = append(op.Tags, TagUnified)
 					}
+					op.Tags = append(op.Tags, "all")
 
 					op.Extensions = ext1("x-oc-source", fmt.Sprintf("%s:%d", im.Source, im.Line))
 				}
@@ -396,6 +402,21 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 		}
 		if pathItem != nil {
 			pathItemMap.Set(path, pathItem)
+		}
+	}
+
+	untagged := []string{}
+	unified := []string{}
+	for path, pathItem := range pathItemMap.FromOldest() {
+		if ops := pathItem.GetOperations(); ops != nil {
+			for verb, op := range ops.FromOldest() {
+				if len(op.Tags) < 1 {
+					untagged = append(untagged, fmt.Sprintf("%s (%s %s)", op.OperationId, verb, path))
+				}
+				if slices.Contains(op.Tags, "unified") {
+					unified = append(unified, fmt.Sprintf("%s (%s %s)", op.OperationId, verb, path))
+				}
+			}
 		}
 	}
 
@@ -787,7 +808,39 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 		}
 	}
 
+	if (len(untagged) < 1 || len(unified) < 1) && doc.Extensions != nil {
+		if node, ok := doc.Extensions.Get("x-tagGroups"); ok && node != nil {
+			keep := []*yaml.Node{}
+			for _, m := range node.Content {
+				skip := false
+				if m.Kind == yaml.MappingNode && len(m.Content) > 0 {
+					for i := 0; i < len(m.Content); {
+						k := m.Content[i]
+						i++
+						v := m.Content[i]
+						i++
+						if k.Value == "name" && ((len(untagged) < 1 && v.Value == "Uncategorized") || (len(unified) < 1 && k.Value == "Unified")) {
+							// skip
+							skip = true
+							break
+						}
+					}
+				}
+				if !skip {
+					keep = append(keep, m)
+				}
+			}
+			node.Content = keep
+		}
+	}
+
 	// logging output to stderr
+	if len(untagged) > 0 {
+		log.Printf("%d untagged endpoints:", len(untagged))
+		for _, u := range untagged {
+			log.Printf("  - %s", u)
+		}
+	}
 	if len(m.UndocumentedResults) > 0 {
 		log.Printf("%d undocumented results:", len(m.UndocumentedResults))
 		for name, u := range m.UndocumentedResults {
