@@ -295,7 +295,11 @@ func (s resolver) bodyparams(params []model.Param, im model.Impl, schemaComponen
 	case 1:
 		schemaRef, _, err = s.reqschema(params[0], im, schemaComponentTypes, params[0].Description)
 		desc = params[0].Description
-		if exampleSet, ok := s.m.Examples[params[0].Name]; ok {
+		exampleKey := params[0].Name
+		if params[0].ExampleKey != "" {
+			exampleKey = params[0].ExampleKey
+		}
+		if exampleSet, ok := s.m.Examples[exampleKey]; ok {
 			exampleList, specific := exampleSet.ForRequest()
 			if specific {
 				for _, example := range exampleList {
@@ -384,7 +388,8 @@ func specificResponseSummary(code int, s model.InferredSummary) string {
 }
 
 func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes map[string]model.Type,
-	neededArrayExamples map[string]bool, neededMapExamples map[string]bool) (*v3.Responses, error) {
+	neededArrayExamples map[string]bool, neededMapExamples map[string]bool,
+	responsesWithoutExamples map[string]bool) (*v3.Responses, error) {
 	respMap := orderedmap.New[string, *v3.Response]()
 
 	resps := map[int]model.Resp{}
@@ -416,10 +421,7 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 			continue // there's already a response for that status code
 		}
 		summary := tools.MustHttpStatusText(pe.Payload.Status) // TODO have a more meaningful summary for this
-		resps[pe.Payload.Status] = model.Resp{
-			Summary: summary,
-			Type:    pe.Type,
-		}
+		resps[pe.Payload.Status] = model.NewResp(pe.Type, summary, pe.ExampleKey)
 	}
 
 	for _, scenario := range paramCases {
@@ -429,10 +431,7 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 					continue // we're good, there is already a response for that status code
 				}
 				summary := tools.MustHttpStatusText(pe.Payload.Status) // TODO have a more meaningful summary for this
-				resps[pe.Payload.Status] = model.Resp{
-					Summary: summary,
-					Type:    pe.Type,
-				}
+				resps[pe.Payload.Status] = model.NewResp(pe.Type, summary, pe.ExampleKey)
 			}
 		}
 	}
@@ -448,10 +447,7 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 				if t, ok := s.typeMap["groupware.ErrorResponse"]; ok {
 					respType = t
 				}
-				resps[code] = model.Resp{
-					Type:    respType,
-					Summary: summary,
-				}
+				resps[code] = model.NewResp(respType, summary, "")
 			}
 		}
 	}
@@ -466,7 +462,13 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 				return nil, fmt.Errorf("failed to reference response type %s: %v", resp.Type, err)
 			} else {
 				examples := orderedmap.New[string, *highbase.Example]()
-				if examplesSet, ok := m.Examples[resp.Type.Key()]; ok {
+				exampleKey := resp.Type.Key()
+				if resp.ExampleKey != "" {
+					exampleKey = resp.ExampleKey
+				}
+				foundExample := false
+				if examplesSet, ok := m.Examples[exampleKey]; ok {
+					foundExample = true
 					exampleList, _ := examplesSet.ForResponse()
 					for _, example := range exampleList {
 						ref := example.Key
@@ -481,6 +483,7 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 						if elt, ok := resp.Type.Element(); ok {
 							k := elt.Key()
 							if exampleList, ok := m.Examples[k]; ok {
+								foundExample = true
 								for _, example := range exampleList.DefaultExamples {
 									ref := "[]" + example.Key
 									id := example.Title
@@ -496,6 +499,7 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 						if elt, ok := resp.Type.Element(); ok {
 							k := elt.Key()
 							if exampleList, ok := m.Examples[k]; ok {
+								foundExample = true
 								for _, example := range exampleList.DefaultExamples {
 									ref := "map[string]" + example.Key
 									id := example.Title
@@ -507,6 +511,14 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 								}
 							}
 						}
+					}
+				}
+				if !foundExample {
+					if resp.ExampleKey != "" {
+						panic(fmt.Errorf("@api:example references '%s' which could not be found", resp.ExampleKey))
+					} else {
+						// we just don't have an example for this one
+						responsesWithoutExamples[exampleKey] = true
 					}
 				}
 				for _, pe := range im.PotentialErrors {
@@ -631,6 +643,11 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 	}
 	// also add the default responses in every operation
 	for code, resp := range m.DefaultResponses {
+		// but skip 400 if there are no parameters!
+		if code == 400 && len(im.QueryParams)+len(im.BodyParams)+len(im.HeaderParams)-len(m.CommonRequestHeaders) < 1 {
+			continue
+		}
+
 		codeKey := strconv.Itoa(code)
 		summary := resp.Summary
 		if summary == "" {

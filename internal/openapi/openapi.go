@@ -126,7 +126,15 @@ func renderExamples(qualified model.Examples, patcher func(*yaml.Node) *yaml.Nod
 		if n, err := renderExample(e.Text); err != nil {
 			panic(fmt.Errorf("failed to render default example for '%s': %w", e.Key, err))
 		} else {
-			n = patcher(n)
+			if n.Kind == yaml.DocumentNode {
+				patched := []*yaml.Node{}
+				for _, c := range n.Content {
+					patched = append(patched, patcher(c))
+				}
+				n.Content = patched
+			} else {
+				n = patcher(n)
+			}
 			defaultExampleByKey[e.Key] = n
 		}
 	}
@@ -276,6 +284,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 	schemaComponentTypes := map[string]model.Type{} // collects items that need to be documented in /components/schemas
 	neededArrayExamples := map[string]bool{}
 	neededMapExamples := map[string]bool{}
+	responsesWithoutExamples := map[string]bool{}
 
 	pathKeys := slices.Collect(maps.Keys(routesByPath))
 	slices.Sort(pathKeys)
@@ -361,7 +370,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 					}
 
 					// responses
-					if responses, err := res.responses(im, m, schemaComponentTypes, neededArrayExamples, neededMapExamples); err != nil {
+					if responses, err := res.responses(im, m, schemaComponentTypes, neededArrayExamples, neededMapExamples, responsesWithoutExamples); err != nil {
 						return err
 					} else if responses != nil {
 						op.Responses = responses
@@ -863,6 +872,12 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 				filename = relpath
 			}
 			log.Printf("  - %s: %s %s @ %s:%d:%d", name, u.Endpoint.Verb, u.Endpoint.Path, filename, u.Pos.Line, u.Pos.Column)
+		}
+	}
+	if len(responsesWithoutExamples) > 0 {
+		log.Printf("%d responses without examples:", len(responsesWithoutExamples))
+		for name := range responsesWithoutExamples {
+			log.Printf("  - %s", name)
 		}
 	}
 

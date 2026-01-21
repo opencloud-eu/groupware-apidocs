@@ -123,8 +123,25 @@ type Endpoint struct {
 }
 
 type Resp struct {
-	Summary string
-	Type    Type
+	Summary    string
+	Type       Type
+	ExampleKey string
+}
+
+func NewResp(typ Type, summary string, exampleKey string) Resp {
+	return Resp{
+		Summary:    summary,
+		Type:       typ,
+		ExampleKey: exampleKey,
+	}
+}
+
+func NewRespWithoutBody(summary string) Resp {
+	return Resp{
+		Summary:    summary,
+		Type:       nil,
+		ExampleKey: "",
+	}
 }
 
 type ParamDefinition struct {
@@ -145,15 +162,17 @@ type Param struct {
 	Type        Type
 	Required    bool
 	Exploded    bool
+	ExampleKey  string
 }
 
-func NewParam(name string, description string, t Type, required bool, exploded bool) Param {
+func NewParam(name string, description string, t Type, required bool, exploded bool, exampleKey string) Param {
 	return Param{
 		Name:        name,
 		Description: description,
 		Type:        t,
 		Required:    required,
 		Exploded:    exploded,
+		ExampleKey:  exampleKey,
 	}
 }
 
@@ -176,9 +195,10 @@ type GroupwareError struct {
 }
 
 type PotentialError struct {
-	Name    string
-	Type    Type
-	Payload GroupwareError
+	Name       string
+	Type       Type
+	Payload    GroupwareError
+	ExampleKey string
 }
 
 type Impl struct {
@@ -200,6 +220,7 @@ type Impl struct {
 	Summary         string
 	Description     string
 	InferredSummary InferredSummary
+	ExampleKey      string
 }
 
 type Undocumented struct {

@@ -25,7 +25,8 @@ import (
 )
 
 var (
-	apiTag = regexp.MustCompile(`^\s*@api:tags?\s+(.+)\s*$`)
+	apiTag        = regexp.MustCompile(`^\s*@api:tags?\s+(.+)\s*$`)
+	apiExampleKey = regexp.MustCompile(`^\s*@api:examples?\s+(.+)\s*$`)
 
 	tagAttrNameRegex      = regexp.MustCompile(`json:"(.+?)(?:,(omitempty|omitzero))?"`)
 	tagDocRegex           = regexp.MustCompile(`doc:"(req|opt|)"`)
@@ -410,11 +411,12 @@ type returnVisitor struct {
 	responses               map[int]model.Resp
 	successfulResponseFuncs map[string]responseFunc
 	potentialErrors         map[string]bool
+	exampleKey              string
 	undocumented            map[string]token.Position
 	errs                    *[]error
 }
 
-func newReturnVisitor(fset *token.FileSet, groupwarePkg *packages.Package, typeMap map[string]model.Type, successfulResponseFuncs map[string]responseFunc) returnVisitor {
+func newReturnVisitor(fset *token.FileSet, groupwarePkg *packages.Package, typeMap map[string]model.Type, successfulResponseFuncs map[string]responseFunc, exampleKey string) returnVisitor {
 	return returnVisitor{
 		fset:                    fset,
 		groupwarePkg:            groupwarePkg,
@@ -422,6 +424,7 @@ func newReturnVisitor(fset *token.FileSet, groupwarePkg *packages.Package, typeM
 		responses:               map[int]model.Resp{},
 		potentialErrors:         map[string]bool{},
 		successfulResponseFuncs: successfulResponseFuncs,
+		exampleKey:              exampleKey,
 		undocumented:            map[string]token.Position{},
 		errs:                    &[]error{},
 	}
@@ -497,7 +500,7 @@ func (v returnVisitor) isErrorResponseFunc(r *ast.ReturnStmt) bool {
 							case *ast.AssignStmt:
 								for _, rhs := range decl.Rhs {
 									if call, ok := isCallExpr(rhs); ok {
-										if p, neededType, ok := isNeedAccountCall(call, v.groupwarePkg); ok && p.Required {
+										if p, neededType, ok := isNeedAccountCall(call, v.groupwarePkg, v.exampleKey); ok && p.Required {
 											v.potentialErrors[MissingAccountError] = true
 											if moreErrs, ok := MissingObjTypeErrors[neededType]; ok {
 												for _, e := range moreErrs {
@@ -764,13 +767,13 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 	if arg, summary, code, ok := v.isSuccessfulResponseFunc(r); ok {
 		if arg == nil {
 			// if a is nil, it means that there is no body
-			v.responses[code] = model.Resp{Type: nil, Summary: summary}
+			v.responses[code] = model.NewRespWithoutBody(summary)
 		} else {
 			if code, t, err := v.deduceArgType(code, arg); err != nil {
 				*v.errs = append(*v.errs, err)
 				return nil
 			} else {
-				v.responses[code] = model.Resp{Type: t, Summary: summary}
+				v.responses[code] = model.NewResp(t, summary, v.exampleKey)
 			}
 		}
 	} else if ok := v.isErrorResponseFunc(r); ok {
@@ -785,6 +788,7 @@ type paramsVisitor struct {
 	fun                       string
 	groupwarePkg              *packages.Package
 	typeMap                   map[string]model.Type
+	exampleKey                string
 	headerParams              map[string]model.Param
 	queryParams               map[string]model.Param
 	pathParams                map[string]model.Param
@@ -797,12 +801,13 @@ type paramsVisitor struct {
 	errs                      *[]error
 }
 
-func newParamsVisitor(fset *token.FileSet, groupwarePkg *packages.Package, fun string, typeMap map[string]model.Type, responseFuncs map[string]responseFunc) paramsVisitor {
+func newParamsVisitor(fset *token.FileSet, groupwarePkg *packages.Package, fun string, typeMap map[string]model.Type, responseFuncs map[string]responseFunc, exampleKey string) paramsVisitor {
 	return paramsVisitor{
 		fset:                      fset,
 		fun:                       fun,
 		groupwarePkg:              groupwarePkg,
 		typeMap:                   typeMap,
+		exampleKey:                exampleKey,
 		headerParams:              map[string]model.Param{},
 		queryParams:               map[string]model.Param{},
 		pathParams:                map[string]model.Param{},
@@ -856,7 +861,9 @@ func (v paramsVisitor) isBodyCall(call *ast.CallExpr) (model.Param, bool, error)
 					if typ, err := toType(n, v.typeMap); err != nil {
 						return model.Param{}, false, fmt.Errorf("failed to resolve type identifier '%s' from call to Request.body[doc]()", n)
 					} else {
-						return model.NewParam(n, desc, typ, required, exploded), true, nil
+						exampleKey := v.exampleKey
+						// TODO implement example key override using an inline comment
+						return model.NewParam(n, desc, typ, required, exploded, exampleKey), true, nil
 					}
 				} else {
 					return model.Param{}, false, err
@@ -876,7 +883,7 @@ func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Resp, ma
 	if len(call.Args) == 3 && isMethodCall(call, "Groupware", "respond") {
 		arg := call.Args[2]
 		if c, ok := isClosure(arg); ok {
-			rv := newReturnVisitor(v.fset, v.groupwarePkg, v.typeMap, v.responseFuncs)
+			rv := newReturnVisitor(v.fset, v.groupwarePkg, v.typeMap, v.responseFuncs, v.exampleKey)
 			ast.Walk(rv, c)
 			if err := errors.Join(*rv.errs...); err != nil {
 				return nil, nil, nil, false, err
@@ -889,7 +896,7 @@ func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Resp, ma
 	return nil, nil, nil, false, nil
 }
 
-func isAccountCall(call *ast.CallExpr, p *packages.Package) (model.Param, bool) {
+func isAccountCall(call *ast.CallExpr, p *packages.Package, exampleKey string) (model.Param, bool) {
 	if len(call.Args) == 0 && isMethodCallPrefix(call, "Request", []string{"GetAccountFor", "GetAccountIdFor"}) {
 		required := true
 		exploded := false
@@ -897,7 +904,8 @@ func isAccountCall(call *ast.CallExpr, p *packages.Package) (model.Param, bool) 
 		if cg := findInlineComment(call.Pos(), p); cg != nil && cg.List != nil {
 			summary = strings.Join(lines(cg.List), "\n")
 		}
-		return model.NewParam(config.AccountIdUriParamName, summary, model.StringType, required, exploded), true
+		// TODO implement example key override using an inline comment
+		return model.NewParam(config.AccountIdUriParamName, summary, model.StringType, required, exploded, exampleKey), true
 	} else {
 		return model.Param{}, false
 	}
@@ -905,7 +913,7 @@ func isAccountCall(call *ast.CallExpr, p *packages.Package) (model.Param, bool) 
 
 var needObjectWithAccountCallRegex = regexp.MustCompile(`^need(Contact|Calendar|Task)WithAccount$`)
 
-func isNeedAccountCall(call *ast.CallExpr, p *packages.Package) (model.Param, string, bool) {
+func isNeedAccountCall(call *ast.CallExpr, p *packages.Package, exampleKey string) (model.Param, string, bool) {
 	required := true
 	exploded := false
 	if s, ok := isSelector(call.Fun); ok {
@@ -917,7 +925,9 @@ func isNeedAccountCall(call *ast.CallExpr, p *packages.Package) (model.Param, st
 						if cg := findInlineComment(call.Pos(), p); cg != nil && cg.List != nil {
 							summary = strings.Join(lines(cg.List), "\n")
 						}
-						return model.NewParam(config.AccountIdUriParamName, summary, model.StringType, required, exploded), m[0][1], true
+						objType := m[0][1]
+						// TODO implement example key override using an inline comment
+						return model.NewParam(config.AccountIdUriParamName, summary, model.StringType, required, exploded, exampleKey), objType, true
 					}
 				}
 			}
@@ -993,11 +1003,12 @@ func (v paramsVisitor) isParseQueryParamCall(call *ast.CallExpr) (model.Param, b
 			summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
 		}
 	}
+	exampleKey := v.exampleKey
+	// TODO implement example key override using an inline comment
 
 	// TODO resolve name (QueryParamXYZ) to its string value using model.QueryParams map
 
-	return model.NewParam(name, summary, typ, required, exploded), true, nil
-
+	return model.NewParam(name, summary, typ, required, exploded, exampleKey), true, nil
 }
 
 func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (model.Param, bool) {
@@ -1008,7 +1019,9 @@ func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (model.Param, bool) {
 			if cg := findInlineComment(call.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
 				summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
 			}
-			return model.NewParam(a.Name, summary, model.StringType, required, false), true
+			exampleKey := v.exampleKey
+			// TODO implement example key override using an inline comment
+			return model.NewParam(a.Name, summary, model.StringType, required, false, exampleKey), true
 		} else {
 			panic(fmt.Errorf("chi.URLParam first argument is not an Ident but a %T: %v", call.Args[0], call.Args[0]))
 		}
@@ -1019,7 +1032,9 @@ func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (model.Param, bool) {
 				if cg := findInlineComment(call.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
 					summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
 				}
-				return model.NewParam(a.Name, summary, model.StringType, required, false), true
+				exampleKey := v.exampleKey
+				// TODO implement example key override using an inline comment
+				return model.NewParam(a.Name, summary, model.StringType, required, false, exampleKey), true
 			} else {
 				panic(fmt.Errorf("Request.%s first argument is not an Ident but a %T: %v", f, call.Args[0], call.Args[0]))
 			}
@@ -1030,7 +1045,9 @@ func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (model.Param, bool) {
 			}
 			if a, ok := isIdent(call.Args[0]); ok {
 				if desc, ok := isString(call.Args[1]); ok {
-					return model.NewParam(a.Name, desc, typ, required, true), true
+					exampleKey := v.exampleKey
+					// TODO implement example key override using an inline comment
+					return model.NewParam(a.Name, desc, typ, required, true, exampleKey), true
 				} else {
 					panic(fmt.Errorf("Request.%s second argument is not a BasicLit STRING but a %T: %v", f, call.Args[1], call.Args[1]))
 				}
@@ -1048,7 +1065,9 @@ func (v paramsVisitor) isHeaderParamCall(call *ast.CallExpr) (model.Param, bool)
 	if len(call.Args) == 2 && isFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), seqp("HeaderParamDoc")) {
 		if a, ok := isIdent(call.Args[0]); ok {
 			if summary, ok := isString(call.Args[1]); ok {
-				return model.NewParam(a.Name, summary, model.StringType, true, false), true
+				exampleKey := v.exampleKey
+				// TODO implement example key override using an inline comment
+				return model.NewParam(a.Name, summary, model.StringType, true, false, exampleKey), true
 			}
 		}
 	} else if len(call.Args) == 1 && isFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), seqp("HeaderParam")) {
@@ -1057,12 +1076,16 @@ func (v paramsVisitor) isHeaderParamCall(call *ast.CallExpr) (model.Param, bool)
 			if cg := findInlineComment(call.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
 				summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
 			}
-			return model.NewParam(a.Name, summary, model.StringType, true, false), true
+			exampleKey := v.exampleKey
+			// TODO implement example key override using an inline comment
+			return model.NewParam(a.Name, summary, model.StringType, true, false, exampleKey), true
 		}
 	} else if len(call.Args) == 2 && isFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), seqp("OptHeaderParamDoc")) {
 		if a, ok := isIdent(call.Args[0]); ok {
 			if summary, ok := isString(call.Args[1]); ok {
-				return model.NewParam(a.Name, summary, model.StringType, false, false), true
+				exampleKey := v.exampleKey
+				// TODO implement example key override using an inline comment
+				return model.NewParam(a.Name, summary, model.StringType, false, false, exampleKey), true
 			}
 		}
 	} else if len(call.Args) == 1 && isFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), seqp("OptHeaderParam")) {
@@ -1071,7 +1094,9 @@ func (v paramsVisitor) isHeaderParamCall(call *ast.CallExpr) (model.Param, bool)
 			if cg := findInlineComment(call.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
 				summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
 			}
-			return model.NewParam(a.Name, summary, model.StringType, false, false), true
+			exampleKey := v.exampleKey
+			// TODO implement example key override using an inline comment
+			return model.NewParam(a.Name, summary, model.StringType, false, false, exampleKey), true
 		}
 	}
 	return model.Param{}, false
@@ -1103,7 +1128,7 @@ func (v paramsVisitor) isBuildFilterCall(call *ast.CallExpr) (map[string]model.P
 		return nil, nil, fmt.Errorf("failed to find declaration of 'buildEmailFilter' in the package '%s'", v.groupwarePkg.ID)
 	}
 
-	p := newParamsVisitor(v.fset, v.groupwarePkg, bf.Name.Name, v.typeMap, v.responseFuncs)
+	p := newParamsVisitor(v.fset, v.groupwarePkg, bf.Name.Name, v.typeMap, v.responseFuncs, v.exampleKey)
 	ast.Walk(p, bf.Body)
 	if err := errors.Join(*v.errs...); err != nil {
 		return nil, nil, err
@@ -1140,7 +1165,7 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 			return v
 		}
 
-		if p, ok := isAccountCall(d, v.groupwarePkg); ok {
+		if p, ok := isAccountCall(d, v.groupwarePkg, v.exampleKey); ok {
 			v.pathParams[p.Name] = p
 			return v
 		}
@@ -1153,7 +1178,7 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 			maps.Copy(v.undocumentedResults, undocumented)
 			return v
 		}
-		if p, _, ok := isNeedAccountCall(d, v.groupwarePkg); ok {
+		if p, _, ok := isNeedAccountCall(d, v.groupwarePkg, v.exampleKey); ok {
 			v.pathParams[p.Name] = p
 		}
 		if p, ok := v.isPathParamCall(d); ok {
@@ -1188,7 +1213,7 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 var commentRegex = regexp.MustCompile(`^\s*//+\s?(.*)\s*$`)
 
 func parseComment(text string) string {
-	m := commentRegex.FindAllStringSubmatch(text, 2)
+	m := commentRegex.FindAllStringSubmatch(text, 1)
 	if m != nil {
 		return m[0][1]
 	} else {
@@ -1598,6 +1623,13 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 					}
 				}
 
+				exampleKey := ""
+				for _, c := range comments {
+					if m := apiExampleKey.FindAllStringSubmatch(c, 1); m != nil {
+						exampleKey = m[0][1]
+					}
+				}
+
 				resp := map[int]model.Resp{}
 				bodyParams := map[string]model.Param{}
 				headerParams := map[string]model.Param{}
@@ -1606,7 +1638,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 				potentialErrors := map[string]model.PotentialError{}
 				{
 					if fun.Body != nil {
-						v := newParamsVisitor(groupware.Fset, groupware, n, typeMap, responseFuncs)
+						v := newParamsVisitor(groupware.Fset, groupware, n, typeMap, responseFuncs, exampleKey)
 						ast.Walk(v, fun.Body)
 						if err := errors.Join(*v.errs...); err != nil {
 							panic(err)
@@ -1678,6 +1710,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 					Summary:         summary,
 					Description:     description,
 					InferredSummary: inferredSummary,
+					ExampleKey:      exampleKey,
 				})
 
 			}
