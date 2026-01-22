@@ -810,6 +810,20 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 				}
 			}
 		}
+		if template.Info != nil {
+			if template.Info.Title != "" {
+				doc.Info.Summary = template.Info.Title
+			}
+			if template.Info.Summary != "" {
+				doc.Info.Summary = template.Info.Summary
+			}
+			if template.Info.Description != "" {
+				doc.Info.Description = template.Info.Description
+			}
+			if template.Info.TermsOfService != "" {
+				doc.Info.TermsOfService = template.Info.TermsOfService
+			}
+		}
 	}
 
 	if (len(untagged) < 1 || len(unified) < 1) && doc.Extensions != nil {

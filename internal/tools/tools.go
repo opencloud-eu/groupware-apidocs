@@ -38,6 +38,16 @@ func Collect[A, B any](s []A, mapper func(A) B) []B {
 	return r
 }
 
+func Filter[T any](s []T, predicate func(T) bool) []T {
+	r := []T{}
+	for _, a := range s {
+		if predicate(a) {
+			r = append(r, a)
+		}
+	}
+	return r
+}
+
 func CollectValues[K comparable, A any, B any](m map[K]A, mapper func(A) B) []B {
 	r := make([]B, len(m))
 	i := 0

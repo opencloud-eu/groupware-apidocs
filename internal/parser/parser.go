@@ -1405,7 +1405,11 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 				panic(fmt.Errorf("failed to find the package '%s'", config.VersionPackageID))
 			}
 		}
-		version = parseVersion(versionPackage)
+		// version = parseLatestTag(versionPackage)
+		version, err = detectVersion(chdir)
+		if err != nil {
+			return model.Model{}, err
+		}
 	}
 
 	httpStatusMap := map[string]int{}

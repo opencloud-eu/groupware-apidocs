@@ -529,7 +529,7 @@ func parseHttpStatuses(p *packages.Package) map[string]int {
 	return m
 }
 
-func parseVersion(p *packages.Package) string {
+func parseLatestTag(p *packages.Package) string {
 	for _, syn := range p.Syntax {
 		for _, decl := range syn.Decls {
 			if g, ok := isGenDecl(decl); ok {
