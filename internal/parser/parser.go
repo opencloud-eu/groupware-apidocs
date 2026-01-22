@@ -1379,6 +1379,35 @@ func lines(s []*ast.Comment) []string {
 }
 
 func Parse(chdir string, basepath string) (model.Model, error) {
+	version := ""
+	{
+		cfg := &packages.Config{
+			Mode:  packages.LoadSyntax,
+			Dir:   chdir,
+			Tests: false,
+		}
+		pkgs, err := packages.Load(cfg, config.VersionSourceDirectory)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if packages.PrintErrors(pkgs) > 0 {
+			return model.Model{}, fmt.Errorf("failed to parse the package '%s'", config.VersionPackageID)
+		}
+		var versionPackage *packages.Package = nil
+		{
+			for _, p := range pkgs {
+				if p.ID == config.VersionPackageID {
+					versionPackage = p
+					break
+				}
+			}
+			if versionPackage == nil {
+				panic(fmt.Errorf("failed to find the package '%s'", config.VersionPackageID))
+			}
+		}
+		version = parseVersion(versionPackage)
+	}
+
 	httpStatusMap := map[string]int{}
 	{
 		cfg := &packages.Config{
@@ -1925,6 +1954,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 	types := slices.Collect(maps.Values(typeMap))
 
 	return model.Model{
+		Version:                             version,
 		Routes:                              routes,
 		PathParams:                          pathParams,
 		QueryParams:                         queryParams,

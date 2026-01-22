@@ -529,6 +529,28 @@ func parseHttpStatuses(p *packages.Package) map[string]int {
 	return m
 }
 
+func parseVersion(p *packages.Package) string {
+	for _, syn := range p.Syntax {
+		for _, decl := range syn.Decls {
+			if g, ok := isGenDecl(decl); ok {
+				for _, s := range g.Specs {
+					if v, ok := isValueSpec(s); ok && v != nil {
+						for i, ident := range v.Names {
+							if ident != nil && ident.Name == "LatestTag" {
+								value := v.Values[i]
+								if text, ok := isString(value); ok {
+									return text
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
 func findGroupwareErrorDefinitions(s ast.Spec, groupwareErrorType model.Type, errorCodeDefinitions map[string]string, httpStatusMap map[string]int) (map[string]model.PotentialError, error) {
 	m := map[string]model.PotentialError{}
 	if v, ok := isValueSpec(s); ok {

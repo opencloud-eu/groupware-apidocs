@@ -258,6 +258,7 @@ func (r Examples) ForResponse() ([]Example, bool) {
 }
 
 type Model struct {
+	Version                                      string
 	Routes                                       []Endpoint
 	PathParams                                   map[string]ParamDefinition
 	QueryParams                                  map[string]ParamDefinition

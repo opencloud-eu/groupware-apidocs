@@ -22,11 +22,7 @@ import (
 )
 
 var (
-	openIdConnectUrl = "https://keycloak.opencloud.test/realms/openCloud/.well-known/openid-configuration"
-	contact          = &base.Contact{
-		Name:  "Pascal Bleser",
-		Email: "p.bleser@opencloud.eu",
-	}
+	openIdConnectUrl         = "https://keycloak.opencloud.test/realms/openCloud/.well-known/openid-configuration"
 	schemaPropertiesExamples = false // can be toggled, but property examples in schemas are not rendered in redoc, so we should leave this on false
 )
 
@@ -773,8 +769,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 		Version: "3.0.4",
 		Info: &base.Info{
 			Title:   "OpenCloud Groupware API",
-			Contact: contact,
-			Version: "0.0.0",
+			Version: m.Version,
 		},
 		Paths: &v3.Paths{
 			PathItems: pathItemMap,

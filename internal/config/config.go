@@ -11,7 +11,8 @@ const (
 	GroupwarePackageID  = "github.com/opencloud-eu/opencloud/services/groupware/pkg/groupware"
 	JmapPackageID       = "github.com/opencloud-eu/opencloud/pkg/jmap"
 	JSCalendarPackageID = "github.com/opencloud-eu/opencloud/pkg/jscalendar"
-	JSContactPacakgeID  = "github.com/opencloud-eu/opencloud/pkg/jscontact"
+	JSContactPackageID  = "github.com/opencloud-eu/opencloud/pkg/jscontact"
+	VersionPackageID    = "github.com/opencloud-eu/opencloud/pkg/version"
 
 	NetHttpPackageID = "net/http"
 )
@@ -23,11 +24,13 @@ var SourceDirectories = []string{
 	"./pkg/jscalendar",
 }
 
+var VersionSourceDirectory = "./pkg/version"
+
 var PackageIDs = []string{
 	GroupwarePackageID,
 	JmapPackageID,
 	JSCalendarPackageID,
-	JSContactPacakgeID,
+	JSContactPackageID,
 }
 
 var MiddlewareFunctionNames = []string{
