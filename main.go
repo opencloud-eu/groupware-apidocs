@@ -10,16 +10,21 @@ import (
 	"opencloud.eu/groupware-apidocs/internal/parser"
 )
 
-var verbose bool = false
+var (
+	verbose                 bool   = false
+	defaultOpenIdConnectUrl string = "https://keycloak.opencloud.test/realms/openCloud/.well-known/openid-configuration"
+)
 
 func main() {
 	chdir := ""
 	template := ""
 	includeBasicAuth := false
+	openIdConnectUrl := defaultOpenIdConnectUrl
 	flag.StringVar(&chdir, "C", "", "Change into the specified directory before parsing source files")
 	flag.StringVar(&template, "t", "", "Template file")
 	flag.BoolVar(&includeBasicAuth, "b", false, "Include basic authentication")
 	flag.BoolVar(&verbose, "v", false, "Output verbose information while parsing source files")
+	flag.StringVar(&openIdConnectUrl, "O", defaultOpenIdConnectUrl, "OIDC URL to reference in the documentation")
 	flag.Parse()
 
 	var err error
@@ -44,7 +49,7 @@ func main() {
 		panic(err)
 	} else {
 		//o := AnsiSink{Verbose: verbose}
-		o := openapi.NewOpenApiSink(basepath, template, includeBasicAuth)
+		o := openapi.NewOpenApiSink(basepath, template, includeBasicAuth, openIdConnectUrl)
 		if err := o.Output(model, os.Stdout); err != nil {
 			panic(err)
 		}

@@ -15,14 +15,12 @@ import (
 	base "github.com/pb33f/libopenapi/datamodel/high/base"
 	highbase "github.com/pb33f/libopenapi/datamodel/high/base"
 	v3 "github.com/pb33f/libopenapi/datamodel/high/v3"
-	"github.com/pb33f/libopenapi/orderedmap"
 	"go.yaml.in/yaml/v4"
 	"opencloud.eu/groupware-apidocs/internal/model"
 	"opencloud.eu/groupware-apidocs/internal/tools"
 )
 
 var (
-	openIdConnectUrl         = "https://keycloak.opencloud.test/realms/openCloud/.well-known/openid-configuration"
 	schemaPropertiesExamples = false // can be toggled, but property examples in schemas are not rendered in redoc, so we should leave this on false
 )
 
@@ -30,13 +28,15 @@ type OpenApiSink struct {
 	BasePath         string
 	TemplateFile     string
 	IncludeBasicAuth bool
+	OpenIdConnectUrl string
 }
 
-func NewOpenApiSink(basepath string, templateFile string, includeBasicAuth bool) OpenApiSink {
+func NewOpenApiSink(basepath string, templateFile string, includeBasicAuth bool, openIdConnectUrl string) OpenApiSink {
 	return OpenApiSink{
 		BasePath:         basepath,
 		TemplateFile:     templateFile,
 		IncludeBasicAuth: includeBasicAuth,
+		OpenIdConnectUrl: openIdConnectUrl,
 	}
 }
 
@@ -97,6 +97,22 @@ func unsignedIntegerSchema(d string) *highbase.Schema {
 
 func booleanSchema(d string) *highbase.Schema {
 	return &base.Schema{Type: []string{"boolean"}, Description: d}
+}
+
+func enumSchema(d string, values []string) *highbase.Schema {
+	nodes := make([]*yaml.Node, len(values))
+	for i, value := range values {
+		nodes[i] = &yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Tag:   "!!str",
+			Value: value,
+		}
+	}
+	return &base.Schema{
+		Type:        []string{"string"},
+		Enum:        nodes,
+		Description: d,
+	}
 }
 
 type renderedExample struct {
@@ -276,7 +292,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 		maps.Copy(renderedExampleMap, renderExamples(qualified, tools.Identity))
 	}
 
-	pathItemMap := orderedmap.New[string, *v3.PathItem]()
+	pathItemMap := somap[*v3.PathItem]()
 	schemaComponentTypes := map[string]model.Type{} // collects items that need to be documented in /components/schemas
 	neededArrayExamples := map[string]bool{}
 	neededMapExamples := map[string]bool{}
@@ -346,7 +362,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 							Explode:     &h.Exploded,
 						}
 						if len(h.Examples) > 0 {
-							examples := orderedmap.New[string, *highbase.Example]()
+							examples := somap[*highbase.Example]()
 							for summary, e := range h.Examples {
 								examples.Set(summary, &highbase.Example{
 									Summary: summary,
@@ -383,7 +399,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 					}
 					op.Tags = append(op.Tags, "all")
 
-					op.Extensions = ext1("x-oc-source", fmt.Sprintf("%s:%d", im.Source, im.Line))
+					op.Extensions = ext("x-oc-source", fmt.Sprintf("%s:%d", im.Source, im.Line))
 				}
 
 				if op != nil {
@@ -425,14 +441,14 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 		}
 	}
 
-	componentResponses := orderedmap.New[string, *v3.Response]()
+	componentResponses := somap[*v3.Response]()
 	{
 		for code, t := range m.DefaultResponses {
 			if t.Type == nil {
 				continue
 			}
 			key := fmt.Sprintf("%s.%d", t.Type.Key(), code)
-			contentMap := orderedmap.New[string, *v3.MediaType]()
+			contentMap := somap[*v3.MediaType]()
 			if schema, ext, err := res.schema(ResponseScope, fmt.Sprintf("default response '%s'", t.Type.Name()), t.Type, []string{t.Type.Name()}, schemaComponentTypes, ""); err != nil {
 				return fmt.Errorf("failed to reference default response type %s: %v", t, err)
 			} else {
@@ -447,7 +463,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 				summary = tools.MustHttpStatusText(code)
 			}
 
-			headers := orderedmap.New[string, *v3.Header]()
+			headers := somap[*v3.Header]()
 			for k, h := range m.DefaultResponseHeaders {
 				if !h.IsApplicable(code) {
 					continue
@@ -465,7 +481,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 	}
 
 	// add the schema of types that are referenced as body parameters or responses
-	componentSchemas := orderedmap.New[string, *highbase.SchemaProxy]()
+	componentSchemas := somap[*highbase.SchemaProxy]()
 	{
 		schemas := map[string]*highbase.SchemaProxy{}
 
@@ -552,7 +568,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 		}
 	}
 
-	componentHeaders := orderedmap.New[string, *v3.Header]()
+	componentHeaders := somap[*v3.Header]()
 	{
 		for name, desc := range m.DefaultResponseHeaders {
 			req := false
@@ -570,7 +586,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 				Explode:     explode,
 			}
 			if len(desc.Examples) > 0 {
-				examples := orderedmap.New[string, *highbase.Example]()
+				examples := somap[*highbase.Example]()
 				for k, e := range desc.Examples {
 					examples.Set(k, &highbase.Example{
 						Summary: k,
@@ -583,7 +599,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 		}
 	}
 
-	componentExamples := orderedmap.New[string, *highbase.Example]()
+	componentExamples := somap[*highbase.Example]()
 	{
 		for _, examples := range m.Examples {
 			if list, ok := examples.ForResponse(); ok {
@@ -594,7 +610,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 						//Summary:     name, // not used
 						Description: e.Title,
 						Value:       rendered,
-						Extensions: ext3(
+						Extensions: ext(
 							"oc-example-key", e.Key,
 							"oc-example-origin", e.Origin,
 							"oc-example-scope", string(ResponseScope),
@@ -617,7 +633,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 							// Summary:     "Array of " + name, // not used
 							Description: e.Title,
 							Value:       rendered,
-							Extensions: ext4(
+							Extensions: ext(
 								"oc-example-key", e.Key,
 								"oc-example-origin", e.Origin,
 								"oc-example-scope", string(ResponseScope),
@@ -643,7 +659,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 							// Summary:     "Array of " + name, // not used
 							Description: e.Title,
 							Value:       rendered,
-							Extensions: ext4(
+							Extensions: ext(
 								"oc-example-key", e.Key,
 								"oc-example-origin", e.Origin,
 								"oc-example-scope", string(ResponseScope),
@@ -664,12 +680,12 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 		Examples:  componentExamples,
 	}
 
-	var securitySchemes *orderedmap.Map[string, *v3.SecurityScheme] = orderedmap.New[string, *v3.SecurityScheme]()
+	securitySchemes := somap[*v3.SecurityScheme]()
 	{
 		securitySchemes.Set("oidc", &v3.SecurityScheme{
 			Type:             "openIdConnect",
 			Description:      "Authentication for API Calls via OIDC",
-			OpenIdConnectUrl: openIdConnectUrl,
+			OpenIdConnectUrl: s.OpenIdConnectUrl,
 		})
 		if s.IncludeBasicAuth {
 			securitySchemes.Set("basic", &v3.SecurityScheme{
@@ -681,7 +697,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 	}
 	components.SecuritySchemes = securitySchemes
 
-	extensions := orderedmap.New[string, *yaml.Node]()
+	extensions := somap[*yaml.Node]()
 	if len(m.UndocumentedResults) > 0 || len(m.UndocumentedRequestBodies) > 0 {
 		container := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
 		if len(m.UndocumentedResults) > 0 {
@@ -738,27 +754,11 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 					filename = relpath
 				}
 
-				c := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
-				{
-					k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: id}
-					parent.Content = append(parent.Content, k, c)
-				}
-
-				{
-					k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "pos"}
-					v := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: fmt.Sprintf("%s:%d:%d", filename, u.Pos.Line, u.Pos.Column)}
-					c.Content = append(c.Content, k, v)
-				}
-				{
-					k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "verb"}
-					v := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: u.Endpoint.Verb}
-					c.Content = append(c.Content, k, v)
-				}
-				{
-					k := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "path"}
-					v := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: u.Endpoint.Path}
-					c.Content = append(c.Content, k, v)
-				}
+				ydict(parent, id,
+					"pos", fmt.Sprintf("%s:%d:%d", filename, u.Pos.Line, u.Pos.Column),
+					"verb", u.Endpoint.Verb,
+					"path", u.Endpoint.Path,
+				)
 			}
 		}
 
@@ -766,7 +766,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 	}
 
 	doc := &v3.Document{
-		Version: "3.0.4",
+		Version: "3.0.4", // this is the OpenAPI version, not the OpenCloud version
 		Info: &base.Info{
 			Title:   "OpenCloud Groupware API",
 			Version: m.Version,
@@ -900,63 +900,6 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 	return nil
 }
 
-var verbSortOrder = []string{
-	"GET",
-	"QUERY",
-	"HEAD",
-	"POST",
-	"PUT",
-	"DELETE",
-	"PATCH",
-	"OPTIONS",
-	"TRACE",
-}
-
-func verbSort(a, b string) int {
-	i := slices.Index(verbSortOrder, a)
-	j := slices.Index(verbSortOrder, b)
-	if i >= 0 {
-		if j >= 0 {
-			return i - j
-		} else {
-			return -1
-		}
-	} else {
-		if j >= 0 {
-			return 1
-		} else {
-			return strings.Compare(a, b)
-		}
-	}
-}
-
-func find[E any](s []E, matcher func(E) bool) (E, bool) {
-	for _, e := range s {
-		if matcher(e) {
-			return e, true
-		}
-	}
-	var zero E
-	return zero, false
-}
-
-func merge[K comparable, V any](dst **orderedmap.Map[K, V], src *orderedmap.Map[K, V]) {
-	if src == nil || dst == nil {
-		return
-	}
-	if *dst == nil {
-		*dst = src
-		return
-	}
-	for k := range src.KeysFromOldest() {
-		if _, ok := (*dst).Get(k); !ok {
-			if v, ok := src.Get(k); ok {
-				(*dst).Set(k, v)
-			}
-		}
-	}
-}
-
 func assign(op *v3.Operation, verb string, pathItem *v3.PathItem) error {
 	switch verb {
 	case "GET":
@@ -979,7 +922,7 @@ func assign(op *v3.Operation, verb string, pathItem *v3.PathItem) error {
 		pathItem.Trace = op
 	default:
 		if pathItem.AdditionalOperations == nil {
-			pathItem.AdditionalOperations = orderedmap.New[string, *v3.Operation]()
+			pathItem.AdditionalOperations = somap[*v3.Operation]()
 		}
 		pathItem.AdditionalOperations.Set(verb, op)
 	}
@@ -998,40 +941,4 @@ func makeObjectSchema(itemSchema *highbase.SchemaProxy) *highbase.Schema {
 		Type:                 []string{"object"},
 		AdditionalProperties: &base.DynamicValue[*base.SchemaProxy, bool]{N: 0, A: itemSchema},
 	}
-}
-
-func ext1(k string, v string) *orderedmap.Map[string, *yaml.Node] {
-	ext := orderedmap.New[string, *yaml.Node]()
-	ext.Set(k, &yaml.Node{Kind: yaml.ScalarNode, Value: v})
-	return ext
-}
-
-func ext2(k1, v1, k2, v2 string) *orderedmap.Map[string, *yaml.Node] {
-	ext := orderedmap.New[string, *yaml.Node]()
-	ext.Set(k1, &yaml.Node{Kind: yaml.ScalarNode, Value: v1})
-	ext.Set(k2, &yaml.Node{Kind: yaml.ScalarNode, Value: v2})
-	return ext
-}
-
-func ext3(k1, v1, k2, v2, k3, v3 string) *orderedmap.Map[string, *yaml.Node] {
-	ext := orderedmap.New[string, *yaml.Node]()
-	ext.Set(k1, &yaml.Node{Kind: yaml.ScalarNode, Value: v1})
-	ext.Set(k2, &yaml.Node{Kind: yaml.ScalarNode, Value: v2})
-	ext.Set(k3, &yaml.Node{Kind: yaml.ScalarNode, Value: v3})
-	return ext
-}
-
-func ext4(k1, v1, k2, v2, k3, v3, k4, v4 string) *orderedmap.Map[string, *yaml.Node] {
-	ext := orderedmap.New[string, *yaml.Node]()
-	ext.Set(k1, &yaml.Node{Kind: yaml.ScalarNode, Value: v1})
-	ext.Set(k2, &yaml.Node{Kind: yaml.ScalarNode, Value: v2})
-	ext.Set(k3, &yaml.Node{Kind: yaml.ScalarNode, Value: v3})
-	ext.Set(k4, &yaml.Node{Kind: yaml.ScalarNode, Value: v4})
-	return ext
-}
-
-func omap1[K comparable, V any](k K, v V) *orderedmap.Map[K, V] {
-	m := orderedmap.New[K, V]()
-	m.Set(k, v)
-	return m
 }

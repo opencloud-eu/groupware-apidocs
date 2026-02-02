@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
 	"log"
@@ -97,12 +98,12 @@ type GlobalParamDefinitions struct {
 	headerParams map[string]model.ParamDefinition
 }
 
-func scrapeGlobalParamDecls(decls []ast.Decl) (GlobalParamDefinitions, error) {
+func scrapeGlobalParamDecls(decls []ast.Decl, pkg *packages.Package) (GlobalParamDefinitions, error) {
 	pathParams := map[string]model.ParamDefinition{}
 	queryParams := map[string]model.ParamDefinition{}
 	headerParams := map[string]model.ParamDefinition{}
 	for _, decl := range decls {
-		if list, err := consts(decl); err != nil {
+		if list, err := consts(decl, pkg); err != nil {
 			return GlobalParamDefinitions{}, err
 		} else {
 			for _, c := range list {
@@ -1442,7 +1443,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 
 	routeFuncs := map[string]*types.Func{}
 	typeMap := map[string]model.Type{}
-	constsMap := map[string]bool{}
+	constsMap := map[string]Const{}
 	groupwareErrorCodesMap := map[string]string{}
 	groupwareErrorsMap := map[string]model.PotentialError{}
 	routes := []model.Endpoint{}
@@ -1452,6 +1453,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 	ims := []model.Impl{}
 	undocumentedResults := map[string]model.Undocumented{}
 	undocumentedResultBodies := map[string]model.Undocumented{}
+	enumMap := map[string][]model.Enum{}
 	{
 		cfg := &packages.Config{
 			Mode:  packages.LoadSyntax,
@@ -1486,34 +1488,92 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 
 			for _, name := range p.Types.Scope().Names() {
 				obj := p.Types.Scope().Lookup(name)
-				switch t := obj.Type().(type) {
-				case *types.Signature:
-					// skip methods
-				case *types.Named:
-					// this is a globally defined type
-					if r, err := typeOf(t, typeMap, p); err != nil {
-						log.Panicf("failed to determine type of named %#v: %v", t, err)
-					} else if r != nil {
-						typeMap[r.Key()] = r
-					}
-				case *types.Basic:
-					switch t.Kind() {
-					case types.UntypedString, types.String:
-						// a const string, we want to collect those for detecting enums
-						constsMap[name] = true
-					case types.UntypedInt, types.Int, types.UntypedBool, types.Bool:
-						// ignore
+				switch obj.(type) {
+				case *types.Func:
+					// ignore functions
+				case *types.Const, *types.Var:
+					switch t := obj.Type().(type) {
+					case *types.Signature:
+						// skip methods
+					case *types.Named:
+						if r, err := typeOf(t, typeMap, p); err != nil {
+							log.Panicf("failed to determine type of named %#v: %v", t, err)
+						} else if r != nil {
+							pos := p.Fset.Position(obj.Pos())
+							value := ""
+							switch c := obj.(type) {
+							case *types.Const:
+								if c.Val().Kind() == constant.String {
+									value = constant.StringVal(c.Val())
+								} else {
+									value = c.Val().ExactString()
+								}
+							case *types.Var:
+								continue
+							default:
+								log.Panicf("failed to analyze constant value %s: is not a Const not a Var but a %T", name, obj)
+							}
+							comments := []string{}
+							if cg := findInlineComment(obj.Pos(), p); cg != nil && cg.List != nil {
+								for _, c := range cg.List {
+									comments = append(comments, c.Text)
+								}
+							}
+							if _, ok := enumMap[r.Key()]; !ok {
+								enumMap[r.Key()] = []model.Enum{}
+							}
+							enumMap[r.Key()] = append(enumMap[r.Key()], model.Enum{Name: name, TypeId: r.Key(), Value: value, Pos: pos, Comments: comments})
+						}
+					case *types.Basic:
+						pos := p.Fset.Position(obj.Pos())
+						switch t.Kind() {
+						case types.UntypedString, types.String:
+							// a const string, we want to collect those for detecting enums
+							comments := []string{}
+							if cg := findInlineComment(obj.Pos(), p); cg != nil && cg.List != nil {
+								for _, c := range cg.List {
+									comments = append(comments, c.Text)
+								}
+							}
+							value := ""
+							switch c := obj.(type) {
+							case *types.Const:
+								value = c.Val().String()
+							default:
+								log.Panicf("failed to analyze constant value %s: is not a Const but a %T", name, obj)
+							}
+
+							constsMap[name] = Const{Name: name, Value: value, Comments: comments, Pos: pos}
+						case types.UntypedInt, types.Int, types.UntypedBool, types.Bool:
+							// ignore
+						default:
+							log.Panicf("%s is Basic but not string: %s", name, t.Name())
+						}
+					case *types.Slice:
+						//fmt.Printf("globvar(slice): %s: %s\n", name, t.String())
+					case *types.Map:
+						//fmt.Printf("globvar(map): %s: %s\n", name, t.String())
+					case *types.Pointer:
+						//fmt.Printf("globvar(ptr): %s: %s\n", name, t.String())
 					default:
-						log.Panicf("%s is Basic but not string: %s", name, t.Name())
+						log.Panicf("failed to analyze const %s: is not a Named but a %T", name, t)
 					}
-				case *types.Slice:
-					//fmt.Printf("globvar(slice): %s: %s\n", name, t.String())
-				case *types.Map:
-					//fmt.Printf("globvar(map): %s: %s\n", name, t.String())
-				case *types.Pointer:
-					//fmt.Printf("globvar(ptr): %s: %s\n", name, t.String())
+				case *types.TypeName:
+					switch t := obj.Type().(type) {
+					case *types.Signature:
+						// skip methods
+					case *types.Named:
+						// this is a globally defined type
+						if r, err := typeOf(t, typeMap, p); err != nil {
+							log.Panicf("failed to determine type of named %#v: %v", t, err)
+						} else if r != nil {
+							typeMap[r.Key()] = r
+						}
+					default:
+						log.Panicf("failed to analyze type %s: is not a Named but a %T", name, t)
+					}
 				default:
-					log.Panicf("failed to analyze type %s: is not a Named but a %T", name, t)
+					log.Panicf("failed to analyze type %s: is not a Named but a %T", name, obj)
 				}
 			}
 		}
@@ -1575,7 +1635,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 				}
 			}
 			{
-				if g, err := scrapeGlobalParamDecls(syntax.Decls); err != nil {
+				if g, err := scrapeGlobalParamDecls(syntax.Decls, groupware); err != nil {
 					panic(err)
 				} else {
 					maps.Copy(pathParams, g.pathParams)
@@ -1850,8 +1910,6 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 		}
 	}
 
-	enums := map[string][]string{} // TODO implement enums
-
 	defaultResponses := map[int]model.DefaultResponseDesc{}
 	{
 		if t, ok := typeMap["groupware.ErrorResponse"]; ok {
@@ -1966,7 +2024,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 		Impls:                               ims,
 		Types:                               types,
 		Examples:                            exampleMap,
-		Enums:                               enums,
+		Enums:                               enumMap,
 		DefaultResponses:                    defaultResponses,
 		DefaultResponseHeaders:              defaultResponseHeaders,
 		CommonRequestHeaders:                commonRequestHeaders,

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"opencloud.eu/groupware-apidocs/internal/model"
+	"opencloud.eu/groupware-apidocs/internal/tools"
 )
 
 type AnsiSink struct {
@@ -136,7 +137,7 @@ func printType(w io.Writer, t model.Type, m model.Model, l int, p string, path [
 		if d, ok := v.Deref(); ok {
 			fmt.Fprintf(w, "%s (%s)", t.Key(), d.String())
 			if n, ok := m.Enums[t.Key()]; ok {
-				fmt.Fprintf(w, " [%s]", strings.Join(n, ","))
+				fmt.Fprintf(w, " [%s]", strings.Join(tools.Collect(n, func(e model.Enum) string { return e.Value }), ","))
 			}
 			fmt.Fprintf(w, "\n")
 		}

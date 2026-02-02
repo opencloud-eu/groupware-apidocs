@@ -78,6 +78,17 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 	if t == nil {
 		return nil, nil, fmt.Errorf("schematize: t is nil (path=%s)", strings.Join(path, " > "))
 	}
+	n := t.Name()
+	var _ = n
+
+	// is it an enum?
+	if enums, ok := s.m.Enums[t.Key()]; ok {
+		// we can assume (?) that the underlying type is a string
+		ext := ext("x-oc-type-source-enum", t.Key())
+		values := tools.Collect(enums, func(e model.Enum) string { return e.Value })
+		return highbase.CreateSchemaProxy(enumSchema(desc, values)), ext, nil
+	}
+
 	if elt, ok := t.Element(); ok {
 		if t.IsMap() {
 			if deref, ext, err := s.schema(scope, ctx, elt, tools.Append(path, t.Name()), schemaComponentTypes, desc); err != nil {
@@ -101,16 +112,17 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 			return nil, nil, fmt.Errorf("failed to schematize type: has Element() but is neither map nor array: %#v", t)
 		}
 	}
+
 	d, ok := t.Deref()
 	if !ok {
 		d = t
 	}
 	if d.Name() == "PatchObject" {
-		ext := ext1("x-oc-type-source-basic", d.Key())
+		ext := ext("x-oc-type-source-basic", d.Key())
 		return highbase.CreateSchemaProxy(patchObjectSchema), ext, nil
 	}
 	if d.IsBasic() {
-		ext := ext1("x-oc-type-source-basic", d.Key())
+		ext := ext("x-oc-type-source-basic", d.Key())
 		switch d.Key() {
 		case "io.Closer":
 			return nil, ext, nil // TODO streaming
@@ -240,7 +252,7 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 			return nil, nil, fmt.Errorf("schematize: %s: failed to find referenced type in typeMap: %s", ctx, ref)
 		}
 
-		var ext *orderedmap.Map[string, *yaml.Node]
+		var e *orderedmap.Map[string, *yaml.Node]
 		if pos, ok := t.Pos(); ok {
 			filename := pos.Filename
 			if relpath, err := filepath.Rel(s.basePath, filename); err != nil {
@@ -248,15 +260,15 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 			} else {
 				filename = relpath
 			}
-			ext = ext2(
+			e = ext(
 				"x-oc-type-source-type", t.Key(),
 				"x-oc-type-source-pos", fmt.Sprintf("%s:%d:%d", filename, pos.Line, pos.Column),
 			)
 		} else {
-			ext = ext1("x-oc-type-source-type", t.Key())
+			e = ext("x-oc-type-source-type", t.Key())
 		}
 
-		return highbase.CreateSchemaProxyRef(SchemaComponentRefPrefix + ref), ext, nil
+		return highbase.CreateSchemaProxyRef(SchemaComponentRefPrefix + ref), e, nil
 	}
 }
 
@@ -310,7 +322,7 @@ func (s resolver) bodyparams(params []model.Param, im model.Impl, schemaComponen
 								// Summary:     "body", // not used
 								Description: example.Title,
 								Value:       rendered,
-								Extensions: ext2(
+								Extensions: ext(
 									"oc-example-origin", example.Origin,
 									"oc-example-scope", "bodyparam/"+string(RequestScope),
 								),
@@ -353,7 +365,7 @@ func (s resolver) bodyparams(params []model.Param, im model.Impl, schemaComponen
 		Required:    tools.BoolPtr(true),
 		Content:     omap1("application/json", &v3.MediaType{Schema: schemaRef, Examples: examples}),
 		Description: desc,
-		Extensions:  ext1("x-oc-ref-source", "bodyparams of "+im.Name),
+		Extensions:  ext("x-oc-ref-source", "bodyparams of "+im.Name),
 	}, nil
 }
 
@@ -455,7 +467,7 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 	for code, resp := range resps {
 		contentMap := orderedmap.New[string, *v3.MediaType]()
 		if resp.Type != nil {
-			if schema, ext, err := s.schema(
+			if schema, ex, err := s.schema(
 				ResponseScope,
 				fmt.Sprintf("verb='%s' path='%s' fun='%s': response type '%s'", im.Endpoint.Verb, im.Endpoint.Path, im.Endpoint.Fun, resp.Type.Key()),
 				resp.Type, []string{resp.Type.Name()}, schemaComponentTypes, ""); err != nil {
@@ -528,7 +540,7 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 						} else {
 							examples.Set(pe.Payload.Detail, &highbase.Example{
 								Description: pe.Payload.Detail,
-								Extensions:  ext1("x-oc-gwe-id", pe.Name),
+								Extensions:  ext("x-oc-gwe-id", pe.Name),
 								Value:       node,
 							})
 						}
@@ -546,7 +558,7 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 							} else {
 								examples.Set(pe.Payload.Detail, &highbase.Example{
 									Description: pe.Payload.Detail,
-									Extensions:  ext1("x-oc-gwe-id", pe.Name),
+									Extensions:  ext("x-oc-gwe-id", pe.Name),
 									Value:       node,
 								})
 							}
@@ -559,7 +571,7 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 				}
 				contentMap.Set("application/json", &v3.MediaType{
 					Schema:     schema,
-					Extensions: ext,
+					Extensions: ex,
 					Examples:   examples,
 				})
 			}
@@ -637,7 +649,7 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 			// Summary: // not displayed, use Description
 			Description: summary,
 			Content:     contentMap,
-			Extensions:  ext1("x-of-source", fmt.Sprintf("responses of %s at %s:%d%d", im.Name, im.Filename, im.Line, im.Column)),
+			Extensions:  ext("x-of-source", fmt.Sprintf("responses of %s at %s:%d%d", im.Name, im.Filename, im.Line, im.Column)),
 			Headers:     headers,
 		})
 	}

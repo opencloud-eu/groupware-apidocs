@@ -257,6 +257,14 @@ func (r Examples) ForResponse() ([]Example, bool) {
 	return r.DefaultExamples, true
 }
 
+type Enum struct {
+	Name     string
+	Value    string
+	TypeId   string
+	Comments []string
+	Pos      token.Position
+}
+
 type Model struct {
 	Version                                      string
 	Routes                                       []Endpoint
@@ -266,7 +274,7 @@ type Model struct {
 	Impls                                        []Impl
 	Types                                        []Type
 	Examples                                     map[string]Examples
-	Enums                                        map[string][]string
+	Enums                                        map[string][]Enum
 	DefaultResponses                             map[int]DefaultResponseDesc
 	DefaultResponseHeaders                       map[string]DefaultResponseHeaderDesc
 	CommonRequestHeaders                         []RequestHeaderDesc

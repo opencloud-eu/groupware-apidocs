@@ -340,9 +340,10 @@ type Const struct {
 	Name     string
 	Value    string
 	Comments []string
+	Pos      token.Position
 }
 
-func consts(decl ast.Decl) ([]Const, error) {
+func consts(decl ast.Decl, p *packages.Package) ([]Const, error) {
 	results := []Const{}
 	switch v := decl.(type) {
 	case *ast.GenDecl:
@@ -373,8 +374,9 @@ func consts(decl ast.Decl) ([]Const, error) {
 						comments = append(comments, c.Text)
 					}
 				}
+				pos := p.Fset.Position(a.Pos())
 				if name != "" {
-					results = append(results, Const{Name: name, Value: value, Comments: comments})
+					results = append(results, Const{Name: name, Value: value, Comments: comments, Pos: pos})
 				}
 			}
 		}
