@@ -93,6 +93,7 @@ type DefaultResponseHeaderDesc struct {
 	OnlyCodes []int
 	OnError   bool
 	OnSuccess bool
+	TypeId    string
 }
 
 func (h DefaultResponseHeaderDesc) IsApplicable(code int) bool {

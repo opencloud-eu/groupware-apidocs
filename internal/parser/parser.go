@@ -1941,6 +1941,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 		}
 		defaultResponseHeaders["Object-Type"] = model.DefaultResponseHeaderDesc{
 			Summary:   "The type of JMAP objects returned in the response",
+			TypeId:    "groupware.ResponseObjectType",
 			OnError:   true,
 			OnSuccess: true,
 			Examples: map[string]string{

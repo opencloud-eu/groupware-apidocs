@@ -302,6 +302,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 	slices.Sort(pathKeys)
 
 	res := newResolver(s.BasePath, m, renderedExampleMap)
+	typeMap := tools.Index(m.Types, func(t model.Type) string { return t.Key() })
 
 	for _, path := range pathKeys {
 		var pathItem *v3.PathItem = nil
@@ -579,11 +580,30 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 			if desc.Explode {
 				explode = true
 			}
+
+			e := ext()
+			var schema *highbase.SchemaProxy
+			if desc.TypeId != "" {
+				if t, ok := typeMap[desc.TypeId]; ok {
+					if s, ext, err := res.schema(ResponseScope, fmt.Sprintf("resolving default response header '%s'", name), t, []string{name}, typeMap, desc.Summary); err != nil {
+						return err
+					} else {
+						schema = s
+						e = ext
+					}
+				} else {
+					log.Panicf("failed to find type '%s' referenced in default response header '%s'", desc.TypeId, name)
+				}
+			} else {
+				schema = highbase.CreateSchemaProxy(stringSchema(desc.Summary))
+			}
+
 			header := &v3.Header{
 				Description: desc.Summary,
-				Schema:      highbase.CreateSchemaProxy(stringSchema(desc.Summary)),
+				Schema:      schema,
 				Required:    req,
 				Explode:     explode,
+				Extensions:  e,
 			}
 			if len(desc.Examples) > 0 {
 				examples := somap[*highbase.Example]()
