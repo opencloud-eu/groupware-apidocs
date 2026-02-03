@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 
+	"golang.org/x/exp/utf8string"
 	"golang.org/x/tools/go/packages"
 	"opencloud.eu/groupware-apidocs/internal/config"
 	"opencloud.eu/groupware-apidocs/internal/model"
@@ -30,9 +31,10 @@ var (
 	apiExampleKey = regexp.MustCompile(`^\s*@api:examples?\s+(.+)\s*$`)
 
 	tagAttrNameRegex      = regexp.MustCompile(`json:"(.+?)(?:,(omitempty|omitzero))?"`)
-	tagDocRegex           = regexp.MustCompile(`doc:"(req|opt|)"`)
+	tagRequiredRegex      = regexp.MustCompile(`doc:"(req|opt|)"`)
 	tagNotInRequestRegex  = regexp.MustCompile(`doc:"(!request)"`)
 	tagNotInResponseRegex = regexp.MustCompile(`doc:"(!response)"`)
+	tagDefaultValueRegex  = regexp.MustCompile(`docdef:"(.*?)"`)
 )
 
 func findRouteDefinition(a *ast.File) *ast.FuncDecl {
@@ -109,13 +111,13 @@ func scrapeGlobalParamDecls(decls []ast.Decl, pkg *packages.Package) (GlobalPara
 			for _, c := range list {
 				if tools.HasAnyPrefix(c.Name, config.PathParamPrefixes) {
 					desc := describeParam(c.Comments)
-					pathParams[c.Name] = model.NewParamDefinition(c.Value, desc)
+					pathParams[c.Name] = model.NewParamDefinition(c.Value, desc, "") // path parameters can't have default values
 				} else if tools.HasAnyPrefix(c.Name, config.QueryParamPrefixes) {
 					desc := describeParam(c.Comments)
-					queryParams[c.Name] = model.NewParamDefinition(c.Value, desc)
+					queryParams[c.Name] = model.NewParamDefinition(c.Value, desc, "") // TODO default values for query parameters
 				} else if tools.HasAnyPrefix(c.Name, config.HeaderParamPrefixes) {
 					desc := describeParam(c.Comments)
-					headerParams[c.Name] = model.NewParamDefinition(c.Value, desc)
+					headerParams[c.Name] = model.NewParamDefinition(c.Value, desc, "") // TODO default values for header parameters
 				}
 			}
 		}
@@ -208,6 +210,8 @@ func skipEmptyLines(i int, lines []string) int {
 }
 
 func summarizeType(comments []string) (string, string) {
+	comments = processComments(comments)
+
 	if len(comments) < 1 {
 		return "", ""
 	}
@@ -344,6 +348,7 @@ func inferEndpointSummary(verb string, path string) (string, model.InferredSumma
 func summarizeEndpoint(verb string, path string, comments []string) (string, string, model.InferredSummary, error) {
 	summary := ""
 	description := ""
+	comments = processComments(comments)
 	if len(comments) > 0 {
 		i := 0
 		summary = decomment(comments[i])
@@ -413,11 +418,15 @@ type returnVisitor struct {
 	successfulResponseFuncs map[string]responseFunc
 	potentialErrors         map[string]bool
 	exampleKey              string
+	defaultValue            string
 	undocumented            map[string]token.Position
 	errs                    *[]error
 }
 
-func newReturnVisitor(fset *token.FileSet, groupwarePkg *packages.Package, typeMap map[string]model.Type, successfulResponseFuncs map[string]responseFunc, exampleKey string) returnVisitor {
+func newReturnVisitor(fset *token.FileSet, groupwarePkg *packages.Package, typeMap map[string]model.Type,
+	successfulResponseFuncs map[string]responseFunc,
+	exampleKey string,
+	defaultValue string) returnVisitor {
 	return returnVisitor{
 		fset:                    fset,
 		groupwarePkg:            groupwarePkg,
@@ -426,6 +435,7 @@ func newReturnVisitor(fset *token.FileSet, groupwarePkg *packages.Package, typeM
 		potentialErrors:         map[string]bool{},
 		successfulResponseFuncs: successfulResponseFuncs,
 		exampleKey:              exampleKey,
+		defaultValue:            defaultValue,
 		undocumented:            map[string]token.Position{},
 		errs:                    &[]error{},
 	}
@@ -534,7 +544,7 @@ func (v returnVisitor) isSuccessfulResponseFunc(r *ast.ReturnStmt) (ast.Expr, st
 				if i.Name == f {
 					summary := ""
 					if cg := findInlineComment(c.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
-						summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
+						summary = strings.Join(processComments(lines(cg.List)), "\n") // TODO parse one-liner response function comment for api tags if needed
 					}
 					var body ast.Expr = nil
 					if spec.bodyArgPos >= 0 {
@@ -774,7 +784,7 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 				*v.errs = append(*v.errs, err)
 				return nil
 			} else {
-				v.responses[code] = model.NewResp(t, summary, v.exampleKey)
+				v.responses[code] = model.NewResp(t, summary, v.exampleKey, v.defaultValue)
 			}
 		}
 	} else if ok := v.isErrorResponseFunc(r); ok {
@@ -790,6 +800,7 @@ type paramsVisitor struct {
 	groupwarePkg              *packages.Package
 	typeMap                   map[string]model.Type
 	exampleKey                string
+	defaultValue              string
 	headerParams              map[string]model.Param
 	queryParams               map[string]model.Param
 	pathParams                map[string]model.Param
@@ -862,9 +873,9 @@ func (v paramsVisitor) isBodyCall(call *ast.CallExpr) (model.Param, bool, error)
 					if typ, err := toType(n, v.typeMap); err != nil {
 						return model.Param{}, false, fmt.Errorf("failed to resolve type identifier '%s' from call to Request.body[doc]()", n)
 					} else {
-						exampleKey := v.exampleKey
-						// TODO implement example key override using an inline comment
-						return model.NewParam(n, desc, typ, required, exploded, exampleKey), true, nil
+						exampleKey := v.exampleKey // TODO implement example key override using an inline comment
+						defaultValue := ""         // TODO implement default value for Request.body() calls
+						return model.NewParam(n, desc, typ, required, defaultValue, exploded, exampleKey), true, nil
 					}
 				} else {
 					return model.Param{}, false, err
@@ -884,7 +895,7 @@ func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Resp, ma
 	if len(call.Args) == 3 && isMethodCall(call, "Groupware", "respond") {
 		arg := call.Args[2]
 		if c, ok := isClosure(arg); ok {
-			rv := newReturnVisitor(v.fset, v.groupwarePkg, v.typeMap, v.responseFuncs, v.exampleKey)
+			rv := newReturnVisitor(v.fset, v.groupwarePkg, v.typeMap, v.responseFuncs, v.exampleKey, v.defaultValue)
 			ast.Walk(rv, c)
 			if err := errors.Join(*rv.errs...); err != nil {
 				return nil, nil, nil, false, err
@@ -903,10 +914,11 @@ func isAccountCall(call *ast.CallExpr, p *packages.Package, exampleKey string) (
 		exploded := false
 		summary := ""
 		if cg := findInlineComment(call.Pos(), p); cg != nil && cg.List != nil {
-			summary = strings.Join(lines(cg.List), "\n")
+			summary = strings.Join(processComments(lines(cg.List)), "\n")
 		}
 		// TODO implement example key override using an inline comment
-		return model.NewParam(config.AccountIdUriParamName, summary, model.StringType, required, exploded, exampleKey), true
+		defaultValue := "" // there is no default value for those calls, they require finding an account ID or fall back to the default one depending on the request type, but we cannot document that
+		return model.NewParam(config.AccountIdUriParamName, summary, model.StringType, required, defaultValue, exploded, exampleKey), true
 	} else {
 		return model.Param{}, false
 	}
@@ -924,11 +936,12 @@ func isNeedAccountCall(call *ast.CallExpr, p *packages.Package, exampleKey strin
 					if t, ok := isIdent(f.Type); ok && t.Name == "Request" {
 						summary := ""
 						if cg := findInlineComment(call.Pos(), p); cg != nil && cg.List != nil {
-							summary = strings.Join(lines(cg.List), "\n")
+							summary = strings.Join(processComments(lines(cg.List)), "\n")
 						}
 						objType := m[0][1]
 						// TODO implement example key override using an inline comment
-						return model.NewParam(config.AccountIdUriParamName, summary, model.StringType, required, exploded, exampleKey), objType, true
+						defaultValue := "" // there is no default value for those calls, they require finding an account ID or fall back to the default one depending on the request type, but we cannot document that
+						return model.NewParam(config.AccountIdUriParamName, summary, model.StringType, required, defaultValue, exploded, exampleKey), objType, true
 					}
 				}
 			}
@@ -1001,15 +1014,16 @@ func (v paramsVisitor) isParseQueryParamCall(call *ast.CallExpr) (model.Param, b
 
 	if summary == "" {
 		if cg := findInlineComment(call.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
-			summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
+			summary = strings.Join(processComments(lines(cg.List)), "\n") // TODO parse one-liner response function comment for api tags if needed
 		}
 	}
-	exampleKey := v.exampleKey
-	// TODO implement example key override using an inline comment
+	exampleKey := v.exampleKey // TODO implement example key override using an inline comment
+
+	defaultValue := "" // TODO implement default values in query parameter parsing calls
 
 	// TODO resolve name (QueryParamXYZ) to its string value using model.QueryParams map
 
-	return model.NewParam(name, summary, typ, required, exploded, exampleKey), true, nil
+	return model.NewParam(name, summary, typ, required, defaultValue, exploded, exampleKey), true, nil
 }
 
 func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (model.Param, bool) {
@@ -1018,11 +1032,11 @@ func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (model.Param, bool) {
 		if a, ok := isIdent(call.Args[1]); ok {
 			summary := ""
 			if cg := findInlineComment(call.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
-				summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
+				summary = strings.Join(processComments(lines(cg.List)), "\n") // TODO parse one-liner response function comment for api tags if needed
 			}
-			exampleKey := v.exampleKey
-			// TODO implement example key override using an inline comment
-			return model.NewParam(a.Name, summary, model.StringType, required, false, exampleKey), true
+			exampleKey := v.exampleKey // TODO implement example key override using an inline comment
+			defaultValue := ""         // no default values for path parameters
+			return model.NewParam(a.Name, summary, model.StringType, required, defaultValue, false, exampleKey), true
 		} else {
 			panic(fmt.Errorf("chi.URLParam first argument is not an Ident but a %T: %v", call.Args[0], call.Args[0]))
 		}
@@ -1031,11 +1045,11 @@ func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (model.Param, bool) {
 			if a, ok := isIdent(call.Args[0]); ok {
 				summary := ""
 				if cg := findInlineComment(call.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
-					summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
+					summary = strings.Join(processComments(lines(cg.List)), "\n") // TODO parse one-liner response function comment for api tags if needed
 				}
-				exampleKey := v.exampleKey
-				// TODO implement example key override using an inline comment
-				return model.NewParam(a.Name, summary, model.StringType, required, false, exampleKey), true
+				exampleKey := v.exampleKey // TODO implement example key override using an inline comment
+				defaultValue := ""         // no default values for path parameters
+				return model.NewParam(a.Name, summary, model.StringType, required, defaultValue, false, exampleKey), true
 			} else {
 				panic(fmt.Errorf("Request.%s first argument is not an Ident but a %T: %v", f, call.Args[0], call.Args[0]))
 			}
@@ -1046,9 +1060,9 @@ func (v paramsVisitor) isPathParamCall(call *ast.CallExpr) (model.Param, bool) {
 			}
 			if a, ok := isIdent(call.Args[0]); ok {
 				if desc, ok := isString(call.Args[1]); ok {
-					exampleKey := v.exampleKey
-					// TODO implement example key override using an inline comment
-					return model.NewParam(a.Name, desc, typ, required, true, exampleKey), true
+					exampleKey := v.exampleKey // TODO implement example key override using an inline comment
+					defaultValue := ""         // no default values for path parameters
+					return model.NewParam(a.Name, desc, typ, required, defaultValue, true, exampleKey), true
 				} else {
 					panic(fmt.Errorf("Request.%s second argument is not a BasicLit STRING but a %T: %v", f, call.Args[1], call.Args[1]))
 				}
@@ -1066,38 +1080,38 @@ func (v paramsVisitor) isHeaderParamCall(call *ast.CallExpr) (model.Param, bool)
 	if len(call.Args) == 2 && isFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), seqp("HeaderParamDoc")) {
 		if a, ok := isIdent(call.Args[0]); ok {
 			if summary, ok := isString(call.Args[1]); ok {
-				exampleKey := v.exampleKey
-				// TODO implement example key override using an inline comment
-				return model.NewParam(a.Name, summary, model.StringType, true, false, exampleKey), true
+				exampleKey := v.exampleKey // TODO implement example key override using an inline comment
+				defaultValue := ""         // TODO implement default value for header parameters
+				return model.NewParam(a.Name, summary, model.StringType, true, defaultValue, false, exampleKey), true
 			}
 		}
 	} else if len(call.Args) == 1 && isFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), seqp("HeaderParam")) {
 		if a, ok := isIdent(call.Args[0]); ok {
 			summary := ""
 			if cg := findInlineComment(call.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
-				summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
+				summary = strings.Join(processComments(lines(cg.List)), "\n") // TODO parse one-liner response function comment for api tags if needed
 			}
-			exampleKey := v.exampleKey
-			// TODO implement example key override using an inline comment
-			return model.NewParam(a.Name, summary, model.StringType, true, false, exampleKey), true
+			exampleKey := v.exampleKey // TODO implement example key override using an inline comment
+			defaultValue := ""         // TODO implement default value for header parameters
+			return model.NewParam(a.Name, summary, model.StringType, true, defaultValue, false, exampleKey), true
 		}
 	} else if len(call.Args) == 2 && isFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), seqp("OptHeaderParamDoc")) {
 		if a, ok := isIdent(call.Args[0]); ok {
 			if summary, ok := isString(call.Args[1]); ok {
-				exampleKey := v.exampleKey
-				// TODO implement example key override using an inline comment
-				return model.NewParam(a.Name, summary, model.StringType, false, false, exampleKey), true
+				exampleKey := v.exampleKey // TODO implement example key override using an inline comment
+				defaultValue := ""         // TODO implement default value for header parameters
+				return model.NewParam(a.Name, summary, model.StringType, false, defaultValue, false, exampleKey), true
 			}
 		}
 	} else if len(call.Args) == 1 && isFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), seqp("OptHeaderParam")) {
 		if a, ok := isIdent(call.Args[0]); ok {
 			summary := ""
 			if cg := findInlineComment(call.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
-				summary = strings.Join(lines(cg.List), "\n") // TODO parse one-liner response function comment for api tags if needed
+				summary = strings.Join(processComments(lines(cg.List)), "\n") // TODO parse one-liner response function comment for api tags if needed
 			}
-			exampleKey := v.exampleKey
-			// TODO implement example key override using an inline comment
-			return model.NewParam(a.Name, summary, model.StringType, false, false, exampleKey), true
+			exampleKey := v.exampleKey // TODO implement example key override using an inline comment
+			defaultValue := ""         // TODO implement default value for header parameters
+			return model.NewParam(a.Name, summary, model.StringType, false, defaultValue, false, exampleKey), true
 		}
 	}
 	return model.Param{}, false
@@ -1519,6 +1533,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 									comments = append(comments, c.Text)
 								}
 							}
+							comments = processComments(comments)
 							if _, ok := enumMap[r.Key()]; !ok {
 								enumMap[r.Key()] = []model.Enum{}
 							}
@@ -1535,6 +1550,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 									comments = append(comments, c.Text)
 								}
 							}
+							comments = processComments(comments)
 							value := ""
 							switch c := obj.(type) {
 							case *types.Const:
@@ -1916,8 +1932,9 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 			for _, statusCode := range []int{400, 404, 500} {
 				summary := tools.MustHttpStatusText(statusCode) // TODO describe default responses
 				defaultResponses[statusCode] = model.DefaultResponseDesc{
-					Type:    t,
-					Summary: summary,
+					Type:         t,
+					Summary:      summary,
+					DefaultValue: "",
 				}
 			}
 		}
@@ -2190,13 +2207,14 @@ func typeOf(t types.Type, mem map[string]model.Type, p *packages.Package) (model
 						attr = f.name
 					}
 					fieldReq := fieldRequirement(f.tag)
+					fieldDef := fieldDefaultValue(f.tag)
 					fieldInRequest := fieldInRequest(f.tag)
 					fieldInResponse := fieldInResponse(f.tag)
 					fieldSummary := strings.Join(findComments(name+"."+f.name, f.pos, token.VAR, p), "\n") // TODO process comments for fields
 					if typ, err := typeOf(f.typ, mem, p); err != nil {
 						return nil, err
 					} else {
-						fields = append(fields, model.NewField(f.name, attr, typ, f.tag, fieldSummary, fieldReq, fieldInRequest, fieldInResponse))
+						fields = append(fields, model.NewField(f.name, attr, typ, f.tag, fieldSummary, fieldReq, fieldDef, fieldInRequest, fieldInResponse))
 					}
 				}
 			}
@@ -2260,7 +2278,7 @@ var (
 )
 
 func fieldRequirement(tag string) *bool {
-	if m := tagDocRegex.FindAllStringSubmatch(tag, 1); m != nil {
+	if m := tagRequiredRegex.FindAllStringSubmatch(tag, 1); m != nil {
 		switch m[0][1] {
 		case "req":
 			return Required
@@ -2271,6 +2289,14 @@ func fieldRequirement(tag string) *bool {
 		}
 	}
 	return nil
+}
+
+func fieldDefaultValue(tag string) string {
+	if m := tagDefaultValueRegex.FindAllStringSubmatch(tag, 1); m != nil {
+		return m[0][1]
+	} else {
+		return ""
+	}
 }
 
 func fieldInRequest(tag string) bool {
@@ -2367,4 +2393,38 @@ func aliasOf(t *types.Alias, mem map[string]model.Type, p *packages.Package) (mo
 		name, pkg := typeNames(t.Obj())
 		return model.NewAliasType(pkg, name, e, p.Fset.Position(t.Obj().Pos())), nil
 	}
+}
+
+// this is slightly unnecessarily complicated because Go regexp don't support negative lookahead
+// and thus we also need to capture the character that follows the closing bracket, if there is one
+// and then check within the function below whether it is a "(" or not which, if it is, would mean
+// that we need to return the string as-is because it is already followed by a link for the RFC
+var commentRfcRegex = regexp.MustCompile(`(\[RFC\d+\].?)`)
+
+func processComments(source []string) []string {
+	if source == nil {
+		return nil
+	}
+	result := make([]string, len(source))
+	for i, line := range source {
+		patched := commentRfcRegex.ReplaceAllStringFunc(line, func(s string) string {
+			if strings.HasSuffix(s, "(") {
+				return s
+			}
+			suffix := ""
+			if !strings.HasSuffix(s, "]") {
+				u := utf8string.NewString(s)
+				suffix = u.Slice(u.RuneCount()-1, u.RuneCount())
+				s = u.Slice(0, u.RuneCount()-1)
+			}
+			full := s
+			s = strings.TrimSuffix(s, "]")
+			s = strings.TrimPrefix(s, "[")
+			return fmt.Sprintf("%s(https://www.rfc-editor.org/rfc/%s.html)%s", full, strings.ToLower(s), suffix)
+		})
+		patched = strings.ReplaceAll(patched, "“", "\"")
+		patched = strings.ReplaceAll(patched, "”", "\"")
+		result[i] = patched
+	}
+	return result
 }

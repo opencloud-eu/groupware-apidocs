@@ -71,35 +71,67 @@ var (
 	patchObjectSchema = arraySchema(base.CreateSchemaProxy(anySchema("")))
 )
 
-func timeSchema(d string) *highbase.Schema {
-	return &base.Schema{Type: []string{"string"}, Format: "date-time", Description: d}
+func timeSchema(desc string) *highbase.Schema {
+	return &base.Schema{Type: []string{"string"}, Format: "date-time", Description: desc}
 }
 
-func anySchema(d string) *highbase.Schema {
-	return &base.Schema{Type: []string{"object"}, Description: d}
+func anySchema(desc string) *highbase.Schema {
+	return &base.Schema{Type: []string{"object"}, Description: desc}
 }
 
-func objectSchema(d string) *highbase.Schema {
-	return &base.Schema{Type: []string{"object"}, Description: d}
+func objectSchema(desc string) *highbase.Schema {
+	return &base.Schema{Type: []string{"object"}, Description: desc}
 }
 
-func stringSchema(d string) *highbase.Schema {
-	return &base.Schema{Type: []string{"string"}, Description: d}
+func stringSchema(desc string, def string) *highbase.Schema {
+	if def == "" {
+		return &base.Schema{Type: []string{"string"}, Description: desc}
+	} else {
+		return &base.Schema{Type: []string{"string"}, Description: desc, Default: &yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Tag:   "!!str",
+			Value: def,
+		}}
+	}
 }
 
-func integerSchema(d string) *highbase.Schema {
-	return &base.Schema{Type: []string{"integer"}, Description: d}
+func integerSchema(desc string, def string) *highbase.Schema {
+	if def == "" {
+		return &base.Schema{Type: []string{"integer"}, Description: desc}
+	} else {
+		return &base.Schema{Type: []string{"integer"}, Description: desc, Default: &yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Tag:   "!!int",
+			Value: def,
+		}}
+	}
 }
 
-func unsignedIntegerSchema(d string) *highbase.Schema {
-	return &base.Schema{Type: []string{"integer"}, Minimum: tools.ZerofPtr(), Description: d}
+func unsignedIntegerSchema(desc string, def string) *highbase.Schema {
+	if def == "" {
+		return &base.Schema{Type: []string{"integer"}, Minimum: tools.ZerofPtr(), Description: desc}
+	} else {
+		return &base.Schema{Type: []string{"integer"}, Minimum: tools.ZerofPtr(), Description: desc, Default: &yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Tag:   "!!int",
+			Value: def,
+		}}
+	}
 }
 
-func booleanSchema(d string) *highbase.Schema {
-	return &base.Schema{Type: []string{"boolean"}, Description: d}
+func booleanSchema(desc string, def string) *highbase.Schema {
+	if def == "" {
+		return &base.Schema{Type: []string{"boolean"}, Description: desc}
+	} else {
+		return &base.Schema{Type: []string{"boolean"}, Description: desc, Default: &yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Tag:   "!!bool",
+			Value: def,
+		}}
+	}
 }
 
-func enumSchema(d string, values []string) *highbase.Schema {
+func enumSchema(desc string, def string, values []string) *highbase.Schema {
 	nodes := make([]*yaml.Node, len(values))
 	for i, value := range values {
 		nodes[i] = &yaml.Node{
@@ -108,10 +140,19 @@ func enumSchema(d string, values []string) *highbase.Schema {
 			Value: value,
 		}
 	}
+	var defNode *yaml.Node = nil
+	if def != "" {
+		defNode = &yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Tag:   "!!str",
+			Value: def,
+		}
+	}
 	return &base.Schema{
 		Type:        []string{"string"},
 		Enum:        nodes,
-		Description: d,
+		Description: desc,
+		Default:     defNode,
 	}
 }
 
@@ -353,7 +394,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 
 					// common header parameters
 					for _, h := range m.CommonRequestHeaders {
-						schemaRef := highbase.CreateSchemaProxy(stringSchema(h.Description))
+						schemaRef := highbase.CreateSchemaProxy(stringSchema(h.Description, h.DefaultValue))
 						param := &v3.Parameter{
 							Name:        h.Name,
 							In:          "header",
@@ -450,7 +491,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 			}
 			key := fmt.Sprintf("%s.%d", t.Type.Key(), code)
 			contentMap := somap[*v3.MediaType]()
-			if schema, ext, err := res.schema(ResponseScope, fmt.Sprintf("default response '%s'", t.Type.Name()), t.Type, []string{t.Type.Name()}, schemaComponentTypes, ""); err != nil {
+			if schema, ext, err := res.schema(ResponseScope, fmt.Sprintf("default response '%s'", t.Type.Name()), t.Type, []string{t.Type.Name()}, schemaComponentTypes, "", t.DefaultValue); err != nil {
 				return fmt.Errorf("failed to reference default response type %s: %v", t, err)
 			} else {
 				contentMap.Set("application/json", &v3.MediaType{
@@ -505,12 +546,10 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 						// (just the type name, e.g. "jmap.Identity") is assumed to be the one to reference in requests
 						ref := t.Key()
 						ctx := fmt.Sprintf("resolving schema component type '%s'", t.Key())
-						if schema, _, err := res.schema(ResponseScope, ctx, t, []string{}, moreSchemaComponentTypes, t.Summary()); err == nil {
-							if schema != nil {
-								schemas[ref] = schema
-							}
-						} else {
+						if schema, _, err := res.schema(ResponseScope, ctx, t, []string{}, moreSchemaComponentTypes, t.Summary(), ""); err != nil {
 							return err
+						} else if schema != nil {
+							schemas[ref] = schema
 						}
 					}
 
@@ -520,12 +559,10 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 						// requests, with this suffix:
 						ref := t.Key() + RequestExceptionTypeKeySuffix
 						ctx := fmt.Sprintf("resolving schema component type '%s' for use in requests", t.Key())
-						if schema, _, err := res.schema(RequestScope, ctx, t, []string{}, moreSchemaComponentTypes, t.Summary()); err == nil {
-							if schema != nil {
-								schemas[ref] = schema
-							}
-						} else {
+						if schema, _, err := res.schema(RequestScope, ctx, t, []string{}, moreSchemaComponentTypes, t.Summary(), ""); err != nil {
 							return err
+						} else if schema != nil {
+							schemas[ref] = schema
 						}
 					}
 				}
@@ -585,7 +622,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 			var schema *highbase.SchemaProxy
 			if desc.TypeId != "" {
 				if t, ok := typeMap[desc.TypeId]; ok {
-					if s, ext, err := res.schema(ResponseScope, fmt.Sprintf("resolving default response header '%s'", name), t, []string{name}, typeMap, desc.Summary); err != nil {
+					if s, ext, err := res.schema(ResponseScope, fmt.Sprintf("resolving default response header '%s'", name), t, []string{name}, typeMap, desc.Summary, desc.DefaultValue); err != nil {
 						return err
 					} else {
 						schema = s
@@ -595,7 +632,7 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 					log.Panicf("failed to find type '%s' referenced in default response header '%s'", desc.TypeId, name)
 				}
 			} else {
-				schema = highbase.CreateSchemaProxy(stringSchema(desc.Summary))
+				schema = highbase.CreateSchemaProxy(stringSchema(desc.Summary, desc.DefaultValue))
 			}
 
 			header := &v3.Header{

@@ -8,14 +8,15 @@ import (
 )
 
 type Field struct {
-	Name       string
-	Attr       string
-	Type       Type
-	Tag        string
-	Summary    string
-	Required   *bool
-	InRequest  bool
-	InResponse bool
+	Name         string
+	Attr         string
+	Type         Type
+	Tag          string
+	Summary      string
+	Required     *bool
+	DefaultValue string
+	InRequest    bool
+	InResponse   bool
 }
 
 var (
@@ -23,16 +24,17 @@ var (
 	NotRequired = boolPtr(false)
 )
 
-func NewField(name string, attr string, t Type, tag string, summary string, req *bool, inRequest bool, inResponse bool) Field {
+func NewField(name string, attr string, t Type, tag string, summary string, req *bool, defaultValue string, inRequest bool, inResponse bool) Field {
 	return Field{
-		Name:       name,
-		Attr:       attr,
-		Type:       t,
-		Tag:        tag,
-		Summary:    summary,
-		Required:   req,
-		InRequest:  inRequest,
-		InResponse: inResponse,
+		Name:         name,
+		Attr:         attr,
+		Type:         t,
+		Tag:          tag,
+		Summary:      summary,
+		Required:     req,
+		DefaultValue: defaultValue,
+		InRequest:    inRequest,
+		InResponse:   inResponse,
 	}
 }
 
@@ -81,19 +83,21 @@ type ResponseHeaderDesc struct {
 }
 
 type DefaultResponseDesc struct {
-	Summary string
-	Type    Type
+	Summary      string
+	Type         Type
+	DefaultValue string
 }
 
 type DefaultResponseHeaderDesc struct {
-	Summary   string
-	Required  bool
-	Explode   bool
-	Examples  map[string]string
-	OnlyCodes []int
-	OnError   bool
-	OnSuccess bool
-	TypeId    string
+	Summary      string
+	Required     bool
+	DefaultValue string
+	Explode      bool
+	Examples     map[string]string
+	OnlyCodes    []int
+	OnError      bool
+	OnSuccess    bool
+	TypeId       string
 }
 
 func (h DefaultResponseHeaderDesc) IsApplicable(code int) bool {
@@ -110,11 +114,12 @@ func (h DefaultResponseHeaderDesc) IsApplicable(code int) bool {
 }
 
 type RequestHeaderDesc struct {
-	Name        string
-	Description string
-	Required    bool
-	Exploded    bool
-	Examples    map[string]string
+	Name         string
+	Description  string
+	Required     bool
+	DefaultValue string
+	Exploded     bool
+	Examples     map[string]string
 }
 
 type Endpoint struct {
@@ -124,16 +129,18 @@ type Endpoint struct {
 }
 
 type Resp struct {
-	Summary    string
-	Type       Type
-	ExampleKey string
+	Summary      string
+	Type         Type
+	ExampleKey   string
+	DefaultValue string
 }
 
-func NewResp(typ Type, summary string, exampleKey string) Resp {
+func NewResp(typ Type, summary string, exampleKey string, defaultValue string) Resp {
 	return Resp{
-		Summary:    summary,
-		Type:       typ,
-		ExampleKey: exampleKey,
+		Summary:      summary,
+		Type:         typ,
+		ExampleKey:   exampleKey,
+		DefaultValue: defaultValue,
 	}
 }
 
@@ -146,34 +153,38 @@ func NewRespWithoutBody(summary string) Resp {
 }
 
 type ParamDefinition struct {
-	Name        string
-	Description string
+	Name         string
+	Description  string
+	DefaultValue string
 }
 
-func NewParamDefinition(name string, description string) ParamDefinition {
+func NewParamDefinition(name string, description string, defaultValue string) ParamDefinition {
 	return ParamDefinition{
-		Name:        name,
-		Description: description,
+		Name:         name,
+		Description:  description,
+		DefaultValue: defaultValue,
 	}
 }
 
 type Param struct {
-	Name        string
-	Description string
-	Type        Type
-	Required    bool
-	Exploded    bool
-	ExampleKey  string
+	Name         string
+	Description  string
+	Type         Type
+	Required     bool
+	Exploded     bool
+	ExampleKey   string
+	DefaultValue string
 }
 
-func NewParam(name string, description string, t Type, required bool, exploded bool, exampleKey string) Param {
+func NewParam(name string, description string, t Type, required bool, defaultValue string, exploded bool, exampleKey string) Param {
 	return Param{
-		Name:        name,
-		Description: description,
-		Type:        t,
-		Required:    required,
-		Exploded:    exploded,
-		ExampleKey:  exampleKey,
+		Name:         name,
+		Description:  description,
+		Type:         t,
+		Required:     required,
+		Exploded:     exploded,
+		ExampleKey:   exampleKey,
+		DefaultValue: defaultValue,
 	}
 }
 

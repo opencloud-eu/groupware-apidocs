@@ -50,10 +50,14 @@ func (s resolver) parameter(p model.Param, in string, requiredByDefault bool, pa
 		if desc == "" {
 			desc = def.Description
 		}
+		defaultValue := p.DefaultValue
+		if defaultValue == "" {
+			defaultValue = def.DefaultValue
+		}
 		var schema *highbase.SchemaProxy
 		var ext *orderedmap.Map[string, *yaml.Node]
 		if p.Type != nil {
-			if s, e, err := s.schema(RequestScope, fmt.Sprintf("parameterize(%v, %s)", p, in), p.Type, []string{p.Name}, schemaComponentTypes, desc); err != nil {
+			if s, e, err := s.schema(RequestScope, fmt.Sprintf("parameterize(%v, %s)", p, in), p.Type, []string{p.Name}, schemaComponentTypes, desc, defaultValue); err != nil {
 				return nil, err
 			} else {
 				schema = s
@@ -74,7 +78,7 @@ func (s resolver) parameter(p model.Param, in string, requiredByDefault bool, pa
 	}
 }
 
-func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []string, schemaComponentTypes map[string]model.Type, desc string) (*highbase.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
+func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []string, schemaComponentTypes map[string]model.Type, desc string, defaultValue string) (*highbase.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
 	if t == nil {
 		return nil, nil, fmt.Errorf("schematize: t is nil (path=%s)", strings.Join(path, " > "))
 	}
@@ -86,12 +90,12 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 		// we can assume (?) that the underlying type is a string
 		ext := ext("x-oc-type-source-enum", t.Key())
 		values := tools.Collect(enums, func(e model.Enum) string { return e.Value })
-		return highbase.CreateSchemaProxy(enumSchema(desc, values)), ext, nil
+		return highbase.CreateSchemaProxy(enumSchema(desc, defaultValue, values)), ext, nil
 	}
 
 	if elt, ok := t.Element(); ok {
 		if t.IsMap() {
-			if deref, ext, err := s.schema(scope, ctx, elt, tools.Append(path, t.Name()), schemaComponentTypes, desc); err != nil {
+			if deref, ext, err := s.schema(scope, ctx, elt, tools.Append(path, t.Name()), schemaComponentTypes, desc, defaultValue); err != nil {
 				return nil, nil, err
 			} else {
 				schema := makeObjectSchema(deref)
@@ -100,7 +104,7 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 				return highbase.CreateSchemaProxy(schema), nil, nil
 			}
 		} else if t.IsArray() {
-			if deref, ext, err := s.schema(scope, ctx, elt, tools.Append(path, t.Name()), schemaComponentTypes, desc); err != nil {
+			if deref, ext, err := s.schema(scope, ctx, elt, tools.Append(path, t.Name()), schemaComponentTypes, desc, defaultValue); err != nil {
 				return nil, nil, err
 			} else {
 				schema := arraySchema(deref)
@@ -131,13 +135,13 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 		case "time.Time":
 			return highbase.CreateSchemaProxy(timeSchema(desc)), ext, nil
 		case "string":
-			return highbase.CreateSchemaProxy(stringSchema(desc)), ext, nil
+			return highbase.CreateSchemaProxy(stringSchema(desc, defaultValue)), ext, nil
 		case "int":
-			return highbase.CreateSchemaProxy(integerSchema(desc)), ext, nil
+			return highbase.CreateSchemaProxy(integerSchema(desc, defaultValue)), ext, nil
 		case "uint":
-			return highbase.CreateSchemaProxy(unsignedIntegerSchema(desc)), ext, nil
+			return highbase.CreateSchemaProxy(unsignedIntegerSchema(desc, defaultValue)), ext, nil
 		case "bool":
-			return highbase.CreateSchemaProxy(booleanSchema(desc)), ext, nil
+			return highbase.CreateSchemaProxy(booleanSchema(desc, defaultValue)), ext, nil
 		case "any":
 			return highbase.CreateSchemaProxy(anySchema(desc)), ext, nil
 		default:
@@ -185,7 +189,7 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 			}
 
 			ctx := fmt.Sprintf("%s.%s", ctx, f.Attr)
-			if fs, _, err := s.schema(scope, ctx, f.Type, tools.Append(path, t.Name()), schemaComponentTypes, f.Summary); err != nil {
+			if fs, _, err := s.schema(scope, ctx, f.Type, tools.Append(path, t.Name()), schemaComponentTypes, f.Summary, f.DefaultValue); err != nil {
 				return nil, nil, err
 			} else if fs != nil {
 				if f.Attr == "" {
@@ -272,9 +276,9 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 	}
 }
 
-func (s resolver) reqschema(param model.Param, im model.Impl, schemaComponentTypes map[string]model.Type, desc string) (*base.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
+func (s resolver) reqschema(param model.Param, im model.Impl, schemaComponentTypes map[string]model.Type, desc string, defaultValue string) (*base.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
 	if t, ok := s.typeMap[param.Name]; ok {
-		return s.schema(RequestScope, "reqschema", t, []string{im.Name}, schemaComponentTypes, desc)
+		return s.schema(RequestScope, "reqschema", t, []string{im.Name}, schemaComponentTypes, desc, defaultValue)
 	}
 
 	var schemaRef *base.SchemaProxy = nil
@@ -283,9 +287,11 @@ func (s resolver) reqschema(param model.Param, im model.Impl, schemaComponentTyp
 	case "map[string]any":
 		schemaRef = base.CreateSchemaProxy(objectSchema(desc))
 	case "string":
-		schemaRef = base.CreateSchemaProxy(stringSchema(desc))
+		schemaRef = base.CreateSchemaProxy(stringSchema(desc, defaultValue))
 	case "[]string":
-		schemaRef = base.CreateSchemaProxy(arraySchema(base.CreateSchemaProxy(stringSchema(desc))))
+		schemaRef = base.CreateSchemaProxy(arraySchema(base.CreateSchemaProxy(stringSchema(desc, defaultValue))))
+	case "bool":
+		schemaRef = base.CreateSchemaProxy(arraySchema(base.CreateSchemaProxy(booleanSchema(desc, defaultValue))))
 	case "any":
 		schemaRef = base.CreateSchemaProxy(anySchema(desc))
 	default:
@@ -305,7 +311,7 @@ func (s resolver) bodyparams(params []model.Param, im model.Impl, schemaComponen
 	case 0:
 		return nil, nil
 	case 1:
-		schemaRef, _, err = s.reqschema(params[0], im, schemaComponentTypes, params[0].Description)
+		schemaRef, _, err = s.reqschema(params[0], im, schemaComponentTypes, params[0].Description, params[0].DefaultValue)
 		desc = params[0].Description
 		exampleKey := params[0].Name
 		if params[0].ExampleKey != "" {
@@ -350,7 +356,7 @@ func (s resolver) bodyparams(params []model.Param, im model.Impl, schemaComponen
 		}
 	default:
 		schemaRef, err = tools.MapReduce(params, func(ref model.Param) (*highbase.SchemaProxy, bool, error) {
-			schemaRef, _, err := s.reqschema(ref, im, schemaComponentTypes, ref.Description)
+			schemaRef, _, err := s.reqschema(ref, im, schemaComponentTypes, ref.Description, ref.DefaultValue)
 			return schemaRef, true, err
 		}, func(schemas []*highbase.SchemaProxy) (*highbase.SchemaProxy, error) {
 			return base.CreateSchemaProxy(&base.Schema{OneOf: schemas}), nil
@@ -432,8 +438,8 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 		if _, ok := resps[pe.Payload.Status]; ok {
 			continue // there's already a response for that status code
 		}
-		summary := tools.MustHttpStatusText(pe.Payload.Status) // TODO have a more meaningful summary for this
-		resps[pe.Payload.Status] = model.NewResp(pe.Type, summary, pe.ExampleKey)
+		summary := tools.MustHttpStatusText(pe.Payload.Status)                        // TODO have a more meaningful summary for this
+		resps[pe.Payload.Status] = model.NewResp(pe.Type, summary, pe.ExampleKey, "") // TODO default value for responses
 	}
 
 	for _, scenario := range paramCases {
@@ -442,8 +448,8 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 				if _, ok := resps[pe.Payload.Status]; ok {
 					continue // we're good, there is already a response for that status code
 				}
-				summary := tools.MustHttpStatusText(pe.Payload.Status) // TODO have a more meaningful summary for this
-				resps[pe.Payload.Status] = model.NewResp(pe.Type, summary, pe.ExampleKey)
+				summary := tools.MustHttpStatusText(pe.Payload.Status)                        // TODO have a more meaningful summary for this
+				resps[pe.Payload.Status] = model.NewResp(pe.Type, summary, pe.ExampleKey, "") // TODO default value for responses
 			}
 		}
 	}
@@ -459,7 +465,7 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 				if t, ok := s.typeMap["groupware.ErrorResponse"]; ok {
 					respType = t
 				}
-				resps[code] = model.NewResp(respType, summary, "")
+				resps[code] = model.NewResp(respType, summary, "", "") // TODO default value for responses
 			}
 		}
 	}
@@ -470,7 +476,7 @@ func (s resolver) responses(im model.Impl, m model.Model, schemaComponentTypes m
 			if schema, ex, err := s.schema(
 				ResponseScope,
 				fmt.Sprintf("verb='%s' path='%s' fun='%s': response type '%s'", im.Endpoint.Verb, im.Endpoint.Path, im.Endpoint.Fun, resp.Type.Key()),
-				resp.Type, []string{resp.Type.Name()}, schemaComponentTypes, ""); err != nil {
+				resp.Type, []string{resp.Type.Name()}, schemaComponentTypes, "", resp.DefaultValue); err != nil {
 				return nil, fmt.Errorf("failed to reference response type %s: %v", resp.Type, err)
 			} else {
 				examples := orderedmap.New[string, *highbase.Example]()
