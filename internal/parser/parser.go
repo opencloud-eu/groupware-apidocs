@@ -1621,20 +1621,20 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 		}
 
 		// analyze routes, route functions and definitions of path and query parameter name
-		// constants in groupware_route.go
+		// constants in route.go
 		{
 			var syntax *ast.File = nil
 			{
 				for i, f := range groupware.CompiledGoFiles {
 					if rf, err := filepath.Rel(basepath, f); err != nil {
 						panic(err)
-					} else if rf == "services/groupware/pkg/groupware/groupware_route.go" {
+					} else if rf == "services/groupware/pkg/groupware/route.go" {
 						syntax = groupware.Syntax[i]
 						break
 					}
 				}
 				if syntax == nil {
-					panic("failed to find syntax for groupware_route.go")
+					panic("failed to find syntax for services/groupware/pkg/groupware/route.go")
 				}
 			}
 
@@ -1667,13 +1667,13 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 				for i, f := range groupware.CompiledGoFiles {
 					if rf, err := filepath.Rel(basepath, f); err != nil {
 						panic(err)
-					} else if rf == "services/groupware/pkg/groupware/groupware_error.go" {
+					} else if rf == "services/groupware/pkg/groupware/error.go" {
 						syntax = groupware.Syntax[i]
 						break
 					}
 				}
 				if syntax == nil {
-					panic("failed to find syntax for groupware_error.go")
+					panic("failed to find syntax for services/groupware/pkg/groupware/error.go")
 				}
 			}
 
@@ -1940,7 +1940,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 		}
 	}
 
-	// TODO extract default headers and their documentation from the source code (groupware_framework.go)
+	// TODO extract default headers and their documentation from the source code (framework.go)
 	defaultResponseHeaders := map[string]model.DefaultResponseHeaderDesc{}
 	{
 		// defaultHeaders["Content-Language"]
