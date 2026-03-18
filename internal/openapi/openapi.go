@@ -827,6 +827,11 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 		Info: &base.Info{
 			Title:   "OpenCloud Groupware API",
 			Version: m.Version,
+			License: &highbase.License{
+				Name:       "GNU Affero General Public License v3.0",
+				URL:        "https://github.com/opencloud-eu/docs/blob/main/LICENSE",
+				Identifier: "AGPL-3.0-or-later",
+			},
 		},
 		Paths: &v3.Paths{
 			PathItems: pathItemMap,
