@@ -1946,9 +1946,11 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 		// defaultHeaders["Content-Language"]
 		// defaultHeaders["ETag"]
 		defaultResponseHeaders["Session-State"] = model.DefaultResponseHeaderDesc{
-			Summary:  "The opaque state identifier for the JMAP Session",
-			Required: true,
-			Examples: map[string]string{"a JMAP Session identifier": "eish5Toh"},
+			Summary:   "The opaque state identifier for the JMAP Session",
+			OnError:   true,
+			OnSuccess: true,
+			Required:  true,
+			Examples:  map[string]string{"a JMAP Session identifier": "eish5Toh"},
 		}
 		defaultResponseHeaders["State"] = model.DefaultResponseHeaderDesc{
 			Summary:   "The opaque state identifier for the type of objects in the response (see the `Object-Type` header)",
