@@ -180,3 +180,7 @@ func MustHttpStatusText(code int) string {
 		panic(fmt.Errorf("unsupported HTTP code %d", code))
 	}
 }
+
+func Truth1[T any](t T) bool {
+	return true
+}

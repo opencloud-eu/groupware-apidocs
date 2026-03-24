@@ -411,33 +411,36 @@ type responseFunc struct {
 }
 
 type returnVisitor struct {
-	fset                    *token.FileSet
-	typeMap                 map[string]model.Type
-	groupwarePkg            *packages.Package
-	responses               map[int]model.Resp
-	successfulResponseFuncs map[string]responseFunc
-	potentialErrors         map[string]bool
-	exampleKey              string
-	defaultValue            string
-	undocumented            map[string]token.Position
-	errs                    *[]error
+	fset                           *token.FileSet
+	typeMap                        map[string]model.Type
+	groupwarePkg                   *packages.Package
+	responses                      map[int]model.Resp
+	successfulResponseFuncs        map[string]responseFunc
+	successfulRequestResponseFuncs map[string]responseFunc
+	potentialErrors                map[string]bool
+	exampleKey                     string
+	defaultValue                   string
+	undocumented                   map[string]token.Position
+	errs                           *[]error
 }
 
 func newReturnVisitor(fset *token.FileSet, groupwarePkg *packages.Package, typeMap map[string]model.Type,
 	successfulResponseFuncs map[string]responseFunc,
+	successfulRequestResponseFuncs map[string]responseFunc,
 	exampleKey string,
 	defaultValue string) returnVisitor {
 	return returnVisitor{
-		fset:                    fset,
-		groupwarePkg:            groupwarePkg,
-		typeMap:                 typeMap,
-		responses:               map[int]model.Resp{},
-		potentialErrors:         map[string]bool{},
-		successfulResponseFuncs: successfulResponseFuncs,
-		exampleKey:              exampleKey,
-		defaultValue:            defaultValue,
-		undocumented:            map[string]token.Position{},
-		errs:                    &[]error{},
+		fset:                           fset,
+		groupwarePkg:                   groupwarePkg,
+		typeMap:                        typeMap,
+		responses:                      map[int]model.Resp{},
+		potentialErrors:                map[string]bool{},
+		successfulResponseFuncs:        successfulResponseFuncs,
+		successfulRequestResponseFuncs: successfulRequestResponseFuncs,
+		exampleKey:                     exampleKey,
+		defaultValue:                   defaultValue,
+		undocumented:                   map[string]token.Position{},
+		errs:                           &[]error{},
 	}
 }
 
@@ -542,6 +545,21 @@ func (v returnVisitor) isSuccessfulResponseFunc(r *ast.ReturnStmt) (ast.Expr, st
 		if i, ok := isIdent(c.Fun); ok {
 			for f, spec := range v.successfulResponseFuncs {
 				if i.Name == f {
+					summary := ""
+					if cg := findInlineComment(c.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
+						summary = strings.Join(processComments(lines(cg.List)), "\n") // TODO parse one-liner response function comment for api tags if needed
+					}
+					var body ast.Expr = nil
+					if spec.bodyArgPos >= 0 {
+						body = c.Args[spec.bodyArgPos]
+					}
+					return body, summary, spec.statusCode, true
+				}
+			}
+		}
+		if _, _, i, ok := expandFQMethodCall(c, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), tools.Truth1); ok {
+			for f, spec := range v.successfulRequestResponseFuncs {
+				if f == i {
 					summary := ""
 					if cg := findInlineComment(c.Pos(), v.groupwarePkg); cg != nil && len(cg.List) > 0 {
 						summary = strings.Join(processComments(lines(cg.List)), "\n") // TODO parse one-liner response function comment for api tags if needed
@@ -808,12 +826,14 @@ type paramsVisitor struct {
 	responses                 map[int]model.Resp
 	potentialErrors           map[string]bool
 	responseFuncs             map[string]responseFunc
+	responseMemberFuncs       map[string]responseFunc
 	undocumentedResults       map[string]token.Position
 	undocumentedRequestBodies map[string]token.Position
 	errs                      *[]error
 }
 
-func newParamsVisitor(fset *token.FileSet, groupwarePkg *packages.Package, fun string, typeMap map[string]model.Type, responseFuncs map[string]responseFunc, exampleKey string) paramsVisitor {
+func newParamsVisitor(fset *token.FileSet, groupwarePkg *packages.Package, fun string, typeMap map[string]model.Type,
+	responseFuncs map[string]responseFunc, responseMemberFuncs map[string]responseFunc, exampleKey string) paramsVisitor {
 	return paramsVisitor{
 		fset:                      fset,
 		fun:                       fun,
@@ -827,6 +847,7 @@ func newParamsVisitor(fset *token.FileSet, groupwarePkg *packages.Package, fun s
 		responses:                 map[int]model.Resp{},
 		potentialErrors:           map[string]bool{},
 		responseFuncs:             responseFuncs,
+		responseMemberFuncs:       responseMemberFuncs,
 		undocumentedResults:       map[string]token.Position{},
 		undocumentedRequestBodies: map[string]token.Position{},
 		errs:                      &[]error{},
@@ -895,7 +916,7 @@ func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Resp, ma
 	if len(call.Args) == 3 && isMethodCall(call, "Groupware", "respond") {
 		arg := call.Args[2]
 		if c, ok := isClosure(arg); ok {
-			rv := newReturnVisitor(v.fset, v.groupwarePkg, v.typeMap, v.responseFuncs, v.exampleKey, v.defaultValue)
+			rv := newReturnVisitor(v.fset, v.groupwarePkg, v.typeMap, v.responseFuncs, v.responseMemberFuncs, v.exampleKey, v.defaultValue)
 			ast.Walk(rv, c)
 			if err := errors.Join(*rv.errs...); err != nil {
 				return nil, nil, nil, false, err
@@ -1143,7 +1164,7 @@ func (v paramsVisitor) isBuildFilterCall(call *ast.CallExpr) (map[string]model.P
 		return nil, nil, fmt.Errorf("failed to find declaration of 'buildEmailFilter' in the package '%s'", v.groupwarePkg.ID)
 	}
 
-	p := newParamsVisitor(v.fset, v.groupwarePkg, bf.Name.Name, v.typeMap, v.responseFuncs, v.exampleKey)
+	p := newParamsVisitor(v.fset, v.groupwarePkg, bf.Name.Name, v.typeMap, v.responseFuncs, v.responseMemberFuncs, v.exampleKey)
 	ast.Walk(p, bf.Body)
 	if err := errors.Join(*v.errs...); err != nil {
 		return nil, nil, err
@@ -1484,13 +1505,25 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 
 		// TODO extract the response funcs from the source code: look for functions in the groupware package that return a Response object, and look for the "body" parameter
 		responseFuncs := map[string]responseFunc{
-			"etagResponse":              {1, http.StatusOK},
+			"etaggedResponse":           {1, http.StatusOK},
 			"response":                  {1, http.StatusOK},
 			"noContentResponse":         {-1, http.StatusNoContent},
 			"noContentResponseWithEtag": {-1, http.StatusNoContent},
 			"notFoundResponse":          {-1, http.StatusNotFound},
-			"etagNotFoundResponse":      {-1, http.StatusNotFound},
+			"etaggedNotFoundResponse":   {-1, http.StatusNotFound},
 			"notImplementedResponse":    {-1, http.StatusNotImplemented},
+		}
+		requestResponseFuncs := map[string]responseFunc{
+			"respondWithoutStatus": {1, http.StatusOK},
+			"respond":              {1, http.StatusOK},
+			"respondN":             {1, http.StatusOK},
+			"noop":                 {-1, http.StatusNoContent},
+			"noopN":                {-1, http.StatusNoContent},
+			"noContent":            {-1, http.StatusNoContent},
+			"notFound":             {-1, http.StatusNotFound},
+			"notFoundN":            {-1, http.StatusNotFound},
+			"etaggedNotFound":      {-1, http.StatusNotFound},
+			"notImplementedN":      {-1, http.StatusNotImplemented},
 		}
 
 		// iterate over every package that we are interested in (defined in config.PackageIDs),
@@ -1747,7 +1780,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 				potentialErrors := map[string]model.PotentialError{}
 				{
 					if fun.Body != nil {
-						v := newParamsVisitor(groupware.Fset, groupware, n, typeMap, responseFuncs, exampleKey)
+						v := newParamsVisitor(groupware.Fset, groupware, n, typeMap, responseFuncs, requestResponseFuncs, exampleKey)
 						ast.Walk(v, fun.Body)
 						if err := errors.Join(*v.errs...); err != nil {
 							panic(err)
