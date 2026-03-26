@@ -859,18 +859,21 @@ func (v paramsVisitor) isBodyCall(call *ast.CallExpr) (model.Param, bool, error)
 		return model.Param{}, false, nil
 	}
 
-	_, _, funcName, ok := expandFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), contp([]string{"body", "bodydoc"}))
+	_, _, funcName, ok := expandFQMethodCall(call, v.groupwarePkg, config.GroupwarePackageID, seqp("Request"), contp([]string{"body", "bodydoc", "optBody", "optBodyDoc"}))
 	if !ok {
 		return model.Param{}, false, nil
 	}
 
-	required := true  // TODO if needed, implement a way for body parameters to be optional; body parameters are required by default
+	required := true
+	if strings.HasPrefix(funcName, "opt") {
+		required = false
+	}
 	exploded := false // TODO body parameters typically aren't exploded since they are JSON payloads but implement something if needed
 	var bodyArg ast.Expr
 	var descArg ast.Expr
-	if funcName == "body" && len(call.Args) == 1 {
+	if len(call.Args) == 1 {
 		bodyArg = call.Args[0]
-	} else if funcName == "bodydoc" && len(call.Args) == 2 {
+	} else if len(call.Args) == 2 {
 		bodyArg = call.Args[0]
 		descArg = call.Args[1]
 	} else {
