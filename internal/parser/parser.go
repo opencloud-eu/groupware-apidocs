@@ -158,7 +158,9 @@ func tags(_ string, path string, comments []string) []string {
 	obj = strings.TrimPrefix(obj, "/")
 
 	if len(obj) > 0 {
-		if m := objsInObjById.FindAllStringSubmatch(obj, -1); m != nil {
+		if m := changesByObj.FindAllStringSubmatch(obj, -1); m != nil {
+			tags = append(tags, "changes", tools.Singularize(m[0][2]))
+		} else if m := objsInObjById.FindAllStringSubmatch(obj, -1); m != nil {
 			tags = append(tags, tools.Singularize(m[0][2]))
 		} else {
 			words := strings.Split(obj, "/")
@@ -243,6 +245,7 @@ var (
 	objById           = regexp.MustCompile(`^([^/]+?s)/{[^/]*?id}$`)                       // e.g. 'emails/{emailid}' in /accounts/all/emails/{emailid}
 	objsInObjById     = regexp.MustCompile(`^([^/]+?s)/{[^/]*?id}/([^/]+?s)$`)             // e.g. 'mailboxes/{mailboxid}/roles' in /accounts/{accountid}/mailboxes/{mailboxid}/roles
 	objsByIdInObjById = regexp.MustCompile(`^([^/]+?s)/{[^/]*?id}/([^/]+?s)//{[^/]*?id}$`) // e.g. 'mailboxes/{mailboxid}/roles/{roleid}' in /accounts/{accountid}/mailboxes/{mailboxid}/roles/{roleid}
+	changesByObj      = regexp.MustCompile(`^(changes)/([^/]+s)$`)                         // e.g. 'changes/mailboxes'
 )
 
 func inferEndpointSummary(verb string, path string) (string, model.InferredSummary, error) {
@@ -288,7 +291,12 @@ func inferEndpointSummary(verb string, path string) (string, model.InferredSumma
 	specificObj := false
 	specificChild := false
 
-	if m := objsByIdInObjById.FindAllStringSubmatch(obj, 2); m != nil {
+	if m := changesByObj.FindAllStringSubmatch(obj, 1); verb == "GET" && m != nil {
+		top := strings.ToLower(m[0][1]) // 'changes'
+		// e.g. 'mailboxes' in '/accounts/{accountid}/changes/mailboxes'
+		obj = tools.Singularize(m[0][2])
+		summary = fmt.Sprintf("Get the %s to %s objects since a given state", top, obj)
+	} else if m := objsByIdInObjById.FindAllStringSubmatch(obj, 2); m != nil {
 		// e.g. 'mailboxes/{mailboxid}/roles/{roleid}' in /accounts/{accountid}/mailboxes/{mailboxid}/roles/{roleid}
 		obj = tools.Singularize(m[0][1])
 		child := tools.Singularize(m[0][2])

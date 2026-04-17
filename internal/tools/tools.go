@@ -164,6 +164,9 @@ func Singularize(str string) string {
 	if strings.HasSuffix(str, "ies") {
 		return str[0:len(str)-3] + "y"
 	}
+	if strings.HasSuffix(str, "ges") {
+		return str[0 : len(str)-1]
+	}
 	if strings.HasSuffix(str, "es") {
 		return str[0 : len(str)-2]
 	}

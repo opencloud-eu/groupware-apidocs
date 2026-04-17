@@ -432,6 +432,20 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 						log.Printf("impl has no responses: %#v", im) // for debugging
 					}
 
+					// check whether all the tags are defined in apidoc.yml
+					unknownTags := []string{}
+					{
+						for _, tag := range im.Tags {
+							if _, ok := find(template.Tags, func(t *highbase.Tag) bool { return t.Name == tag }); !ok {
+								unknownTags = append(unknownTags, tag)
+							}
+						}
+					}
+					if len(unknownTags) > 0 {
+						return fmt.Errorf("verb='%s' path='%s' fun='%s': unknown tags that are not defined in '%s' at %s:%d: [%s]",
+							r.Verb, r.Path, r.Fun, s.TemplateFile, im.Filename, im.Line, strings.Join(unknownTags, ", "))
+					}
+
 					op.Tags = im.Tags
 					if len(op.Tags) < 1 {
 						op.Tags = append(op.Tags, "untagged")
