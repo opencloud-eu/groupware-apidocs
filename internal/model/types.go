@@ -1,6 +1,7 @@
 package model
 
 import (
+	"fmt"
 	"go/token"
 	"slices"
 
@@ -50,6 +51,80 @@ func IsBuiltinType(t string) bool {
 func IsBuiltinSelectorType(pkg string, _ string) bool {
 	return !slices.Contains(config.PackagesOfInterest, pkg)
 }
+
+func NewFutureAliasType(pkg string, name string, aliased string, pos token.Position) FutureAliasType {
+	return FutureAliasType{pkg: pkg, name: name, alias: aliased, pos: pos}
+}
+
+type FutureAliasType struct {
+	pkg   string
+	name  string
+	alias string
+	pos   token.Position
+}
+
+func (t FutureAliasType) Alias() string {
+	return t.alias
+}
+
+func (t FutureAliasType) Pkg() string {
+	return t.pkg
+}
+
+func (t FutureAliasType) Key() string {
+	return t.String()
+}
+
+func (t FutureAliasType) Name() string {
+	return t.name
+}
+
+func (t FutureAliasType) IsArray() bool {
+	return false
+}
+
+func (t FutureAliasType) IsMap() bool {
+	return false
+}
+
+func (t FutureAliasType) IsBasic() bool {
+	return false
+}
+
+func (t FutureAliasType) Deref() (Type, bool) {
+	panic(fmt.Errorf("don't Deref() a FutureAliasType"))
+	//return nil, false
+}
+
+func (t FutureAliasType) String() string {
+	if t.pkg != "" {
+		return t.pkg + "." + t.name
+	} else {
+		return t.name
+	}
+}
+
+func (t FutureAliasType) Fields() []Field {
+	return []Field{}
+}
+
+func (t FutureAliasType) Element() (Type, bool) {
+	return nil, false
+}
+
+func (t FutureAliasType) Summary() string {
+	return ""
+}
+
+func (t FutureAliasType) Description() string {
+	return ""
+}
+
+func (t FutureAliasType) Pos() (token.Position, bool) {
+	return t.pos, true
+}
+
+var _ Type = FutureAliasType{}
 
 func NewAliasType(pkg string, name string, typeRef Type, pos token.Position) AliasType {
 	if typeRef == nil {

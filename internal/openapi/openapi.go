@@ -965,6 +965,13 @@ func (s OpenApiSink) Output(m model.Model, w io.Writer) error {
 			log.Printf("  - %s", name)
 		}
 	}
+	if len(m.UnmappedRouteFuncs) > 0 {
+		log.Printf("%d route functions that are not mounted:", len(m.UnmappedRouteFuncs))
+		for name, fun := range m.UnmappedRouteFuncs {
+			log.Printf("  - %s: %s", name, fun.FullName()) // TODO add position
+		}
+
+	}
 
 	if rendered, err := doc.Render(); err == nil {
 		if _, err := w.Write(rendered); err != nil {

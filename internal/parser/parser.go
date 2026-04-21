@@ -9,6 +9,7 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"iter"
 	"log"
 	"maps"
 	"net/http"
@@ -38,12 +39,9 @@ var (
 )
 
 func findRouteDefinition(a *ast.File) *ast.FuncDecl {
-	for _, decl := range a.Decls {
-		switch v := decl.(type) {
-		case *ast.FuncDecl:
-			if hasName(v, "Route") && isMemberOf(v, "Groupware") && hasNumParams(v, 1) && isParamType(v.Type.Params.List[0], "chi", "Router") {
-				return v
-			}
+	for v := range funcDecls(a) {
+		if hasName(v, "Route") && isMemberOf(v, "Groupware") && hasNumParams(v, 1) && isParamType(v.Type.Params.List[0], "chi", "Router") {
+			return v
 		}
 	}
 	return nil
@@ -51,43 +49,37 @@ func findRouteDefinition(a *ast.File) *ast.FuncDecl {
 
 func endpoints(base string, stmts []ast.Stmt, pkg string) ([]model.Endpoint, error) {
 	result := []model.Endpoint{}
-	for _, stmt := range stmts {
-		if call := stmtIsCallExpr(stmt); call != nil {
-			if verb, err := methodNameOf(call, "r"); err == nil && verb != "" {
-				if verb == "Route" {
-					// recurse
-					if path := stringArgOf(call, 0); path != "" {
-						if deep := funcArgOf(call, 1); deep != nil {
-							if deref, err := endpoints(join(base, path), deep.Body.List, pkg); err == nil {
-								result = append(result, deref...)
-							} else {
-								return nil, err
-							}
-						}
-					}
-				} else if slices.Contains(config.Verbs, verb) && len(call.Args) == 2 {
-					if path := stringArgOf(call, 0); path != "" {
-						if f := funcRefArgOf(call, 1); f != nil {
-							if fun, err := nameOf(f.Sel, pkg); err == nil {
-								result = append(result, model.Endpoint{Verb: strings.ToUpper(verb), Path: join(base, path), Fun: fun})
-							} else {
-								return nil, err
-							}
-						}
-					}
-				} else if slices.Contains(config.CustomVerbs, verb) && len(call.Args) == 3 {
-					if path := stringArgOf(call, 1); path != "" {
-						if f := funcRefArgOf(call, 2); f != nil {
-							if fun, err := nameOf(f.Sel, pkg); err == nil {
-								result = append(result, model.Endpoint{Verb: strings.ToUpper(verb), Path: join(base, path), Fun: fun})
-							} else {
-								return nil, err
-							}
-						}
+	for verb, call := range callsTo(stmts, "r") {
+		if verb == "Route" {
+			// recurse
+			if path := stringArgOf(call, 0); path != "" {
+				if deep := funcArgOf(call, 1); deep != nil {
+					if deref, err := endpoints(join(base, path), deep.Body.List, pkg); err == nil {
+						result = append(result, deref...)
+					} else {
+						return nil, err
 					}
 				}
-			} else if err != nil {
-				return nil, err
+			}
+		} else if slices.Contains(config.Verbs, verb) && len(call.Args) == 2 {
+			if path := stringArgOf(call, 0); path != "" {
+				if f := funcRefArgOf(call, 1); f != nil {
+					if fun, err := nameOf(f.Sel, pkg); err == nil {
+						result = append(result, model.Endpoint{Verb: strings.ToUpper(verb), Path: join(base, path), Fun: fun})
+					} else {
+						return nil, err
+					}
+				}
+			}
+		} else if slices.Contains(config.CustomVerbs, verb) && len(call.Args) == 3 {
+			if path := stringArgOf(call, 1); path != "" {
+				if f := funcRefArgOf(call, 2); f != nil {
+					if fun, err := nameOf(f.Sel, pkg); err == nil {
+						result = append(result, model.Endpoint{Verb: strings.ToUpper(verb), Path: join(base, path), Fun: fun})
+					} else {
+						return nil, err
+					}
+				}
 			}
 		}
 	}
@@ -514,29 +506,27 @@ func (v returnVisitor) isErrorResponseFunc(r *ast.ReturnStmt) bool {
 		} else if ident, ok := isIdent(result); ok {
 			//obj := v.pkg.TypesInfo.Uses[ident]
 			//tv := v.pkg.TypesInfo.Defs[ident]
-			if t, ok := v.groupwarePkg.TypesInfo.Types[ident]; ok {
-				if t.Type != nil {
-					if n, ok := isNamed(t.Type); ok {
-						if n.Obj() != nil && n.Obj().Name() == "Response" && n.Obj().Pkg() != nil && n.Obj().Pkg().Name() == "groupware" {
-							switch decl := ident.Obj.Decl.(type) {
-							case *ast.AssignStmt:
-								for _, rhs := range decl.Rhs {
-									if call, ok := isCallExpr(rhs); ok {
-										if p, neededType, ok := isNeedAccountCall(call, v.groupwarePkg, v.exampleKey); ok && p.Required {
-											v.potentialErrors[MissingAccountError] = true
-											if moreErrs, ok := MissingObjTypeErrors[neededType]; ok {
-												for _, e := range moreErrs {
-													v.potentialErrors[e] = true
-												}
-											} else {
-												log.Panicf("failed to find MissingObjTypeErrors entry for neededType='%s'", neededType)
+			if t, ok := v.groupwarePkg.TypesInfo.Types[ident]; ok && t.Type != nil {
+				if n, ok := isNamed(t.Type); ok {
+					if n.Obj() != nil && n.Obj().Name() == "Response" && n.Obj().Pkg() != nil && n.Obj().Pkg().Name() == "groupware" {
+						switch decl := ident.Obj.Decl.(type) {
+						case *ast.AssignStmt:
+							for _, rhs := range decl.Rhs {
+								if call, ok := isCallExpr(rhs); ok {
+									if p, neededType, ok := isNeedAccountCall(call, v.groupwarePkg, v.exampleKey); ok && p.Required {
+										v.potentialErrors[MissingAccountError] = true
+										if moreErrs, ok := MissingObjTypeErrors[neededType]; ok {
+											for _, e := range moreErrs {
+												v.potentialErrors[e] = true
 											}
+										} else {
+											log.Panicf("failed to find MissingObjTypeErrors entry for neededType='%s'", neededType)
 										}
 									}
 								}
 							}
-							// TODO try to detect more error responses
 						}
+						// TODO try to detect more error responses
 					}
 				}
 			}
@@ -604,7 +594,7 @@ func (v returnVisitor) resolveType(t types.Type) (model.Type, error) {
 		name = nameType(n.Obj())
 		pos = n.Obj().Pos()
 	}
-	r, err := typeOf(t, v.typeMap, v.groupwarePkg)
+	r, err := typeOf(t, nil, v.typeMap, v.groupwarePkg)
 	if err != nil {
 		return nil, err
 	}
@@ -623,7 +613,7 @@ func (v returnVisitor) resolveType(t types.Type) (model.Type, error) {
 func (v returnVisitor) deduceArgType(code int, arg ast.Expr) (int, model.Type, error) {
 	switch arg := arg.(type) {
 	case *ast.SelectorExpr:
-		key := arg.X.(*ast.Ident).Name + "." + arg.Sel.Name
+		key := name(arg.X.(*ast.Ident).Name, arg.Sel.Name)
 		if m, ok := v.typeMap[key]; ok {
 			return code, m, nil
 		} else {
@@ -647,7 +637,7 @@ func (v returnVisitor) deduceArgType(code int, arg ast.Expr) (int, model.Type, e
 				key := t.Obj.Name
 				if !strings.Contains(key, ".") {
 					if !model.IsBuiltinType(key) {
-						key = v.groupwarePkg.Name + "." + key
+						key = name(v.groupwarePkg.Name, key)
 					}
 				}
 				if m, ok := v.typeMap[key]; ok {
@@ -956,28 +946,37 @@ func isAccountCall(call *ast.CallExpr, p *packages.Package, exampleKey string) (
 	}
 }
 
-var needObjectWithAccountCallRegex = regexp.MustCompile(`^need(Contact|Calendar|Task)WithAccount$`)
+var needObjectWithAccountCallRegex = regexp.MustCompile(`^need([A-Z][a-z]+)WithAccount$`)
 
-func isNeedAccountCall(call *ast.CallExpr, p *packages.Package, exampleKey string) (model.Param, string, bool) {
-	required := true
-	exploded := false
-	if s, ok := isSelector(call.Fun); ok {
-		if x, ok := isIdent(s.X); ok && len(call.Args) == 0 && x.Obj != nil {
-			if m := needObjectWithAccountCallRegex.FindAllStringSubmatch(s.Sel.Name, 1); m != nil {
-				if f, ok := isField(x.Obj.Decl); ok {
-					if t, ok := isIdent(f.Type); ok && t.Name == "Request" {
-						summary := ""
-						if cg := findInlineComment(call.Pos(), p); cg != nil && cg.List != nil {
-							summary = strings.Join(processComments(lines(cg.List)), "\n")
+func methodsMatching(call *ast.CallExpr, recv string, regex *regexp.Regexp) iter.Seq2[*ast.CallExpr, string] {
+	return func(yield func(call *ast.CallExpr, match string) bool) {
+		if s, ok := isSelector(call.Fun); ok {
+			if x, ok := isIdent(s.X); ok && len(call.Args) == 0 && x.Obj != nil {
+				if m := regex.FindAllStringSubmatch(s.Sel.Name, 1); m != nil {
+					if f, ok := isField(x.Obj.Decl); ok {
+						if t, ok := isIdent(f.Type); ok && t.Name == recv {
+							if !yield(call, m[0][1]) {
+								return
+							}
 						}
-						objType := m[0][1]
-						// TODO implement example key override using an inline comment
-						defaultValue := "" // there is no default value for those calls, they require finding an account ID or fall back to the default one depending on the request type, but we cannot document that
-						return model.NewParam(config.AccountIdUriParamName, summary, model.StringType, required, defaultValue, exploded, exampleKey), objType, true
 					}
 				}
 			}
 		}
+	}
+}
+
+func isNeedAccountCall(call *ast.CallExpr, p *packages.Package, exampleKey string) (model.Param, string, bool) {
+	required := true
+	exploded := false
+	for call, objType := range methodsMatching(call, "Request", needObjectWithAccountCallRegex) {
+		summary := ""
+		if cg := findInlineComment(call.Pos(), p); cg != nil && cg.List != nil {
+			summary = strings.Join(processComments(lines(cg.List)), "\n")
+		}
+		// TODO implement example key override using an inline comment
+		defaultValue := "" // there is no default value for those calls, they require finding an account ID or fall back to the default one depending on the request type, but we cannot document that
+		return model.NewParam(config.AccountIdUriParamName, summary, model.StringType, required, defaultValue, exploded, exampleKey), objType, true
 	}
 	return model.Param{}, "", false
 }
@@ -1333,7 +1332,7 @@ func findFun(n string, p *packages.Package, _ *types.Func) (*ast.FuncDecl, strin
 		for _, d := range s.Decls {
 			switch x := d.(type) {
 			case *ast.FuncDecl:
-				fname := s.Name.Name + "." + x.Name.Name
+				fname := name(s.Name.Name, x.Name.Name)
 				if n == fname {
 					return x, f, true
 				}
@@ -1488,6 +1487,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 	}
 
 	routeFuncs := map[string]*types.Func{}
+	unmappedRouteFuncs := map[string]*types.Func{}
 	typeMap := map[string]model.Type{}
 	constsMap := map[string]Const{}
 	groupwareErrorCodesMap := map[string]string{}
@@ -1537,6 +1537,23 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 			"notImplementedN":      {-1, http.StatusNotImplemented},
 		}
 
+		for _, p := range pkgs {
+			if !slices.Contains(config.PackageIDs, p.ID) {
+				continue // we're not interested in that package
+			}
+			for _, name := range p.Types.Scope().Names() {
+				obj := p.Types.Scope().Lookup(name)
+				switch obj.(type) {
+				case *types.Const, *types.Var:
+					switch t := obj.Type().(type) {
+					case *types.Named:
+						n := t.Obj().Name()
+						fmt.Printf("n='%s' v: %+v\n", n, t)
+					}
+				}
+			}
+		}
+
 		// iterate over every package that we are interested in (defined in config.PackageIDs),
 		// and analyze types and constants in each of them
 		for _, p := range pkgs {
@@ -1554,7 +1571,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 					case *types.Signature:
 						// skip methods
 					case *types.Named:
-						if r, err := typeOf(t, typeMap, p); err != nil {
+						if r, err := typeOf(t, nil, typeMap, p); err != nil {
 							log.Panicf("failed to determine type of named %#v: %v", t, err)
 						} else if r != nil {
 							pos := p.Fset.Position(obj.Pos())
@@ -1624,8 +1641,14 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 						// skip methods
 					case *types.Named:
 						// this is a globally defined type
-						if r, err := typeOf(t, typeMap, p); err != nil {
+						if r, err := typeOf(t, nil, typeMap, p); err != nil {
 							log.Panicf("failed to determine type of named %#v: %v", t, err)
+						} else if r != nil {
+							typeMap[r.Key()] = r
+						}
+					case *types.Alias:
+						if r, err := typeOf(t, nil, typeMap, p); err != nil {
+							log.Panicf("failed to determine type of alias %#v: %v", t, err)
 						} else if r != nil {
 							typeMap[r.Key()] = r
 						}
@@ -1634,6 +1657,29 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 					}
 				default:
 					log.Panicf("failed to analyze type %s: is not a Named but a %T", name, obj)
+				}
+			}
+		}
+
+		// resolve future references
+		for name, typ := range typeMap {
+			if f, ok := typ.(model.FutureAliasType); ok {
+				target := f.Alias()
+
+				for x := range typeMap {
+					if strings.Contains(x, "Template") {
+						log.Printf("template in typemap: %s", x)
+					}
+				}
+
+				if r, ok := typeMap[target]; ok {
+					if pos, ok := f.Pos(); ok {
+						typeMap[name] = model.NewAliasType(f.Pkg(), f.Name(), r, pos)
+					} else {
+						log.Panicf("alias target has no position attribute")
+					}
+				} else {
+					log.Panicf("failed to resolve %T '%s' to '%s'", f, name, target)
 				}
 			}
 		}
@@ -1772,7 +1818,8 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 						}
 					}
 					if !foundRoute {
-						log.Panicf("failed to find endpoint for route function '%s'", n)
+						unmappedRouteFuncs[n] = f
+						continue
 					}
 				}
 
@@ -2094,6 +2141,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 		CommonRequestHeaders:                commonRequestHeaders,
 		UndocumentedResults:                 undocumentedResults,
 		UndocumentedRequestBodies:           undocumentedResultBodies,
+		UnmappedRouteFuncs:                  unmappedRouteFuncs,
 		GlobalPotentialErrors:               mustMapPotentialErrors(GlobalPotentialErrors, groupwareErrorsMap),
 		GlobalPotentialErrorsForQueryParams: mustMapPotentialErrors(GlobalPotentialErrorsForQueryParams, groupwareErrorsMap),
 		GlobalPotentialErrorsForMandatoryQueryParams: mustMapPotentialErrors(GlobalPotentialErrorsForMandatoryQueryParams, groupwareErrorsMap),
@@ -2177,7 +2225,7 @@ func toType(id string, typeMap map[string]model.Type) (model.Type, error) {
 	return nil, fmt.Errorf("failed to map '%s' to a type", id)
 }
 
-func typeOf(t types.Type, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
+func typeOf(t types.Type, typeParams map[string]model.Type, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
 	switch t := t.(type) {
 	case *types.Named:
 		pkg, name := typeNames(t.Obj())
@@ -2208,21 +2256,36 @@ func typeOf(t types.Type, mem map[string]model.Type, p *packages.Package) (model
 		case *types.Interface:
 			return model.NewInterfaceType(pkg, name, position), nil
 		case *types.Map:
-			r, err := mapOf(u, mem, p)
+			r, err := mapOf(u, typeParams, mem, p)
 			return r, err
 		case *types.Array:
-			r, err := arrayOf(u.Elem(), mem, p)
+			r, err := arrayOf(u.Elem(), typeParams, mem, p)
 			return r, err
 		case *types.Slice:
-			r, err := arrayOf(u.Elem(), mem, p)
+			r, err := arrayOf(u.Elem(), typeParams, mem, p)
 			return r, err
 		case *types.Pointer:
 			// pointer denotes that it's optional, unless it's explicitly marked as required or not required through annotations or other conventions
-			return typeOf(u.Elem(), mem, p)
+			return typeOf(u.Elem(), typeParams, mem, p)
 		case *types.Struct:
 			id := fmt.Sprintf("%s.%s", pkg, name)
 			if ex, ok := mem[id]; ok {
 				return ex, nil
+			}
+
+			typeParams := map[string]model.Type{}
+			if t.TypeParams() != nil {
+				for tp := range t.TypeParams().TypeParams() {
+					if tp.Constraint() != nil {
+						if c, err := typeOf(tp.Constraint(), nil, mem, p); err != nil {
+							return nil, err
+						} else {
+							typeParams[tp.Obj().Name()] = c
+						}
+					} else {
+						typeParams[tp.Obj().Name()] = nil
+					}
+				}
 			}
 
 			summary := ""
@@ -2257,7 +2320,7 @@ func typeOf(t types.Type, mem map[string]model.Type, p *packages.Package) (model
 					fieldInRequest := fieldInRequest(f.tag)
 					fieldInResponse := fieldInResponse(f.tag)
 					fieldSummary := strings.Join(findComments(name+"."+f.name, f.pos, token.VAR, p), "\n") // TODO process comments for fields
-					if typ, err := typeOf(f.typ, mem, p); err != nil {
+					if typ, err := typeOf(f.typ, typeParams, mem, p); err != nil {
 						return nil, err
 					} else {
 						fields = append(fields, model.NewField(f.name, attr, typ, f.tag, fieldSummary, fieldReq, fieldDef, fieldInRequest, fieldInResponse))
@@ -2274,15 +2337,15 @@ func typeOf(t types.Type, mem map[string]model.Type, p *packages.Package) (model
 	case *types.Basic:
 		return model.NewBuiltinType("", t.Name()), nil
 	case *types.Map:
-		return mapOf(t, mem, p)
+		return mapOf(t, typeParams, mem, p)
 	case *types.Array:
-		return arrayOf(t.Elem(), mem, p)
+		return arrayOf(t.Elem(), typeParams, mem, p)
 	case *types.Slice:
-		return arrayOf(t.Elem(), mem, p)
+		return arrayOf(t.Elem(), typeParams, mem, p)
 	case *types.Pointer:
-		return typeOf(t.Elem(), mem, p)
+		return typeOf(t.Elem(), typeParams, mem, p)
 	case *types.Alias:
-		return aliasOf(t, mem, p)
+		return aliasOf(t, typeParams, mem, p)
 	case *types.Interface:
 		if t.String() == "any" {
 			return model.AnyType, nil
@@ -2290,8 +2353,12 @@ func typeOf(t types.Type, mem map[string]model.Type, p *packages.Package) (model
 			return nil, fmt.Errorf("typeOf: unsupported: using an interface type that isn't any: %T: %#v", t, t)
 		}
 	case *types.TypeParam:
-		// ignore
-		return nil, nil
+		name := t.Obj().Name()
+		if x, ok := typeParams[name]; ok {
+			return x, nil
+		} else {
+			return nil, nil
+		}
 	case *types.Chan:
 		// ignore
 		return nil, nil
@@ -2412,19 +2479,19 @@ func decompose(name string, u *types.Struct, level int, p *packages.Package) ([]
 	return structFields, nil
 }
 
-func arrayOf(t types.Type, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
-	if e, err := typeOf(t, mem, p); err != nil {
+func arrayOf(t types.Type, typeParams map[string]model.Type, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
+	if e, err := typeOf(t, typeParams, mem, p); err != nil {
 		return nil, err
 	} else {
 		return model.NewArrayType(e), nil
 	}
 }
 
-func mapOf(t *types.Map, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
-	if k, err := typeOf(t.Key(), mem, p); err != nil {
+func mapOf(t *types.Map, typeParams map[string]model.Type, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
+	if k, err := typeOf(t.Key(), typeParams, mem, p); err != nil {
 		return nil, err
 	} else {
-		if v, err := typeOf(t.Elem(), mem, p); err != nil {
+		if v, err := typeOf(t.Elem(), typeParams, mem, p); err != nil {
 			return nil, err
 		} else {
 			return model.NewMapType(k, v), nil
@@ -2432,8 +2499,34 @@ func mapOf(t *types.Map, mem map[string]model.Type, p *packages.Package) (model.
 	}
 }
 
-func aliasOf(t *types.Alias, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
-	if e, err := typeOf(t.Underlying(), mem, p); err != nil {
+func aliasOf(t *types.Alias, typeParams map[string]model.Type, mem map[string]model.Type, p *packages.Package) (model.Type, error) {
+	aliased := t.Underlying()
+	alias := t.Obj().Name()
+	if t.Obj().Pkg() != nil {
+		alias = name(t.Obj().Pkg().Name(), alias)
+	}
+
+	if t.Rhs() != nil {
+		if n, ok := isNamed(t.Rhs()); ok {
+			name := n.Obj().Name()
+			pkg := ""
+			if n.Obj().Pkg() != nil && n.Obj().Pkg().Name() != "" {
+				pkg = n.Obj().Pkg().Name()
+			}
+			fqname := name
+			if pkg != "" {
+				fqname = pkg + "." + name
+			}
+
+			if deref, ok := mem[fqname]; ok {
+				return model.NewAliasType(pkg, name, deref, p.Fset.Position(t.Obj().Pos())), nil
+			} else {
+				return model.NewFutureAliasType(t.Obj().Pkg().Name(), t.Obj().Name(), fqname, p.Fset.Position(t.Obj().Pos())), nil
+			}
+		}
+	}
+
+	if e, err := typeOf(aliased, typeParams, mem, p); err != nil {
 		return nil, err
 	} else {
 		name, pkg := typeNames(t.Obj())

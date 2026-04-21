@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"iter"
 	"maps"
 	"regexp"
 	"slices"
@@ -16,6 +17,33 @@ import (
 	"opencloud.eu/groupware-apidocs/internal/model"
 	"opencloud.eu/groupware-apidocs/internal/tools"
 )
+
+func funcDecls(a *ast.File) iter.Seq[*ast.FuncDecl] {
+	return func(yield func(*ast.FuncDecl) bool) {
+		for _, decl := range a.Decls {
+			switch v := decl.(type) {
+			case *ast.FuncDecl:
+				if !yield(v) {
+					return
+				}
+			}
+		}
+	}
+}
+
+func callsTo(stmts []ast.Stmt, recv string) iter.Seq2[string, *ast.CallExpr] {
+	return func(yield func(string, *ast.CallExpr) bool) {
+		for _, stmt := range stmts {
+			if call := stmtIsCallExpr(stmt); call != nil {
+				if verb, err := methodNameOf(call, recv); err == nil && verb != "" {
+					if !yield(verb, call) {
+						return
+					}
+				}
+			}
+		}
+	}
+}
 
 func isFQMethodCall(call *ast.CallExpr, pkg *packages.Package,
 	pkgPath string,
@@ -198,21 +226,27 @@ func isMemberOf(f ast.Decl, name string) bool {
 	return false
 }
 
+func name(pkg string, name string) string {
+	if pkg != "" {
+		return pkg + "." + name
+	} else {
+		return name
+	}
+}
+
 func nameOf(expr ast.Expr, pkg string) (string, error) {
 	switch e := expr.(type) {
 	case *ast.Ident:
 		if model.IsBuiltinType(e.Name) {
 			return e.Name, nil
-		} else if pkg != "" {
-			return pkg + "." + e.Name, nil
 		} else {
-			return e.Name, nil
+			return name(pkg, e.Name), nil
 		}
 	case *ast.SelectorExpr:
 		if x, ok := isIdent(e.X); ok {
-			return x.Name + "." + e.Sel.Name, nil
+			return name(x.Name, e.Sel.Name), nil
 		} else {
-			return "", fmt.Errorf("typeName(): unsupported SelectorExpr type: %T %v", expr, expr)
+			return "", fmt.Errorf("nameOf(): unsupported SelectorExpr type: %T %v", expr, expr)
 		}
 	case *ast.ArrayType:
 		if deref, err := nameOf(e.Elt, pkg); err == nil {
@@ -641,12 +675,4 @@ func seqp(s string) func(string) bool {
 
 func contp[T comparable](s []T) func(T) bool {
 	return func(e T) bool { return slices.Contains(s, e) }
-}
-
-func truep[T any]() func(T) bool {
-	return func(T) bool { return true }
-}
-
-func falsep[T any]() func(T) bool {
-	return func(T) bool { return false }
 }

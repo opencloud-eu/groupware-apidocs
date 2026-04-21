@@ -3,6 +3,7 @@ package model
 import (
 	"go/ast"
 	"go/token"
+	"go/types"
 	"io"
 	"slices"
 )
@@ -292,6 +293,7 @@ type Model struct {
 	CommonRequestHeaders                         []RequestHeaderDesc
 	UndocumentedResults                          map[string]Undocumented
 	UndocumentedRequestBodies                    map[string]Undocumented
+	UnmappedRouteFuncs                           map[string]*types.Func
 	GlobalPotentialErrors                        []PotentialError
 	GlobalPotentialErrorsForQueryParams          []PotentialError
 	GlobalPotentialErrorsForMandatoryQueryParams []PotentialError
