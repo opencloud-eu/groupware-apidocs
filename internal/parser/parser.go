@@ -815,6 +815,7 @@ type paramsVisitor struct {
 	fun                       string
 	groupwarePkg              *packages.Package
 	typeMap                   map[string]model.Type
+	objectTypeMap             map[string]model.ObjectType
 	exampleKey                string
 	defaultValue              string
 	headerParams              map[string]model.Param
@@ -831,12 +832,14 @@ type paramsVisitor struct {
 }
 
 func newParamsVisitor(fset *token.FileSet, groupwarePkg *packages.Package, fun string, typeMap map[string]model.Type,
+	objectTypeMap map[string]model.ObjectType,
 	responseFuncs map[string]responseFunc, responseMemberFuncs map[string]responseFunc, exampleKey string) paramsVisitor {
 	return paramsVisitor{
 		fset:                      fset,
 		fun:                       fun,
 		groupwarePkg:              groupwarePkg,
 		typeMap:                   typeMap,
+		objectTypeMap:             objectTypeMap,
 		exampleKey:                exampleKey,
 		headerParams:              map[string]model.Param{},
 		queryParams:               map[string]model.Param{},
@@ -1174,7 +1177,7 @@ func (v paramsVisitor) isBuildFilterCall(call *ast.CallExpr) (map[string]model.P
 		return nil, nil, fmt.Errorf("failed to find declaration of 'buildEmailFilter' in the package '%s'", v.groupwarePkg.ID)
 	}
 
-	p := newParamsVisitor(v.fset, v.groupwarePkg, bf.Name.Name, v.typeMap, v.responseFuncs, v.responseMemberFuncs, v.exampleKey)
+	p := newParamsVisitor(v.fset, v.groupwarePkg, bf.Name.Name, v.typeMap, v.objectTypeMap, v.responseFuncs, v.responseMemberFuncs, v.exampleKey)
 	ast.Walk(p, bf.Body)
 	if err := errors.Join(*v.errs...); err != nil {
 		return nil, nil, err
@@ -1215,6 +1218,29 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 			v.pathParams[p.Name] = p
 			return v
 		}
+
+		if f, ok := isIdent(d.Fun); len(d.Args) > 0 && ok {
+			if x, ok := isIdent(d.Args[0]); ok { // XXX TODO objtype mapping
+				ot, ok := v.objectTypeMap[x.Name]
+				if !ok {
+					*v.errs = append(*v.errs, fmt.Errorf("failed to resolve ObjectType '%s' in %+v", x.Name, d.Fun))
+					return nil
+				}
+				var _ = ot
+				// e.g. "AddressBook"
+				switch f.Name {
+				case "create":
+					responses := map[int]model.Resp{
+						200: {
+							Summary: "",
+						},
+					}
+					maps.Copy(v.responses, responses)
+
+				}
+			}
+		}
+
 		if responses, potentialErrors, undocumented, ok, err := v.isRespondCall(d); err != nil {
 			*v.errs = append(*v.errs, err)
 			return nil
@@ -1500,6 +1526,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 	undocumentedResults := map[string]model.Undocumented{}
 	undocumentedResultBodies := map[string]model.Undocumented{}
 	enumMap := map[string][]model.Enum{}
+	objectTypeMap := map[string]model.ObjectType{}
 	{
 		cfg := &packages.Config{
 			Mode:  packages.LoadSyntax,
@@ -1537,21 +1564,22 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 			"notImplementedN":      {-1, http.StatusNotImplemented},
 		}
 
-		for _, p := range pkgs {
-			if !slices.Contains(config.PackageIDs, p.ID) {
-				continue // we're not interested in that package
-			}
-			for _, name := range p.Types.Scope().Names() {
-				obj := p.Types.Scope().Lookup(name)
-				switch obj.(type) {
-				case *types.Const, *types.Var:
-					switch t := obj.Type().(type) {
-					case *types.Named:
-						n := t.Obj().Name()
-						fmt.Printf("n='%s' v: %+v\n", n, t)
-					}
+		// find the Package for "groupware"
+		var groupware *packages.Package = nil
+		{
+			for _, p := range pkgs {
+				if p.ID == config.GroupwarePackageID {
+					groupware = p
+					break
 				}
 			}
+			if groupware == nil {
+				panic("failed to find the groupware package " + config.GroupwarePackageID)
+			}
+		}
+
+		if objectTypeMap, err = parseObjectTypes(groupware); err != nil {
+			log.Fatal(err)
 		}
 
 		// iterate over every package that we are interested in (defined in config.PackageIDs),
@@ -1684,20 +1712,6 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 			}
 		}
 
-		// find the Package for "groupware"
-		var groupware *packages.Package = nil
-		{
-			for _, p := range pkgs {
-				if p.ID == config.GroupwarePackageID {
-					groupware = p
-					break
-				}
-			}
-			if groupware == nil {
-				panic("failed to find the groupware package " + config.GroupwarePackageID)
-			}
-		}
-
 		// fill routeFuncs
 		{
 			for _, d := range groupware.TypesInfo.Defs {
@@ -1718,13 +1732,13 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 				for i, f := range groupware.CompiledGoFiles {
 					if rf, err := filepath.Rel(basepath, f); err != nil {
 						panic(err)
-					} else if rf == "services/groupware/pkg/groupware/route.go" {
+					} else if rf == config.RoutesSource {
 						syntax = groupware.Syntax[i]
 						break
 					}
 				}
 				if syntax == nil {
-					panic("failed to find syntax for services/groupware/pkg/groupware/route.go")
+					panic(fmt.Errorf("failed to find syntax for %s", config.RoutesSource))
 				}
 			}
 
@@ -1838,7 +1852,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 				potentialErrors := map[string]model.PotentialError{}
 				{
 					if fun.Body != nil {
-						v := newParamsVisitor(groupware.Fset, groupware, n, typeMap, responseFuncs, requestResponseFuncs, exampleKey)
+						v := newParamsVisitor(groupware.Fset, groupware, n, typeMap, objectTypeMap, responseFuncs, requestResponseFuncs, exampleKey)
 						ast.Walk(v, fun.Body)
 						if err := errors.Join(*v.errs...); err != nil {
 							panic(err)
@@ -2136,6 +2150,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 		Types:                               types,
 		Examples:                            exampleMap,
 		Enums:                               enumMap,
+		ObjectTYpes:                         objectTypeMap,
 		DefaultResponses:                    defaultResponses,
 		DefaultResponseHeaders:              defaultResponseHeaders,
 		CommonRequestHeaders:                commonRequestHeaders,
@@ -2223,6 +2238,167 @@ func toType(id string, typeMap map[string]model.Type) (model.Type, error) {
 		return t, nil
 	}
 	return nil, fmt.Errorf("failed to map '%s' to a type", id)
+}
+
+// Retrieve string value from a basic string literator or from an ident, or a starred ident
+func stri(e ast.Expr) (string, bool) {
+	switch t := e.(type) {
+	case *ast.Ident:
+		return t.Name, true
+	case *ast.StarExpr:
+		return stri(t.X)
+	case *ast.BasicLit:
+		if t.Kind == token.STRING {
+			return strings.Trim(t.Value, "\""), true
+		}
+	}
+	return "", false
+}
+
+func compositeLits(p *packages.Package) iter.Seq2[string, *ast.CompositeLit] {
+	return func(yield func(string, *ast.CompositeLit) bool) {
+		for _, syn := range p.Syntax {
+			for _, decl := range syn.Decls {
+				if g, ok := isGenDecl(decl); ok {
+					for _, s := range g.Specs {
+						if v, ok := isValueSpec(s); ok && v != nil {
+							for i, ident := range v.Names {
+								if ident != nil {
+									switch c := v.Values[i].(type) {
+									case *ast.CompositeLit:
+										if !yield(ident.Name, c) {
+											return
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func keyValueExprs(elts []ast.Expr) iter.Seq2[string, ast.Expr] {
+	return func(yield func(string, ast.Expr) bool) {
+		for _, el := range elts {
+			if kve, ok := el.(*ast.KeyValueExpr); ok {
+				if k, ok := isIdent(kve.Key); ok {
+					if !yield(k.Name, kve.Value) {
+						return
+					}
+				}
+			}
+		}
+	}
+}
+
+func vars(p *packages.Package) iter.Seq2[string, *types.Var] {
+	return func(yield func(string, *types.Var) bool) {
+		for _, name := range p.Types.Scope().Names() {
+			obj := p.Types.Scope().Lookup(name)
+			switch v := obj.(type) {
+			case *types.Var:
+				if !yield(name, v) {
+					return
+				}
+			}
+		}
+	}
+}
+
+func parseObjectTypes(p *packages.Package) (map[string]model.ObjectType, error) {
+	fooMap := map[string]string{}
+	for name, v := range vars(p) {
+		switch n := v.Type().(type) {
+		case *types.Named:
+			if n.Obj().Name() != "ObjectType" {
+				continue
+			}
+			if n.TypeArgs() == nil {
+				return nil, fmt.Errorf("ObjectType '%s' has no type args", name)
+			}
+			fooArg := n.TypeArgs().At(0)
+			if na, ok := isNamed(fooArg); ok {
+				fooName := na.Obj().Name()
+				pkg := na.Obj().Pkg()
+				if pkg != nil && pkg.Name() != "" {
+					fooName = pkg.Name() + "." + fooName
+				}
+				fooMap[name] = fooName
+			}
+		}
+	}
+
+	m := map[string]model.ObjectType{}
+	for name, c := range compositeLits(p) {
+		il, ok := c.Type.(*ast.IndexListExpr)
+		if !ok {
+			continue
+		}
+		n, ok := isIdent(il.X)
+		if !ok {
+			continue
+		}
+		if n.Name != "ObjectType" {
+			continue
+		}
+
+		ot := model.ObjectType{}
+		if foo, ok := fooMap[name]; ok {
+			ot.Foo = foo
+		} else {
+			return nil, fmt.Errorf("failed to find Foo in fooMap for '%s'", name)
+		}
+
+		for k, v := range keyValueExprs(c.Elts) {
+			switch k {
+			case "name":
+				if s, ok := stri(v); ok {
+					ot.Name = s
+				} else {
+					return nil, fmt.Errorf("type of ObjectType attribute '%s' is of unexpected type %+v", name, v)
+				}
+			case "responseType":
+				if s, ok := stri(v); ok {
+					ot.ResponseObjectType = s
+				} else {
+					return nil, fmt.Errorf("type of ObjectType attribute '%s' is of unexpected type %+v", name, v)
+				}
+			case "uriParamName":
+				if s, ok := stri(v); ok {
+					ot.UriParamName = s
+				} else {
+					return nil, fmt.Errorf("type of ObjectType attribute '%s' is of unexpected type %+v", name, v)
+				}
+			case "containerUriParamName":
+				if s, ok := stri(v); ok {
+					ot.ContainerUriParamName = s
+				} else {
+					return nil, fmt.Errorf("type of ObjectType attribute '%s' is of unexpected type %+v", name, v)
+				}
+			case "failedToDeleteError":
+				if s, ok := stri(v); ok {
+					ot.FailedToDeleteError = s
+				} else {
+					return nil, fmt.Errorf("type of ObjectType attribute '%s' is of unexpected type %+v", name, v)
+				}
+			case "accountFunc":
+				if s, ok := isSelector(v); ok {
+					if a := needObjectWithAccountCallRegex.FindAllStringSubmatch(s.Sel.Name, 1); a != nil {
+						ot.AccountType = a[0][1]
+					} else {
+						return nil, fmt.Errorf("ObjectType '%s' function reference does not match '%s': '%s'", name, needObjectWithAccountCallRegex, s.Sel.Name)
+					}
+				} else {
+					return nil, fmt.Errorf("type of ObjectType attribute '%s' is of unexpected type %+v", name, v)
+				}
+			}
+		}
+		m[name] = ot
+	}
+	return m, nil
 }
 
 func typeOf(t types.Type, typeParams map[string]model.Type, mem map[string]model.Type, p *packages.Package) (model.Type, error) {

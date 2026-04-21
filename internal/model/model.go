@@ -278,6 +278,16 @@ type Enum struct {
 	Pos      token.Position
 }
 
+type ObjectType struct {
+	Foo                   string
+	Name                  string
+	ResponseObjectType    string
+	UriParamName          string
+	ContainerUriParamName string
+	AccountType           string
+	FailedToDeleteError   string
+}
+
 type Model struct {
 	Version                                      string
 	Routes                                       []Endpoint
@@ -288,6 +298,7 @@ type Model struct {
 	Types                                        []Type
 	Examples                                     map[string]Examples
 	Enums                                        map[string][]Enum
+	ObjectTYpes                                  map[string]ObjectType
 	DefaultResponses                             map[int]DefaultResponseDesc
 	DefaultResponseHeaders                       map[string]DefaultResponseHeaderDesc
 	CommonRequestHeaders                         []RequestHeaderDesc

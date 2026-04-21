@@ -24,6 +24,8 @@ var SourceDirectories = []string{
 	"./pkg/jscalendar",
 }
 
+const RoutesSource = "services/groupware/pkg/groupware/route.go"
+
 var VersionSourceDirectory = "./pkg/version"
 
 var PackageIDs = []string{
