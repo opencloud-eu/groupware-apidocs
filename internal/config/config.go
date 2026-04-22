@@ -26,6 +26,8 @@ var SourceDirectories = []string{
 
 const RoutesSource = "services/groupware/pkg/groupware/route.go"
 
+const TemplatesSource = "services/groupware/pkg/groupware/templates.go"
+
 var VersionSourceDirectory = "./pkg/version"
 
 var PackageIDs = []string{

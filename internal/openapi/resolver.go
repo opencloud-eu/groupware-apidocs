@@ -277,6 +277,9 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 }
 
 func (s resolver) reqschema(param model.Param, im model.Impl, schemaComponentTypes map[string]model.Type, desc string, defaultValue string) (*base.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
+	if param.Type != nil {
+		return s.schema(RequestScope, "reqschema", param.Type, []string{im.Name}, schemaComponentTypes, desc, defaultValue)
+	}
 	if t, ok := s.typeMap[param.Name]; ok {
 		return s.schema(RequestScope, "reqschema", t, []string{im.Name}, schemaComponentTypes, desc, defaultValue)
 	}
@@ -306,11 +309,13 @@ func (s resolver) bodyparams(params []model.Param, im model.Impl, schemaComponen
 	var schemaRef *highbase.SchemaProxy
 	var err error
 	desc := ""
+	required := true // body params are required by default
 	examples := orderedmap.New[string, *highbase.Example]()
 	switch len(params) {
 	case 0:
 		return nil, nil
 	case 1:
+		required = params[0].Required
 		schemaRef, _, err = s.reqschema(params[0], im, schemaComponentTypes, params[0].Description, params[0].DefaultValue)
 		desc = params[0].Description
 		exampleKey := params[0].Name
@@ -368,7 +373,7 @@ func (s resolver) bodyparams(params []model.Param, im model.Impl, schemaComponen
 	}
 
 	return &v3.RequestBody{
-		Required:    tools.BoolPtr(true),
+		Required:    tools.BoolPtr(required),
 		Content:     omap1("application/json", &v3.MediaType{Schema: schemaRef, Examples: examples}),
 		Description: desc,
 		Extensions:  ext("x-oc-ref-source", "bodyparams of "+im.Name),

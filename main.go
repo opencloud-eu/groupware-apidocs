@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -18,10 +19,12 @@ var (
 func main() {
 	chdir := ""
 	template := ""
+	output := ""
 	includeBasicAuth := false
 	openIdConnectUrl := defaultOpenIdConnectUrl
 	flag.StringVar(&chdir, "C", "", "Change into the specified directory before parsing source files")
 	flag.StringVar(&template, "t", "", "Template file")
+	flag.StringVar(&output, "o", "", "Output file")
 	flag.BoolVar(&includeBasicAuth, "b", false, "Include basic authentication")
 	flag.BoolVar(&verbose, "v", false, "Output verbose information while parsing source files")
 	flag.StringVar(&openIdConnectUrl, "O", defaultOpenIdConnectUrl, "OIDC URL to reference in the documentation")
@@ -50,7 +53,19 @@ func main() {
 	} else {
 		//o := AnsiSink{Verbose: verbose}
 		o := openapi.NewOpenApiSink(basepath, template, includeBasicAuth, openIdConnectUrl)
-		if err := o.Output(model, os.Stdout); err != nil {
+
+		var w io.Writer
+		if output == "" || output == "-" {
+			w = os.Stdout
+		} else {
+			if f, err := os.OpenFile(output, os.O_WRONLY|os.O_CREATE, 0600); err != nil {
+				panic(err)
+			} else {
+				defer f.Close()
+				w = f
+			}
+		}
+		if err := o.Output(model, w); err != nil {
 			panic(err)
 		}
 	}

@@ -161,6 +161,9 @@ func Voweled(str string) bool {
 }
 
 func Singularize(str string) string {
+	if strings.HasSuffix(str, "ses") {
+		return str[0:len(str)-3] + "se"
+	}
 	if strings.HasSuffix(str, "ies") {
 		return str[0:len(str)-3] + "y"
 	}
@@ -186,4 +189,13 @@ func MustHttpStatusText(code int) string {
 
 func Truth1[T any](t T) bool {
 	return true
+}
+
+func Splice(s string, sep string) (string, string) {
+	pos := strings.Index(s, sep)
+	if pos >= 0 {
+		return s[:pos], s[pos+1:]
+	} else {
+		return s, ""
+	}
 }

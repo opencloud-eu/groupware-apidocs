@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"text/template"
 
 	"golang.org/x/exp/utf8string"
 	"golang.org/x/tools/go/packages"
@@ -37,6 +38,191 @@ var (
 	tagNotInResponseRegex = regexp.MustCompile(`doc:"(!response)"`)
 	tagDefaultValueRegex  = regexp.MustCompile(`docdef:"(.*?)"`)
 )
+
+func argIsSel(f *ast.Field, pkg string, typ string) bool {
+	t := f.Type
+	if s, ok := t.(*ast.StarExpr); ok {
+		t = s.X
+	}
+	s, ok := isSelector(t)
+	if !ok {
+		return false
+	}
+	i, ok := isIdent(s.X)
+	if !ok {
+		return false
+	}
+	if i.Name != pkg {
+		return false
+	}
+	i, ok = isIdent(s.Sel)
+	if !ok {
+		return false
+	}
+	if i.Name != typ {
+		return false
+	}
+	return true
+}
+
+var (
+	apiSuccessCommentRegex  = regexp.MustCompile(`^@api:success\s+(\d+)`)
+	apiResponseCommentRegex = regexp.MustCompile(`^@api:response\s+(\d+:?\S+?)\s+(.+)$`)
+	apiBodyCommentRegex     = regexp.MustCompile(`^@api:body\s+(\S+)\s+(.+)$`)
+)
+
+func parseTemplateFuncs(p *packages.Package, a *ast.File) (map[string]model.TemplateFunc, error) {
+	result := map[string]model.TemplateFunc{}
+	for v := range funcDecls(a) {
+		if v.Recv != nil {
+			continue // it's a method, we are looking for functions, only
+		}
+		if len(v.Type.Params.List) < 4 {
+			continue
+		}
+
+		name := ""
+		if i, ok := isIdent(v.Name); ok {
+			name = i.Name
+		} else {
+			continue
+		}
+
+		// first template function argument must be an ObjectType
+		{
+			o, ok := v.Type.Params.List[0].Type.(*ast.IndexListExpr)
+			if !ok {
+				continue
+			}
+			i, ok := isIdent(o.X)
+			if !ok || i.Name != "ObjectType" {
+				continue
+			}
+		}
+
+		// second template function argument must be an http.ResponseWriter
+		if !argIsSel(v.Type.Params.List[1], "http", "ResponseWriter") {
+			continue
+		}
+
+		// third template function argument must be an http.Request
+		if !argIsSel(v.Type.Params.List[2], "http", "Request") {
+			continue
+		}
+
+		// fourth template function argument must be a *Groupware
+		{
+			g, ok := v.Type.Params.List[3].Type.(*ast.StarExpr)
+			if !ok {
+				continue
+			}
+			i, ok := isIdent(g.X)
+			if !ok {
+				continue
+			}
+			if i.Name != "Groupware" {
+				continue
+			}
+		}
+
+		typeParams := map[string]bool{}
+
+		if v.Type.TypeParams != nil {
+			for _, f := range v.Type.TypeParams.List {
+				if len(f.Names) > 0 {
+					if t, ok := isIdent(f.Names[0]); ok {
+						typeParams[t.Name] = true
+					}
+				}
+			}
+		}
+
+		pos := p.Fset.Position(v.Pos())
+		successCode := 200
+		var comments *template.Template
+		responses := map[int]*template.Template{}
+		bodyType := ""
+		var bodyComment *template.Template
+		bodyRequired := true
+		if v.Doc != nil {
+			text := []string{}
+			for _, l := range lines(v.Doc.List) {
+				t := strings.TrimSpace(l)
+				if m := apiSuccessCommentRegex.FindAllStringSubmatch(t, 1); m != nil {
+					if i, err := strconv.Atoi(m[0][1]); err != nil {
+						return nil, err
+					} else {
+						successCode = i
+					}
+				} else if m := apiResponseCommentRegex.FindAllStringSubmatch(t, 2); m != nil {
+					tag, obj := tools.Splice(m[0][1], ":")
+					if obj != "" {
+						if strings.ToUpper(obj) == obj {
+							// when it's all caps, then we assume that it is a generics parameter
+							if _, ok := typeParams[obj]; ok {
+								// ok XXX TODO
+							} else {
+								return nil, fmt.Errorf("%s comment at %s:%d references generics type param '%s' that does not exist", apiResponseCommentRegex, pos.Filename, pos.Line, obj)
+							}
+						} else {
+							// XXX TODO what if it isn't a generics param?
+						}
+					}
+					if code, err := strconv.Atoi(tag); err != nil {
+						return nil, err
+					} else {
+						if t, err := template.New(name).Parse(m[0][2]); err != nil {
+							return nil, err
+						} else {
+							responses[code] = t
+						}
+					}
+				} else if m := apiBodyCommentRegex.FindAllStringSubmatch(t, 2); m != nil {
+					obj := m[0][1]
+					if strings.HasPrefix(obj, "?") {
+						bodyRequired = false
+						obj = obj[1:]
+					}
+					if strings.ToUpper(obj) == obj {
+						if _, ok := typeParams[obj]; ok {
+							bodyType = obj
+						} else {
+							return nil, fmt.Errorf("%s comment at %s:%d references type param '%s' that does not exist", apiBodyCommentRegex, pos.Filename, pos.Line, obj)
+						}
+					} else {
+						// not generics parameter but straight type
+						bodyType = obj
+					}
+					if t, err := template.New(name).Parse(m[0][2]); err != nil {
+						return nil, err
+					} else {
+						bodyComment = t
+					}
+				} else {
+					text = append(text, l)
+				}
+			}
+
+			if t, err := template.New(name).Parse(strings.Join(text, "\n")); err != nil {
+				return nil, err
+			} else {
+				comments = t
+			}
+		}
+
+		result[name] = model.TemplateFunc{
+			Name:         name,
+			Pos:          pos,
+			Comments:     comments,
+			SuccessCode:  successCode,
+			Responses:    responses,
+			BodyRequired: bodyRequired,
+			BodyType:     bodyType,
+			BodyComment:  bodyComment,
+		}
+	}
+	return result, nil
+}
 
 func findRouteDefinition(a *ast.File) *ast.FuncDecl {
 	for v := range funcDecls(a) {
@@ -813,6 +999,7 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 type paramsVisitor struct {
 	fset                      *token.FileSet
 	fun                       string
+	endpoint                  model.Endpoint
 	groupwarePkg              *packages.Package
 	typeMap                   map[string]model.Type
 	objectTypeMap             map[string]model.ObjectType
@@ -822,21 +1009,39 @@ type paramsVisitor struct {
 	queryParams               map[string]model.Param
 	pathParams                map[string]model.Param
 	bodyParams                map[string]model.Param
+	templateFuncs             map[string]model.TemplateFunc
 	responses                 map[int]model.Resp
 	potentialErrors           map[string]bool
 	responseFuncs             map[string]responseFunc
 	responseMemberFuncs       map[string]responseFunc
 	undocumentedResults       map[string]token.Position
 	undocumentedRequestBodies map[string]token.Position
+	defaultSummary            string
+	pathParamDefs             map[string]model.ParamDefinition
+	queryParamDefs            map[string]model.ParamDefinition
+	headerParamDefs           map[string]model.ParamDefinition
 	errs                      *[]error
 }
 
-func newParamsVisitor(fset *token.FileSet, groupwarePkg *packages.Package, fun string, typeMap map[string]model.Type,
+func newParamsVisitor(
+	fset *token.FileSet,
+	groupwarePkg *packages.Package,
+	fun string,
+	endpoint model.Endpoint,
+	typeMap map[string]model.Type,
 	objectTypeMap map[string]model.ObjectType,
-	responseFuncs map[string]responseFunc, responseMemberFuncs map[string]responseFunc, exampleKey string) paramsVisitor {
+	templateFuncs map[string]model.TemplateFunc,
+	responseFuncs map[string]responseFunc,
+	responseMemberFuncs map[string]responseFunc,
+	exampleKey string,
+	pathParamDefs map[string]model.ParamDefinition,
+	queryParamDefs map[string]model.ParamDefinition,
+	headerParamDefs map[string]model.ParamDefinition,
+) paramsVisitor {
 	return paramsVisitor{
 		fset:                      fset,
 		fun:                       fun,
+		endpoint:                  endpoint,
 		groupwarePkg:              groupwarePkg,
 		typeMap:                   typeMap,
 		objectTypeMap:             objectTypeMap,
@@ -847,11 +1052,16 @@ func newParamsVisitor(fset *token.FileSet, groupwarePkg *packages.Package, fun s
 		bodyParams:                map[string]model.Param{},
 		responses:                 map[int]model.Resp{},
 		potentialErrors:           map[string]bool{},
+		templateFuncs:             templateFuncs,
 		responseFuncs:             responseFuncs,
 		responseMemberFuncs:       responseMemberFuncs,
 		undocumentedResults:       map[string]token.Position{},
 		undocumentedRequestBodies: map[string]token.Position{},
+		pathParamDefs:             pathParamDefs,
+		queryParamDefs:            queryParamDefs,
+		headerParamDefs:           headerParamDefs,
 		errs:                      &[]error{},
+		defaultSummary:            "",
 	}
 }
 
@@ -1177,13 +1387,31 @@ func (v paramsVisitor) isBuildFilterCall(call *ast.CallExpr) (map[string]model.P
 		return nil, nil, fmt.Errorf("failed to find declaration of 'buildEmailFilter' in the package '%s'", v.groupwarePkg.ID)
 	}
 
-	p := newParamsVisitor(v.fset, v.groupwarePkg, bf.Name.Name, v.typeMap, v.objectTypeMap, v.responseFuncs, v.responseMemberFuncs, v.exampleKey)
+	p := newParamsVisitor(
+		v.fset, v.groupwarePkg, bf.Name.Name, v.endpoint,
+		v.typeMap, v.objectTypeMap, v.templateFuncs, v.responseFuncs, v.responseMemberFuncs,
+		v.exampleKey,
+		v.pathParamDefs, v.queryParamDefs, v.headerParamDefs,
+	)
 	ast.Walk(p, bf.Body)
 	if err := errors.Join(*v.errs...); err != nil {
 		return nil, nil, err
 	}
 
 	return p.queryParams, p.headerParams, nil
+}
+
+type templateFuncSummaryModel struct {
+	Name         string
+	Names        string
+	Verb         string
+	Path         string
+	ObjType      string
+	UriParamName string
+	AccountType  string
+	QueryParam   map[string]model.ParamDefinition
+	PathParam    map[string]model.ParamDefinition
+	HeaderParam  map[string]model.ParamDefinition
 }
 
 func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
@@ -1220,23 +1448,102 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 		}
 
 		if f, ok := isIdent(d.Fun); len(d.Args) > 0 && ok {
-			if x, ok := isIdent(d.Args[0]); ok { // XXX TODO objtype mapping
-				ot, ok := v.objectTypeMap[x.Name]
-				if !ok {
-					*v.errs = append(*v.errs, fmt.Errorf("failed to resolve ObjectType '%s' in %+v", x.Name, d.Fun))
-					return nil
-				}
-				var _ = ot
-				// e.g. "AddressBook"
-				switch f.Name {
-				case "create":
+			if tf, ok := v.templateFuncs[f.Name]; ok {
+				if x, ok := isIdent(d.Args[0]); ok {
+					ot, ok := v.objectTypeMap[x.Name]
+					if !ok {
+						*v.errs = append(*v.errs, fmt.Errorf("failed to resolve function template's first argument ObjectType '%s' in %+v", x.Name, d.Fun))
+						return nil
+					}
+
+					m := templateFuncSummaryModel{
+						Name:         ot.Name,
+						Names:        ot.Plural,
+						Verb:         v.endpoint.Verb,
+						Path:         v.endpoint.Path,
+						ObjType:      ot.Foo,
+						UriParamName: ot.UriParamName,
+						AccountType:  ot.AccountType,
+						QueryParam:   v.queryParamDefs,
+						PathParam:    v.pathParamDefs,
+						HeaderParam:  v.headerParamDefs,
+					}
+
+					defaultSummary := fmt.Sprintf("%s %s %s", tools.Title(tf.Name), tools.Article(ot.Name), ot.Name)
+					if tf.Comments != nil {
+						var buf bytes.Buffer
+						if err := tf.Comments.Execute(&buf, m); err != nil {
+							*v.errs = append(*v.errs, err)
+							return nil
+						} else {
+							defaultSummary = buf.String()
+						}
+					}
+					v.defaultSummary = defaultSummary
+
+					if tf.BodyType != "" {
+						bodyDesc := ""
+						bodyType := ""
+						switch tf.BodyType {
+						case "T":
+							bodyType = ot.Foo
+						case "CHANGE":
+							bodyType = ot.Change
+						case "CHANGES":
+							bodyType = ot.Changes
+						case "":
+						default:
+							bodyType = tf.BodyType
+							//*v.errs = append(*v.errs, fmt.Errorf("unsupported generics parameter for template function body type: %s", tf.BodyType))
+							//return nil
+						}
+
+						switch bodyType {
+						case "":
+						case "[]string":
+							v.bodyParams[bodyType] = model.NewParam(bodyType, bodyDesc, model.NewArrayType(model.StringType), tf.BodyRequired, "", false, "")
+						default:
+							if t, ok := v.typeMap[bodyType]; ok {
+								var buf bytes.Buffer
+								if err := tf.BodyComment.Execute(&buf, m); err != nil {
+									*v.errs = append(*v.errs, err)
+									return nil
+								} else {
+									bodyDesc = buf.String()
+								}
+								v.bodyParams[t.Name()] = model.NewParam(t.Name(), bodyDesc, t, tf.BodyRequired, "", false, "")
+							} else {
+								*v.errs = append(*v.errs, fmt.Errorf("failed to resolve body type '%s' using the type map", bodyType))
+							}
+						}
+					}
+
+					typ, ok := v.typeMap[ot.Foo]
+					if !ok {
+						*v.errs = append(*v.errs, fmt.Errorf("failed to resolve ObjectType '%s' Foo '%s' using the type map", ot.Name, ot.Foo))
+						return nil
+					}
+
+					responseSummary := ""
+					if r, ok := tf.Responses[tf.SuccessCode]; ok {
+						var buf bytes.Buffer
+						if err := r.Execute(&buf, m); err != nil {
+							*v.errs = append(*v.errs, err)
+							return nil
+						} else {
+							responseSummary = buf.String()
+						}
+					}
+
 					responses := map[int]model.Resp{
-						200: {
-							Summary: "",
+						tf.SuccessCode: {
+							Summary: responseSummary,
+							Type:    typ,
 						},
 					}
 					maps.Copy(v.responses, responses)
-
+				} else {
+					// not a call to a template function => ignore
 				}
 			}
 		}
@@ -1450,6 +1757,17 @@ func lines(s []*ast.Comment) []string {
 	return tools.Collect(s, func(c *ast.Comment) string { return decomment(c.Text) })
 }
 
+func syntax(basepath string, pkg *packages.Package, filename string) (*ast.File, error) {
+	for i, f := range pkg.CompiledGoFiles {
+		if rf, err := filepath.Rel(basepath, f); err != nil {
+			panic(err)
+		} else if rf == filename {
+			return pkg.Syntax[i], nil
+		}
+	}
+	return nil, fmt.Errorf("failed to find syntax for %s", filename)
+}
+
 func Parse(chdir string, basepath string) (model.Model, error) {
 	version := ""
 	{
@@ -1519,9 +1837,9 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 	groupwareErrorCodesMap := map[string]string{}
 	groupwareErrorsMap := map[string]model.PotentialError{}
 	routes := []model.Endpoint{}
-	pathParams := map[string]model.ParamDefinition{}
-	queryParams := map[string]model.ParamDefinition{}
-	headerParams := map[string]model.ParamDefinition{}
+	pathParamDefs := map[string]model.ParamDefinition{}
+	queryParamDefs := map[string]model.ParamDefinition{}
+	headerParamDefs := map[string]model.ParamDefinition{}
 	ims := []model.Impl{}
 	undocumentedResults := map[string]model.Undocumented{}
 	undocumentedResultBodies := map[string]model.Undocumented{}
@@ -1580,6 +1898,20 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 
 		if objectTypeMap, err = parseObjectTypes(groupware); err != nil {
 			log.Fatal(err)
+		}
+
+		templateFuncs := map[string]model.TemplateFunc{}
+		{ // resolve template functions
+			syntax, err := syntax(basepath, groupware, config.TemplatesSource)
+			if err != nil {
+				panic(err)
+			}
+			m, err := parseTemplateFuncs(groupware, syntax)
+			if err != nil {
+				panic(err)
+			} else {
+				templateFuncs = m
+			}
 		}
 
 		// iterate over every package that we are interested in (defined in config.PackageIDs),
@@ -1727,19 +2059,9 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 		// analyze routes, route functions and definitions of path and query parameter name
 		// constants in route.go
 		{
-			var syntax *ast.File = nil
-			{
-				for i, f := range groupware.CompiledGoFiles {
-					if rf, err := filepath.Rel(basepath, f); err != nil {
-						panic(err)
-					} else if rf == config.RoutesSource {
-						syntax = groupware.Syntax[i]
-						break
-					}
-				}
-				if syntax == nil {
-					panic(fmt.Errorf("failed to find syntax for %s", config.RoutesSource))
-				}
+			syntax, err := syntax(basepath, groupware, config.RoutesSource)
+			if err != nil {
+				panic(err)
 			}
 
 			routeFunc := findRouteDefinition(syntax)
@@ -1758,9 +2080,9 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 				if g, err := scrapeGlobalParamDecls(syntax.Decls, groupware); err != nil {
 					panic(err)
 				} else {
-					maps.Copy(pathParams, g.pathParams)
-					maps.Copy(queryParams, g.queryParams)
-					maps.Copy(headerParams, g.headerParams)
+					maps.Copy(pathParamDefs, g.pathParams)
+					maps.Copy(queryParamDefs, g.queryParams)
+					maps.Copy(headerParamDefs, g.headerParams)
 				}
 			}
 		}
@@ -1852,7 +2174,14 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 				potentialErrors := map[string]model.PotentialError{}
 				{
 					if fun.Body != nil {
-						v := newParamsVisitor(groupware.Fset, groupware, n, typeMap, objectTypeMap, responseFuncs, requestResponseFuncs, exampleKey)
+						v := newParamsVisitor(
+							groupware.Fset, groupware, n, route,
+							typeMap, objectTypeMap, templateFuncs, responseFuncs, requestResponseFuncs,
+							exampleKey,
+							queryParamDefs,
+							pathParamDefs,
+							headerParamDefs,
+						)
 						ast.Walk(v, fun.Body)
 						if err := errors.Join(*v.errs...); err != nil {
 							panic(err)
@@ -2143,9 +2472,9 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 	return model.Model{
 		Version:                             version,
 		Routes:                              routes,
-		PathParams:                          pathParams,
-		QueryParams:                         queryParams,
-		HeaderParams:                        headerParams,
+		PathParams:                          pathParamDefs,
+		QueryParams:                         queryParamDefs,
+		HeaderParams:                        headerParamDefs,
 		Impls:                               ims,
 		Types:                               types,
 		Examples:                            exampleMap,
@@ -2310,23 +2639,41 @@ func vars(p *packages.Package) iter.Seq2[string, *types.Var] {
 
 func parseObjectTypes(p *packages.Package) (map[string]model.ObjectType, error) {
 	fooMap := map[string]string{}
+	changeMap := map[string]string{}
+	changesMap := map[string]string{}
 	for name, v := range vars(p) {
 		switch n := v.Type().(type) {
 		case *types.Named:
 			if n.Obj().Name() != "ObjectType" {
 				continue
 			}
+			// AddressBook = ObjectType[jmap.AddressBook, jmap.AddressBookChange, jmap.AddressBookChanges]{
 			if n.TypeArgs() == nil {
 				return nil, fmt.Errorf("ObjectType '%s' has no type args", name)
 			}
-			fooArg := n.TypeArgs().At(0)
-			if na, ok := isNamed(fooArg); ok {
+			if na, ok := isNamed(n.TypeArgs().At(0)); ok {
 				fooName := na.Obj().Name()
 				pkg := na.Obj().Pkg()
 				if pkg != nil && pkg.Name() != "" {
 					fooName = pkg.Name() + "." + fooName
 				}
 				fooMap[name] = fooName
+			}
+			if na, ok := isNamed(n.TypeArgs().At(1)); ok {
+				changeName := na.Obj().Name()
+				pkg := na.Obj().Pkg()
+				if pkg != nil && pkg.Name() != "" {
+					changeName = pkg.Name() + "." + changeName
+				}
+				changeMap[name] = changeName
+			}
+			if na, ok := isNamed(n.TypeArgs().At(2)); ok {
+				changesName := na.Obj().Name()
+				pkg := na.Obj().Pkg()
+				if pkg != nil && pkg.Name() != "" {
+					changesName = pkg.Name() + "." + changesName
+				}
+				changesMap[name] = changesName
 			}
 		}
 	}
@@ -2351,12 +2698,28 @@ func parseObjectTypes(p *packages.Package) (map[string]model.ObjectType, error) 
 		} else {
 			return nil, fmt.Errorf("failed to find Foo in fooMap for '%s'", name)
 		}
+		if change, ok := changeMap[name]; ok {
+			ot.Change = change
+		} else {
+			return nil, fmt.Errorf("failed to find Change in changeMap for '%s'", name)
+		}
+		if changes, ok := changesMap[name]; ok {
+			ot.Changes = changes
+		} else {
+			return nil, fmt.Errorf("failed to find Changes in changesMap for '%s'", name)
+		}
 
 		for k, v := range keyValueExprs(c.Elts) {
 			switch k {
 			case "name":
 				if s, ok := stri(v); ok {
 					ot.Name = s
+				} else {
+					return nil, fmt.Errorf("type of ObjectType attribute '%s' is of unexpected type %+v", name, v)
+				}
+			case "plural":
+				if s, ok := stri(v); ok {
+					ot.Plural = s
 				} else {
 					return nil, fmt.Errorf("type of ObjectType attribute '%s' is of unexpected type %+v", name, v)
 				}

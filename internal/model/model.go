@@ -6,6 +6,7 @@ import (
 	"go/types"
 	"io"
 	"slices"
+	"text/template"
 )
 
 type Field struct {
@@ -236,6 +237,17 @@ type Impl struct {
 	ExampleKey      string
 }
 
+type TemplateFunc struct {
+	Name         string
+	Pos          token.Position
+	Comments     *template.Template
+	SuccessCode  int
+	Responses    map[int]*template.Template
+	BodyRequired bool
+	BodyType     string
+	BodyComment  *template.Template
+}
+
 type Undocumented struct {
 	Pos      token.Position
 	Endpoint Endpoint
@@ -280,7 +292,10 @@ type Enum struct {
 
 type ObjectType struct {
 	Foo                   string
+	Change                string
+	Changes               string
 	Name                  string
+	Plural                string
 	ResponseObjectType    string
 	UriParamName          string
 	ContainerUriParamName string
