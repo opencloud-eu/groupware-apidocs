@@ -159,13 +159,15 @@ func parseTemplateFuncs(p *packages.Package, a *ast.File) (map[string]model.Temp
 					if obj != "" {
 						if strings.ToUpper(obj) == obj {
 							// when it's all caps, then we assume that it is a generics parameter
-							if _, ok := typeParams[obj]; ok {
-								// ok XXX TODO
-							} else {
-								return nil, fmt.Errorf("%s comment at %s:%d references generics type param '%s' that does not exist", apiResponseCommentRegex, pos.Filename, pos.Line, obj)
+							objcheck := obj
+							if strings.HasPrefix(obj, "[]") {
+								objcheck = obj[2:]
 							}
-						} else {
-							// XXX TODO what if it isn't a generics param?
+							if _, ok := typeParams[objcheck]; ok {
+								bodyType = obj
+							} else {
+								return nil, fmt.Errorf("%s comment at %s:%d references generics type param '%s' that does not exist", apiResponseCommentRegex, pos.Filename, pos.Line, objcheck)
+							}
 						}
 					}
 					if code, err := strconv.Atoi(tag); err != nil {
@@ -1485,12 +1487,16 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 						bodyDesc := ""
 						bodyType := ""
 						switch tf.BodyType {
+						case "[]T":
+							bodyType = "[]" + ot.Foo
 						case "T":
 							bodyType = ot.Foo
 						case "CHANGE":
 							bodyType = ot.Change
 						case "CHANGES":
 							bodyType = ot.Changes
+						case "SEARCHRESULTS":
+							bodyType = ot.Foo + "SearchResults" // TODO this is a hack, we should parse them instead to be safe
 						case "":
 						default:
 							bodyType = tf.BodyType
@@ -1503,13 +1509,24 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 						case "[]string":
 							v.bodyParams[bodyType] = model.NewParam(bodyType, bodyDesc, model.NewArrayType(model.StringType), tf.BodyRequired, "", false, "")
 						default:
-							if t, ok := v.typeMap[bodyType]; ok {
-								var buf bytes.Buffer
-								if err := tf.BodyComment.Execute(&buf, m); err != nil {
-									*v.errs = append(*v.errs, err)
-									return nil
-								} else {
-									bodyDesc = buf.String()
+							ary := false
+							discreteType := bodyType
+							if strings.HasPrefix(bodyType, "[]") {
+								ary = true
+								discreteType = bodyType[2:]
+							}
+							if t, ok := v.typeMap[discreteType]; ok {
+								if tf.BodyComment != nil {
+									var buf bytes.Buffer
+									if err := tf.BodyComment.Execute(&buf, m); err != nil {
+										*v.errs = append(*v.errs, err)
+										return nil
+									} else {
+										bodyDesc = buf.String()
+									}
+								}
+								if ary {
+									t = model.NewArrayType(t)
 								}
 								v.bodyParams[bodyType] = model.NewParam(bodyType, bodyDesc, t, tf.BodyRequired, "", false, "")
 							} else {
@@ -2186,6 +2203,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 						if err := errors.Join(*v.errs...); err != nil {
 							panic(err)
 						}
+
 						maps.Copy(resp, v.responses)
 						maps.Copy(bodyParams, v.bodyParams)
 						maps.Copy(headerParams, v.headerParams)
