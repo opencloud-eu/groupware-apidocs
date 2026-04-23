@@ -175,6 +175,8 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 						ext.Set("x-oc-example-scope", &yaml.Node{Kind: yaml.ScalarNode, Value: string(scope)})
 					}
 				}
+			} else {
+				// failed to find an example
 			}
 		}
 
