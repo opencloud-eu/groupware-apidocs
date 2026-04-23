@@ -277,13 +277,14 @@ func (s resolver) schema(scope schemaScope, ctx string, t model.Type, path []str
 }
 
 func (s resolver) reqschema(param model.Param, im model.Impl, schemaComponentTypes map[string]model.Type, desc string, defaultValue string) (*base.SchemaProxy, *orderedmap.Map[string, *yaml.Node], error) {
-	if param.Type != nil {
-		return s.schema(RequestScope, "reqschema", param.Type, []string{im.Name}, schemaComponentTypes, desc, defaultValue)
+	desc = tools.Title(desc)
+	t := param.Type
+	if t == nil {
+		t = s.typeMap[param.Name]
 	}
-	if t, ok := s.typeMap[param.Name]; ok {
+	if t != nil {
 		return s.schema(RequestScope, "reqschema", t, []string{im.Name}, schemaComponentTypes, desc, defaultValue)
 	}
-
 	var schemaRef *base.SchemaProxy = nil
 	var ext *orderedmap.Map[string, *yaml.Node] = nil
 	switch param.Name {
@@ -371,6 +372,8 @@ func (s resolver) bodyparams(params []model.Param, im model.Impl, schemaComponen
 		}
 		// TODO multiple body parameters, what should we use for the description and the examples?
 	}
+
+	desc = tools.Title(desc)
 
 	return &v3.RequestBody{
 		Required:    tools.BoolPtr(required),

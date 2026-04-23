@@ -1511,7 +1511,7 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 								} else {
 									bodyDesc = buf.String()
 								}
-								v.bodyParams[t.Name()] = model.NewParam(t.Name(), bodyDesc, t, tf.BodyRequired, "", false, "")
+								v.bodyParams[bodyType] = model.NewParam(bodyType, bodyDesc, t, tf.BodyRequired, "", false, "")
 							} else {
 								*v.errs = append(*v.errs, fmt.Errorf("failed to resolve body type '%s' using the type map", bodyType))
 							}
