@@ -1414,6 +1414,7 @@ type templateFuncSummaryModel struct {
 	QueryParam   map[string]model.ParamDefinition
 	PathParam    map[string]model.ParamDefinition
 	HeaderParam  map[string]model.ParamDefinition
+	TypeParam    map[string]string
 }
 
 func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
@@ -1452,10 +1453,49 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 		if f, ok := isIdent(d.Fun); len(d.Args) > 0 && ok {
 			if tf, ok := v.templateFuncs[f.Name]; ok {
 				if x, ok := isIdent(d.Args[0]); ok {
+					typeParams := map[string]model.Type{}
+					{
+						typePlaceholderNames := []string{}
+						if def, ok := v.groupwarePkg.TypesInfo.Uses[f]; ok {
+							if t, ok := def.Type().(*types.Signature); ok {
+								for tparam := range t.TypeParams().TypeParams() {
+									typePlaceholderNames = append(typePlaceholderNames, tparam.Obj().Name())
+								}
+							} else {
+								panic(fmt.Errorf("failed to case to Signature"))
+							}
+						}
+						if gen, ok := v.groupwarePkg.TypesInfo.Instances[f]; ok {
+							for i, tparam := range typePlaceholderNames {
+								switch arg := gen.TypeArgs.At(i).(type) {
+								case *types.Named:
+									name := arg.Obj().Name()
+									if arg.Obj().Pkg() != nil && arg.Obj().Pkg().Name() != "" {
+										name = arg.Obj().Pkg().Name() + "." + name
+									}
+									if t, ok := v.typeMap[name]; !ok {
+										*v.errs = append(*v.errs, fmt.Errorf("failed to map generic parameter 'T' to type '%s': not found in typemap", name))
+										return nil
+									} else {
+										typeParams[tparam] = t
+									}
+								default:
+									*v.errs = append(*v.errs, fmt.Errorf("failed to map generic parameter 'T': unsupported TypeArg: %T: %#+v", gen.TypeArgs.At(0), gen.TypeArgs.At(0)))
+									return nil
+								}
+							}
+						}
+					}
+
 					ot, ok := v.objectTypeMap[x.Name]
 					if !ok {
 						*v.errs = append(*v.errs, fmt.Errorf("failed to resolve function template's first argument ObjectType '%s' in %+v", x.Name, d.Fun))
 						return nil
+					}
+
+					typeParamsNames := map[string]string{}
+					for k, v := range typeParams {
+						typeParamsNames[k] = v.Key()
 					}
 
 					m := templateFuncSummaryModel{
@@ -1469,6 +1509,56 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 						QueryParam:   v.queryParamDefs,
 						PathParam:    v.pathParamDefs,
 						HeaderParam:  v.headerParamDefs,
+						TypeParam:    typeParamsNames,
+					}
+
+					if tf.BodyType != "" {
+						bodyDesc := ""
+						var bodyType model.Type = nil
+						ary := false
+						singularType := tf.BodyType
+						if strings.HasPrefix(tf.BodyType, "[]") {
+							ary = true
+							singularType = tf.BodyType[2:]
+						}
+						if strings.ToUpper(singularType) == singularType {
+							// generic parameter
+							if g, ok := typeParams[singularType]; ok {
+								bodyType = g
+							} else {
+								*v.errs = append(*v.errs, fmt.Errorf("failed to find generic type parameter %s", singularType))
+								return nil
+							}
+						} else if tf.BodyType != "" {
+							if t, err := toType(tf.BodyType, v.typeMap); err != nil {
+								bodyType = t
+							} else {
+								*v.errs = append(*v.errs, err)
+								return nil
+							}
+						}
+
+						if bodyType != nil {
+							if tf.BodyComment != nil {
+								var buf bytes.Buffer
+								if err := tf.BodyComment.Execute(&buf, m); err != nil {
+									*v.errs = append(*v.errs, err)
+									return nil
+								} else {
+									bodyDesc = buf.String()
+								}
+							}
+							if ary {
+								bodyType = model.NewArrayType(bodyType)
+							}
+							v.bodyParams[bodyType.Key()] = model.NewParam(bodyType.Key(), bodyDesc, bodyType, tf.BodyRequired, "", false, "")
+						}
+					}
+
+					typ, ok := v.typeMap[ot.Foo]
+					if !ok {
+						*v.errs = append(*v.errs, fmt.Errorf("failed to resolve ObjectType '%s' Foo '%s' using the type map", ot.Name, ot.Foo))
+						return nil
 					}
 
 					defaultSummary := fmt.Sprintf("%s %s %s", tools.Title(tf.Name), tools.Article(ot.Name), ot.Name)
@@ -1482,64 +1572,6 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 						}
 					}
 					v.defaultSummary = defaultSummary
-
-					if tf.BodyType != "" {
-						bodyDesc := ""
-						bodyType := ""
-						switch tf.BodyType {
-						case "[]T":
-							bodyType = "[]" + ot.Foo
-						case "T":
-							bodyType = ot.Foo
-						case "CHANGE":
-							bodyType = ot.Change
-						case "CHANGES":
-							bodyType = ot.Changes
-						case "SEARCHRESULTS":
-							bodyType = ot.Foo + "SearchResults" // TODO this is a hack, we should parse them instead to be safe
-						case "":
-						default:
-							bodyType = tf.BodyType
-							//*v.errs = append(*v.errs, fmt.Errorf("unsupported generics parameter for template function body type: %s", tf.BodyType))
-							//return nil
-						}
-
-						switch bodyType {
-						case "":
-						case "[]string":
-							v.bodyParams[bodyType] = model.NewParam(bodyType, bodyDesc, model.NewArrayType(model.StringType), tf.BodyRequired, "", false, "")
-						default:
-							ary := false
-							discreteType := bodyType
-							if strings.HasPrefix(bodyType, "[]") {
-								ary = true
-								discreteType = bodyType[2:]
-							}
-							if t, ok := v.typeMap[discreteType]; ok {
-								if tf.BodyComment != nil {
-									var buf bytes.Buffer
-									if err := tf.BodyComment.Execute(&buf, m); err != nil {
-										*v.errs = append(*v.errs, err)
-										return nil
-									} else {
-										bodyDesc = buf.String()
-									}
-								}
-								if ary {
-									t = model.NewArrayType(t)
-								}
-								v.bodyParams[bodyType] = model.NewParam(bodyType, bodyDesc, t, tf.BodyRequired, "", false, "")
-							} else {
-								*v.errs = append(*v.errs, fmt.Errorf("failed to resolve body type '%s' using the type map", bodyType))
-							}
-						}
-					}
-
-					typ, ok := v.typeMap[ot.Foo]
-					if !ok {
-						*v.errs = append(*v.errs, fmt.Errorf("failed to resolve ObjectType '%s' Foo '%s' using the type map", ot.Name, ot.Foo))
-						return nil
-					}
 
 					responseSummary := ""
 					if r, ok := tf.Responses[tf.SuccessCode]; ok {
