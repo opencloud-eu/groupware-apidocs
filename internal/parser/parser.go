@@ -1467,7 +1467,11 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 						}
 						if gen, ok := v.groupwarePkg.TypesInfo.Instances[f]; ok {
 							for i, tparam := range typePlaceholderNames {
-								switch arg := gen.TypeArgs.At(i).(type) {
+								arg := gen.TypeArgs.At(i)
+								if p, ok := arg.(*types.Pointer); ok {
+									arg = p.Elem()
+								}
+								switch arg := arg.(type) {
 								case *types.Named:
 									name := arg.Obj().Name()
 									if arg.Obj().Pkg() != nil && arg.Obj().Pkg().Name() != "" {
@@ -2232,8 +2236,13 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 							headerParamDefs,
 						)
 						ast.Walk(v, fun.Body)
-						if err := errors.Join(*v.errs...); err != nil {
-							panic(err)
+						{
+							errs := tools.Filter(*v.errs, func(err error) bool { return err != nil }) // can contain a nil, so filter those out first
+							if len(errs) == 1 {
+								panic(errs[0]) // this makes for a cleaner panic than a joined one
+							} else if err := errors.Join(errs...); err != nil {
+								panic(err)
+							}
 						}
 
 						maps.Copy(resp, v.responses)
@@ -2952,6 +2961,11 @@ func typeOf(t types.Type, typeParams map[string]model.Type, mem map[string]model
 		// ignore
 		return nil, nil
 	case *types.Struct:
+		// handle zero struct{}
+		if t.NumFields() == 0 {
+			return model.NewStructType("", "", []model.Field{}, "", "", token.Position{}), nil
+		}
+
 		// ignore unnamed struct
 		return nil, nil
 	default:
