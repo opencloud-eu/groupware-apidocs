@@ -237,12 +237,17 @@ type Impl struct {
 	ExampleKey      string
 }
 
+type ResponseTemplate struct {
+	Summary  *template.Template
+	Response string
+}
+
 type TemplateFunc struct {
 	Name         string
 	Pos          token.Position
 	Comments     *template.Template
 	SuccessCode  int
-	Responses    map[int]*template.Template
+	Responses    map[int]ResponseTemplate
 	BodyRequired bool
 	BodyType     string
 	BodyComment  *template.Template

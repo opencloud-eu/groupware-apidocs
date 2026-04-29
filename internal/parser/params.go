@@ -26,6 +26,7 @@ var (
 type paramsVisitor struct {
 	fset                      *token.FileSet
 	fun                       string
+	fn                        *types.Func
 	endpoint                  model.Endpoint
 	groupwarePkg              *packages.Package
 	typeMap                   map[string]model.Type
@@ -54,6 +55,7 @@ func newParamsVisitor(
 	fset *token.FileSet,
 	groupwarePkg *packages.Package,
 	fun string,
+	fn *types.Func,
 	endpoint model.Endpoint,
 	typeMap map[string]model.Type,
 	objectTypeMap map[string]model.ObjectType,
@@ -68,6 +70,7 @@ func newParamsVisitor(
 	return paramsVisitor{
 		fset:                      fset,
 		fun:                       fun,
+		fn:                        fn,
 		endpoint:                  endpoint,
 		groupwarePkg:              groupwarePkg,
 		typeMap:                   typeMap,
@@ -157,7 +160,7 @@ func (v paramsVisitor) isRespondCall(call *ast.CallExpr) (map[int]model.Resp, ma
 	if len(call.Args) == 3 && isMethodCall(call, "Groupware", "respond") {
 		arg := call.Args[2]
 		if c, ok := isClosure(arg); ok {
-			rv := newReturnVisitor(v.fset, v.groupwarePkg, v.typeMap, v.responseFuncs, v.responseMemberFuncs, v.exampleKey, v.defaultValue)
+			rv := newReturnVisitor(v.fun, v.fn, v.fset, v.groupwarePkg, v.typeMap, v.responseFuncs, v.responseMemberFuncs, v.exampleKey, v.defaultValue)
 			ast.Walk(rv, c)
 			if err := errors.Join(*rv.errs...); err != nil {
 				return nil, nil, nil, false, err
@@ -357,8 +360,19 @@ func (v paramsVisitor) isBuildFilterCall(call *ast.CallExpr) (map[string]model.P
 		return nil, nil, fmt.Errorf("failed to find declaration of 'buildEmailFilter' in the package '%s'", v.groupwarePkg.ID)
 	}
 
+	var fn *types.Func
+	if fun, ok := v.groupwarePkg.TypesInfo.Defs[bf.Name]; ok {
+		if f, ok := fun.(*types.Func); ok {
+			fn = f
+		} else {
+			return nil, nil, fmt.Errorf("found typeinfo def for function '%s', but it's not a *types.Func", bf.Name.Name)
+		}
+	} else {
+		return nil, nil, fmt.Errorf("failed to typeinfo def for function '%s'", bf.Name.Name)
+	}
+
 	p := newParamsVisitor(
-		v.fset, v.groupwarePkg, bf.Name.Name, v.endpoint,
+		v.fset, v.groupwarePkg, bf.Name.Name, fn, v.endpoint,
 		v.typeMap, v.objectTypeMap, v.templateFuncs, v.responseFuncs, v.responseMemberFuncs,
 		v.exampleKey,
 		v.pathParamDefs, v.queryParamDefs, v.headerParamDefs,
@@ -527,12 +541,6 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 						}
 					}
 
-					typ, ok := v.typeMap[ot.Foo]
-					if !ok {
-						*v.errs = append(*v.errs, fmt.Errorf("failed to resolve ObjectType '%s' Foo '%s' using the type map", ot.Name, ot.Foo))
-						return nil
-					}
-
 					defaultSummary := fmt.Sprintf("%s %s %s", tools.Title(tf.Name), tools.Article(ot.Name), ot.Name)
 					if tf.Comments != nil {
 						var buf bytes.Buffer
@@ -545,22 +553,46 @@ func (v paramsVisitor) Visit(n ast.Node) ast.Visitor {
 					}
 					v.defaultSummary = defaultSummary
 
-					responseSummary := ""
-					if r, ok := tf.Responses[tf.SuccessCode]; ok {
-						var buf bytes.Buffer
-						if err := r.Execute(&buf, m); err != nil {
-							*v.errs = append(*v.errs, err)
-							return nil
-						} else {
-							responseSummary = buf.String()
+					responses := map[int]model.Resp{}
+					for code, resp := range tf.Responses {
+						rendered := ""
+						if resp.Summary != nil {
+							var buf bytes.Buffer
+							if err := resp.Summary.Execute(&buf, m); err != nil {
+								*v.errs = append(*v.errs, err)
+								return nil
+							} else {
+								rendered = buf.String()
+							}
 						}
-					}
-
-					responses := map[int]model.Resp{
-						tf.SuccessCode: {
-							Summary: responseSummary,
-							Type:    typ,
-						},
+						var typ model.Type = nil
+						if resp.Response != "" {
+							name := resp.Response
+							ary := false
+							if strings.HasPrefix(name, "[]") {
+								ary = true
+								name = name[2:]
+							}
+							if strings.ToUpper(name) == name {
+								if t, ok := typeParams[name]; ok {
+									typ = t
+								} else {
+									*v.errs = append(*v.errs, fmt.Errorf("failed to resolve template response type name '%s' using typeParams", name))
+									return nil
+								}
+							} else {
+								if t, ok := v.typeMap[name]; ok {
+									typ = t
+								} else {
+									*v.errs = append(*v.errs, fmt.Errorf("failed to resolve template response type name '%s'", name))
+									return nil
+								}
+							}
+							if ary {
+								typ = model.NewArrayType(typ)
+							}
+						}
+						responses[code] = model.NewResp(typ, rendered, "", "")
 					}
 					maps.Copy(v.responses, responses)
 				} else {

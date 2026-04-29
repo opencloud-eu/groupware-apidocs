@@ -7,7 +7,6 @@ import (
 	"go/token"
 	"go/types"
 	"log"
-	"os"
 	"strconv"
 	"strings"
 
@@ -23,6 +22,8 @@ type responseFunc struct {
 }
 
 type returnVisitor struct {
+	fun                            string
+	fn                             *types.Func
 	fset                           *token.FileSet
 	typeMap                        map[string]model.Type
 	groupwarePkg                   *packages.Package
@@ -36,12 +37,14 @@ type returnVisitor struct {
 	errs                           *[]error
 }
 
-func newReturnVisitor(fset *token.FileSet, groupwarePkg *packages.Package, typeMap map[string]model.Type,
+func newReturnVisitor(fun string, fn *types.Func, fset *token.FileSet, groupwarePkg *packages.Package, typeMap map[string]model.Type,
 	successfulResponseFuncs map[string]responseFunc,
 	successfulRequestResponseFuncs map[string]responseFunc,
 	exampleKey string,
 	defaultValue string) returnVisitor {
 	return returnVisitor{
+		fun:                            fun,
+		fn:                             fn,
 		fset:                           fset,
 		groupwarePkg:                   groupwarePkg,
 		typeMap:                        typeMap,
@@ -222,23 +225,39 @@ func (v returnVisitor) resolveType(t types.Type) (model.Type, error) {
 	return r, nil
 }
 
-func (v returnVisitor) deduceArgType(code int, arg ast.Expr) (int, model.Type, error) {
+func (v returnVisitor) deduceArgType(code int, arg ast.Expr, pkg *packages.Package) (int, model.Type, error) {
 	switch arg := arg.(type) {
 	case *ast.SelectorExpr:
-		key := name(arg.X.(*ast.Ident).Name, arg.Sel.Name)
-		if m, ok := v.typeMap[key]; ok {
-			return code, m, nil
-		} else {
-			fmt.Fprintf(os.Stderr, "failed to find the type '%s' in the typeMap, has the following types:\n", key)
-			for _, k := range keysort(v.typeMap) {
-				fmt.Fprintf(os.Stderr, "  - %s\n", k)
-			}
-			buf := new(bytes.Buffer)
-			if err := ast.Fprint(buf, v.fset, arg, nil); err == nil {
-				return 0, nil, fmt.Errorf("failed to find the type '%s' in the typeMap, used as the response type for %#v in %s", key, arg, buf.String())
+		if x, ok := pkg.TypesInfo.Selections[arg]; ok {
+			if n, ok := isNamed(x.Recv()); ok {
+				key := n.Obj().Name()
+				if n.Obj().Pkg() != nil && n.Obj().Pkg().Name() != "" {
+					key = n.Obj().Pkg().Name() + "." + key
+				}
+				if key == "jmap.Result" {
+					// unwrap
+					targs := n.TypeArgs()
+					if targs != nil && targs.Len() == 1 {
+						if t, err := typeOf(targs.At(0), nil, v.typeMap, v.groupwarePkg); err != nil {
+							return 0, nil, err
+						} else {
+							return code, t, nil
+						}
+					} else {
+						return 0, nil, fmt.Errorf("%s has no typeargs", key)
+					}
+				} else {
+					if m, ok := v.typeMap[key]; ok {
+						return code, m, nil
+					} else {
+						return 0, nil, fmt.Errorf("failed to find the type '%s' in the typeMap", key)
+					}
+				}
 			} else {
-				return 0, nil, fmt.Errorf("failed to find the type '%s' in the typeMap, used as the response type for %#v", key, arg)
+				return 0, nil, fmt.Errorf("SelectorExpr is not Named")
 			}
+		} else {
+			return 0, nil, fmt.Errorf("failed to find SelectorExpr in package")
 		}
 	case *ast.CompositeLit:
 		switch t := arg.Type.(type) {
@@ -408,7 +427,7 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 			// if a is nil, it means that there is no body
 			v.responses[code] = model.NewRespWithoutBody(summary)
 		} else {
-			if code, t, err := v.deduceArgType(code, arg); err != nil {
+			if code, t, err := v.deduceArgType(code, arg, v.groupwarePkg); err != nil {
 				*v.errs = append(*v.errs, err)
 				return nil
 			} else {
@@ -416,7 +435,7 @@ func (v returnVisitor) Visit(n ast.Node) ast.Visitor {
 			}
 		}
 	} else if ok := v.isErrorResponseFunc(r); ok {
-
+		fmt.Printf("found error response func")
 	}
 
 	return v

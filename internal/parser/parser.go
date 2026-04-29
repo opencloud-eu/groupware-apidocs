@@ -139,7 +139,7 @@ func parseTemplateFuncs(p *packages.Package, a *ast.File) (map[string]model.Temp
 		pos := p.Fset.Position(v.Pos())
 		successCode := 200
 		var comments *template.Template
-		responses := map[int]*template.Template{}
+		responses := map[int]model.ResponseTemplate{}
 		bodyType := ""
 		var bodyComment *template.Template
 		bodyRequired := true
@@ -175,7 +175,10 @@ func parseTemplateFuncs(p *packages.Package, a *ast.File) (map[string]model.Temp
 						if t, err := template.New(name).Parse(m[0][2]); err != nil {
 							return nil, err
 						} else {
-							responses[code] = t
+							responses[code] = model.ResponseTemplate{
+								Summary:  t,
+								Response: bodyType,
+							}
 						}
 					}
 				} else if m := apiBodyCommentRegex.FindAllStringSubmatch(t, 2); m != nil {
@@ -1229,7 +1232,7 @@ func Parse(chdir string, basepath string) (model.Model, error) {
 				{
 					if fun.Body != nil {
 						v := newParamsVisitor(
-							groupware.Fset, groupware, n, route,
+							groupware.Fset, groupware, n, f, route,
 							typeMap, objectTypeMap, templateFuncs, responseFuncs, requestResponseFuncs,
 							exampleKey,
 							queryParamDefs,
